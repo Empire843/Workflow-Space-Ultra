@@ -37,6 +37,10 @@ export default function TopBar() {
   const renameWorkflow = useWorkflowStore((s) => s.renameWorkflow);
   const activeWorkflowId = useWorkflowStore((s) => s.activeWorkflowId);
   const saveCurrent = useWorkflowStore((s) => s._saveCurrentWorkflow);
+  const undo = useWorkflowStore((s) => s.undo);
+  const redo = useWorkflowStore((s) => s.redo);
+  const canUndo = useWorkflowStore((s) => s.canUndo);
+  const canRedo = useWorkflowStore((s) => s.canRedo);
 
   const refreshAuth = () =>
     fetch("/api/auth/status", { cache: "no-store" })
@@ -115,8 +119,18 @@ export default function TopBar() {
 
       <div className="mx-4 h-6 w-px bg-[color:var(--color-border)]" />
 
-      <TopBarButton icon={<Undo2 className="h-4 w-4" />} label="Undo" />
-      <TopBarButton icon={<Redo2 className="h-4 w-4" />} label="Redo" />
+      <TopBarButton
+        icon={<Undo2 className="h-4 w-4" />}
+        label="Undo (Ctrl+Z)"
+        onClick={undo}
+        disabled={!canUndo}
+      />
+      <TopBarButton
+        icon={<Redo2 className="h-4 w-4" />}
+        label="Redo (Ctrl+Shift+Z)"
+        onClick={redo}
+        disabled={!canRedo}
+      />
 
       <div className="flex-1" />
 
@@ -313,17 +327,25 @@ function TopBarButton({
   icon,
   label,
   onClick,
+  disabled,
 }: {
   icon: React.ReactNode;
   label: string;
   onClick?: () => void;
+  disabled?: boolean;
 }) {
   return (
     <button
       type="button"
       title={label}
       onClick={onClick}
-      className="h-8 w-8 grid place-items-center rounded-md text-[color:var(--color-fg-muted)] hover:bg-[color:var(--color-bg-elev-2)] hover:text-[color:var(--color-fg)] transition"
+      disabled={disabled}
+      className={cn(
+        "h-8 w-8 grid place-items-center rounded-md text-[color:var(--color-fg-muted)] transition",
+        disabled
+          ? "opacity-40 cursor-not-allowed"
+          : "hover:bg-[color:var(--color-bg-elev-2)] hover:text-[color:var(--color-fg)]",
+      )}
     >
       {icon}
     </button>

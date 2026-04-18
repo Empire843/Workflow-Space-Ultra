@@ -1,6 +1,7 @@
 import path from "node:path";
 
 import type { NodeDataBase, NodeKind, OutputItem } from "@/lib/nodes";
+import { buildCombinedPrompt, joinTextSegments } from "@/lib/prompt";
 import { resolveI2vModelKey, resolveT2vModelKey } from "@/lib/veoVideoModels";
 
 import {
@@ -50,10 +51,8 @@ export async function executeNode(
       if (kind === "content.text") {
         const upstream = inputs
           .filter((i) => i?.kind === "content.text")
-          .map((i) => (i.effectiveText || i.text || "").trim())
-          .filter(Boolean);
-        const own = (nodeData.text || "").trim();
-        const combined = [...upstream, own].filter(Boolean).join("\n");
+          .map((i) => i.effectiveText || i.text || "");
+        const combined = joinTextSegments([...upstream, nodeData.text]);
         const out: NodeDataBase = {
           ...nodeData,
           effectiveText: combined,
@@ -70,24 +69,13 @@ export async function executeNode(
       return out;
     }
 
-    // Prompt = all upstream text (in edge order) + own prompt.
-    // Allows the user to:
-    //   - chain text nodes → the last text node already has effectiveText accumulated
-    //   - connect MULTIPLE text nodes in parallel to the same gen node → merge them all
-    //   - use text nodes and also add a prompt directly on the gen node
-    //
-    // IMPORTANT: do NOT mutate `nodeData.prompt` with the combined text. The client merges
-    // `msg.output` (including prompt) back into node.data after run → if we
-    // overwrite prompt with upstream+own, the next run would double the upstream
-    // (upstream + (upstream+own)). So use a local `genData` for the provider,
-    // while `output` keeps the user's original `prompt`.
-    const upstreamTexts = inputs
-      .filter((i): i is NodeDataBase => Boolean(i) && i.kind === "content.text")
-      .map((i) => (i.effectiveText || i.text || "").trim())
-      .filter(Boolean);
-    const upstreamText = upstreamTexts.join("\n");
-    const ownPrompt = (nodeData.prompt || "").trim();
-    const combinedPrompt = [upstreamText, ownPrompt].filter(Boolean).join("\n");
+    // Prompt = all upstream text (in edge order) + own prompt. The helper lives
+    // in @/lib/prompt so client preview and server execution agree on the
+    // join semantics. IMPORTANT: do NOT mutate `nodeData.prompt` with the
+    // combined text — the client merges `msg.output` back into node.data after
+    // run → overwriting prompt with upstream+own would double the upstream on
+    // subsequent re-runs. Use a local `genData` for providers only.
+    const combinedPrompt = buildCombinedPrompt(nodeData.prompt, inputs);
     const genData: NodeDataBase = { ...nodeData, prompt: combinedPrompt };
 
     // Resolve primary / secondary image inputs

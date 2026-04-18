@@ -10,11 +10,13 @@ import {
   useReactFlow,
   type NodeTypes,
 } from "@xyflow/react";
-import { useCallback, useEffect, useMemo, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useShallow } from "zustand/react/shallow";
 
 import { useWorkflowStore } from "@/state/workflowStore";
 import type { NodeKind } from "@/lib/nodes";
 
+import QuickAddMenu from "./QuickAddMenu";
 import WSNode from "./WSNode";
 
 const nodeTypes: NodeTypes = { wsNode: WSNode };
@@ -28,24 +30,46 @@ export default function Canvas() {
 }
 
 function Inner() {
-  const {
-    nodes,
-    edges,
-    onNodesChange,
-    onEdgesChange,
-    onConnect,
-    addNode,
-    selectNode,
-    canvasTool,
-    showMinimap,
-    showPalette,
-    setCanvasTool,
-    togglePalette,
-    toggleMinimap,
-  } = useWorkflowStore();
+  // Split selectors with shallow equality to avoid full re-render on every
+  // node/edge patch (e.g. progress ticks). `nodes`/`edges` identity changes
+  // intentionally; other slices stay stable.
+  const nodes = useWorkflowStore((s) => s.nodes);
+  const edges = useWorkflowStore((s) => s.edges);
+  const canvasTool = useWorkflowStore((s) => s.canvasTool);
+  const showMinimap = useWorkflowStore((s) => s.showMinimap);
+  const showPalette = useWorkflowStore((s) => s.showPalette);
+  const { onNodesChange, onEdgesChange, onConnect, addNode, selectNode, setCanvasTool, togglePalette, toggleMinimap } =
+    useWorkflowStore(
+      useShallow((s) => ({
+        onNodesChange: s.onNodesChange,
+        onEdgesChange: s.onEdgesChange,
+        onConnect: s.onConnect,
+        addNode: s.addNode,
+        selectNode: s.selectNode,
+        setCanvasTool: s.setCanvasTool,
+        togglePalette: s.togglePalette,
+        toggleMinimap: s.toggleMinimap,
+      })),
+    );
 
   const { screenToFlowPosition } = useReactFlow();
   const wrapperRef = useRef<HTMLDivElement>(null);
+
+  // Quick-add menu: right-click the empty pane to open a searchable node picker
+  // at the cursor. `flow*` = world coords where the spawned node will land;
+  // `screen*` = viewport pixels for positioning the menu.
+  const [quickAdd, setQuickAdd] = useState<
+    { screenX: number; screenY: number; flowX: number; flowY: number } | null
+  >(null);
+
+  const onPaneContextMenu = useCallback(
+    (e: React.MouseEvent | MouseEvent) => {
+      e.preventDefault();
+      const flow = screenToFlowPosition({ x: e.clientX, y: e.clientY });
+      setQuickAdd({ screenX: e.clientX, screenY: e.clientY, flowX: flow.x, flowY: flow.y });
+    },
+    [screenToFlowPosition],
+  );
 
   const onDrop = useCallback(
     (e: React.DragEvent<HTMLDivElement>) => {
@@ -72,7 +96,27 @@ function Inner() {
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
       const tag = (e.target as HTMLElement)?.tagName?.toLowerCase();
-      if (tag === "input" || tag === "textarea" || (e.target as HTMLElement)?.isContentEditable) return;
+      const isEditable = tag === "input" || tag === "textarea" || (e.target as HTMLElement)?.isContentEditable;
+
+      // Ctrl/Cmd+Z = undo, Ctrl/Cmd+Shift+Z = redo, Ctrl+Y = redo (Windows style)
+      // Intercepted even inside inputs is tempting but confuses users — they
+      // expect native text-field undo there. So gate by !isEditable.
+      const mod = e.ctrlKey || e.metaKey;
+      if (mod && !isEditable) {
+        const key = e.key.toLowerCase();
+        if (key === "z" && !e.shiftKey) {
+          e.preventDefault();
+          useWorkflowStore.getState().undo();
+          return;
+        }
+        if ((key === "z" && e.shiftKey) || key === "y") {
+          e.preventDefault();
+          useWorkflowStore.getState().redo();
+          return;
+        }
+      }
+
+      if (isEditable) return;
       if (e.metaKey || e.ctrlKey || e.altKey) return;
 
       switch (e.key.toLowerCase()) {
@@ -135,12 +179,21 @@ function Inner() {
         onEdgesChange={onEdgesChange}
         onConnect={onConnect}
         nodeTypes={nodeTypes}
-        onPaneClick={() => selectNode(null)}
+        onPaneClick={() => {
+          selectNode(null);
+          setQuickAdd(null);
+        }}
+        onPaneContextMenu={onPaneContextMenu}
+        onMoveStart={() => setQuickAdd(null)}
+        onNodeContextMenu={() => setQuickAdd(null)}
         defaultEdgeOptions={defaultEdgeOptions}
         proOptions={{ hideAttribution: true }}
         fitView
         minZoom={0.2}
         maxZoom={2}
+        // Perf: only mount nodes/edges intersecting the viewport. Dramatic
+        // savings once the canvas has dozens of media previews.
+        onlyRenderVisibleElements
         /* Delete selected nodes/edges with both Delete and Backspace.
          * React Flow emits `{type: "remove"}` changes → applied by `onNodesChange` /
          * `onEdgesChange` in the store. Edges attached to a removed node are
@@ -171,6 +224,15 @@ function Inner() {
         )}
         <Controls position="bottom-left" />
       </ReactFlow>
+      {quickAdd && (
+        <QuickAddMenu
+          screenX={quickAdd.screenX}
+          screenY={quickAdd.screenY}
+          flowX={quickAdd.flowX}
+          flowY={quickAdd.flowY}
+          onClose={() => setQuickAdd(null)}
+        />
+      )}
     </div>
   );
 }

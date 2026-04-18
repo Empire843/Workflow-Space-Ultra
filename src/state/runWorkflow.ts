@@ -3,8 +3,10 @@
 import type { Edge } from "@xyflow/react";
 
 import type { NodeDataBase } from "@/lib/nodes";
+import { joinTextSegments } from "@/lib/prompt";
 import { classifySessionError } from "@/lib/sessionError";
 import { uid } from "@/lib/utils";
+import { getEdgesByTarget, getNodesById } from "@/state/graphMaps";
 import { useSessionErrorStore } from "@/state/sessionErrorStore";
 import { useWorkflowStore } from "@/state/workflowStore";
 
@@ -142,16 +144,12 @@ function computeEffectiveText(nodeId: string, visited: Set<string> = new Set()):
   visited.add(nodeId);
 
   const store = useWorkflowStore.getState();
-  const node = store.nodes.find((n) => n.id === nodeId);
+  const node = getNodesById(store.nodes).get(nodeId);
   if (!node || node.data.kind !== "content.text") return "";
 
-  const parentIds = store.edges.filter((e) => e.target === nodeId).map((e) => e.source);
-  const upstream = parentIds
-    .map((pid) => computeEffectiveText(pid, visited))
-    .map((s) => s.trim())
-    .filter(Boolean);
-  const own = (node.data.text || "").trim();
-  return [...upstream, own].filter(Boolean).join("\n");
+  const parentEdges = getEdgesByTarget(store.edges).get(nodeId) ?? [];
+  const upstream = parentEdges.map((e) => computeEffectiveText(e.source, visited));
+  return joinTextSegments([...upstream, node.data.text]);
 }
 
 /**

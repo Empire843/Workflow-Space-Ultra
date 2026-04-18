@@ -43,6 +43,8 @@ A node-based AI workflow canvas (Picsart Flow / Freepik AI Suite–style) for **
 - Text chaining — connect multiple text nodes; downstream nodes merge them into one composite prompt.
 - Real-time progress streamed onto each node, with per-provider job queues to respect rate limits.
 - Auto re-login popup when a session expires — guides you through the recovery flow.
+- Full undo/redo history — `Ctrl/Cmd+Z`, `Ctrl/Cmd+Shift+Z` (or `Ctrl+Y`); drag-as-one-step; safe across progress ticks.
+- Quick-add menu — right-click an empty spot on the canvas to spawn a searchable node picker at the cursor (↑/↓/Enter/Esc).
 - Dark, minimal Picsart-style UI with edge-to-edge media previews.
 
 ## Quick start
@@ -50,6 +52,14 @@ A node-based AI workflow canvas (Picsart Flow / Freepik AI Suite–style) for **
 ```bash
 npm install
 npm run dev      # http://localhost:3000
+```
+
+Handy scripts:
+
+```bash
+npm test           # run the Vitest unit suite (lanes, prompt chain, zod, runWorkflow topo, ...)
+npm run typecheck  # strict TypeScript check
+npm run screenshots # regenerate demo screenshots in docs/screenshots/
 ```
 
 On first run:

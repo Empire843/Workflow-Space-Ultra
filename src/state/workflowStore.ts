@@ -37,6 +37,21 @@ const RUNTIME_KEYS: (keyof NodeDataBase)[] = [
   "uploadBase64",
 ];
 
+const RUNTIME_KEY_SET = new Set<string>(RUNTIME_KEYS as unknown as string[]);
+
+/**
+ * A patch is "runtime-only" when it touches nothing except RUNTIME_KEYS.
+ * Progress ticks and SSE status updates fall in this bucket and should NOT
+ * reschedule the debounced IndexedDB save — otherwise every running job
+ * triggers a write per second per node.
+ */
+function isRuntimeOnlyPatch(patch: Partial<NodeDataBase>): boolean {
+  for (const k of Object.keys(patch)) {
+    if (!RUNTIME_KEY_SET.has(k)) return false;
+  }
+  return true;
+}
+
 function stripRuntimeFields(nodes: WSNode[]): WSNode[] {
   return nodes.map((n) => {
     const cleaned = { ...n.data };
@@ -65,6 +80,20 @@ function scheduleSave() {
 }
 
 // ---------------------------------------------------------------------------
+// Undo / Redo history
+// ---------------------------------------------------------------------------
+interface HistorySnapshot {
+  nodes: WSNode[];
+  edges: WSEdge[];
+}
+
+const MAX_HISTORY = 50;
+
+// Tracks whether we've already snapshotted the CURRENT drag gesture so we only
+// push one undo step per drag (not per intermediate position change).
+let _dragSnapshotTaken = false;
+
+// ---------------------------------------------------------------------------
 // Store
 // ---------------------------------------------------------------------------
 export type CanvasTool = "select" | "pan";
@@ -80,6 +109,12 @@ interface WorkflowState {
   canvasTool: CanvasTool;
   showPalette: boolean;
   showMinimap: boolean;
+
+  // Undo/redo
+  _past: HistorySnapshot[];
+  _future: HistorySnapshot[];
+  canUndo: boolean;
+  canRedo: boolean;
 
   setNodes: (n: WSNode[]) => void;
   setEdges: (e: WSEdge[]) => void;
@@ -100,6 +135,11 @@ interface WorkflowState {
   onConnect: (conn: Connection) => void;
 
   clearAll: () => void;
+
+  undo: () => void;
+  redo: () => void;
+  _takeSnapshot: () => void;
+  _clearHistory: () => void;
 
   // Multi-workflow actions
   loadWorkflow: (id: string) => Promise<boolean>;
@@ -124,14 +164,76 @@ export const useWorkflowStore = create<WorkflowState>()(
     showPalette: true,
     showMinimap: true,
 
+    _past: [],
+    _future: [],
+    canUndo: false,
+    canRedo: false,
+
+    _takeSnapshot: () => {
+      const { nodes, edges, _past } = get();
+      const snap: HistorySnapshot = { nodes, edges };
+      const nextPast = [..._past, snap];
+      // Keep history bounded to avoid unbounded memory on long sessions.
+      if (nextPast.length > MAX_HISTORY) nextPast.splice(0, nextPast.length - MAX_HISTORY);
+      set({ _past: nextPast, _future: [], canUndo: true, canRedo: false });
+    },
+
+    _clearHistory: () => {
+      _dragSnapshotTaken = false;
+      set({ _past: [], _future: [], canUndo: false, canRedo: false });
+    },
+
+    undo: () => {
+      const { _past, _future, nodes, edges } = get();
+      if (!_past.length) return;
+      const prev = _past[_past.length - 1];
+      const nextPast = _past.slice(0, -1);
+      const nextFuture = [..._future, { nodes, edges }];
+      set({
+        nodes: prev.nodes,
+        edges: prev.edges,
+        _past: nextPast,
+        _future: nextFuture,
+        canUndo: nextPast.length > 0,
+        canRedo: true,
+      });
+      scheduleSave();
+    },
+
+    redo: () => {
+      const { _past, _future, nodes, edges } = get();
+      if (!_future.length) return;
+      const next = _future[_future.length - 1];
+      const nextFuture = _future.slice(0, -1);
+      const nextPast = [..._past, { nodes, edges }];
+      set({
+        nodes: next.nodes,
+        edges: next.edges,
+        _past: nextPast,
+        _future: nextFuture,
+        canUndo: true,
+        canRedo: nextFuture.length > 0,
+      });
+      scheduleSave();
+    },
+
     setCanvasTool: (tool) => set({ canvasTool: tool }),
     togglePalette: () => set((s) => ({ showPalette: !s.showPalette })),
     toggleMinimap: () => set((s) => ({ showMinimap: !s.showMinimap })),
 
-    setNodes: (n) => { set({ nodes: n }); scheduleSave(); },
-    setEdges: (e) => { set({ edges: e }); scheduleSave(); },
+    setNodes: (n) => {
+      get()._takeSnapshot();
+      set({ nodes: n });
+      scheduleSave();
+    },
+    setEdges: (e) => {
+      get()._takeSnapshot();
+      set({ edges: e });
+      scheduleSave();
+    },
 
     addNode: (kind, position, extra) => {
+      get()._takeSnapshot();
       const id = uid("node");
       const catalogEntry = NODE_CATALOG.find((e) => e.kind === kind);
       const genMode = extra?.genMode || catalogEntry?.defaultGenMode;
@@ -146,12 +248,21 @@ export const useWorkflowStore = create<WorkflowState>()(
       return id;
     },
 
-    addNodes: (ns) => { set({ nodes: [...get().nodes, ...ns] }); scheduleSave(); },
-    addEdges: (es) => { set({ edges: [...get().edges, ...es] }); scheduleSave(); },
+    addNodes: (ns) => {
+      get()._takeSnapshot();
+      set({ nodes: [...get().nodes, ...ns] });
+      scheduleSave();
+    },
+    addEdges: (es) => {
+      get()._takeSnapshot();
+      set({ edges: [...get().edges, ...es] });
+      scheduleSave();
+    },
 
     cloneNode: (sourceId, offsetIndex, extra) => {
       const src = get().nodes.find((n) => n.id === sourceId);
       if (!src) return null;
+      get()._takeSnapshot();
       const id = uid("node");
       const pos = {
         x: (src.position.x || 0) + 280 * offsetIndex,
@@ -180,15 +291,20 @@ export const useWorkflowStore = create<WorkflowState>()(
     },
 
     updateNodeData: (id, data) => {
+      const runtimeOnly = isRuntimeOnlyPatch(data);
+      // Skip snapshots for runtime-only progress/status ticks — they'd pollute
+      // the undo stack with uninteresting states and bury the user's last edit.
+      if (!runtimeOnly) get()._takeSnapshot();
       set({
         nodes: get().nodes.map((n) =>
           n.id === id ? { ...n, data: { ...n.data, ...data } } : n
         ),
       });
-      scheduleSave();
+      if (!runtimeOnly) scheduleSave();
     },
 
     removeNode: (id) => {
+      get()._takeSnapshot();
       set({
         nodes: get().nodes.filter((n) => n.id !== id),
         edges: get().edges.filter((e) => e.source !== id && e.target !== id),
@@ -200,6 +316,32 @@ export const useWorkflowStore = create<WorkflowState>()(
     selectNode: (id) => set({ selectedNodeId: id }),
 
     onNodesChange: (changes) => {
+      // Decide if THIS change batch should push an undo snapshot. React Flow
+      // fires many `position` changes while dragging (one per frame) → we only
+      // want ONE undo step for the whole drag. Strategy:
+      //   • `dragging: true` from React Flow → snapshot once per gesture
+      //   • `dragging: false` (drag end) → reset the per-gesture flag, no snapshot
+      //   • `remove` / `reset` / `add` → always snapshot (discrete ops)
+      //   • `select` / `dimensions` only → ignore (transient UI)
+      let snapshotWorthy = false;
+      let dragStart = false;
+      let dragEnd = false;
+      for (const c of changes) {
+        if (c.type === "position") {
+          if (c.dragging) dragStart = true;
+          else dragEnd = true;
+        } else if (c.type === "remove" || c.type === "add" || c.type === "replace") {
+          snapshotWorthy = true;
+        }
+      }
+      if (dragStart && !_dragSnapshotTaken) {
+        get()._takeSnapshot();
+        _dragSnapshotTaken = true;
+      } else if (snapshotWorthy) {
+        get()._takeSnapshot();
+      }
+      if (dragEnd) _dragSnapshotTaken = false;
+
       const nextNodes = applyNodeChanges(changes, get().nodes) as WSNode[];
       // If the selected node is removed (via Delete/Backspace or
       // drag-select + delete), clear selectedNodeId so NodeInspector hides.
@@ -217,15 +359,24 @@ export const useWorkflowStore = create<WorkflowState>()(
       scheduleSave();
     },
     onEdgesChange: (changes) => {
+      const snapshotWorthy = changes.some(
+        (c) => c.type === "remove" || c.type === "add" || c.type === "replace",
+      );
+      if (snapshotWorthy) get()._takeSnapshot();
       set({ edges: applyEdgeChanges(changes, get().edges) });
       scheduleSave();
     },
     onConnect: (conn) => {
+      get()._takeSnapshot();
       set({ edges: addEdge({ ...conn, animated: true, style: { stroke: "#ff3c8e" } }, get().edges) });
       scheduleSave();
     },
 
-    clearAll: () => { set({ nodes: [], edges: [], selectedNodeId: null }); scheduleSave(); },
+    clearAll: () => {
+      get()._takeSnapshot();
+      set({ nodes: [], edges: [], selectedNodeId: null });
+      scheduleSave();
+    },
 
     // ----- Multi-workflow -----
 
@@ -239,6 +390,7 @@ export const useWorkflowStore = create<WorkflowState>()(
         edges: (rec.data.edges ?? []) as WSEdge[],
         selectedNodeId: null,
       });
+      get()._clearHistory();
       _persistActiveId(rec.id);
       return true;
     },
@@ -283,6 +435,7 @@ export const useWorkflowStore = create<WorkflowState>()(
         edges: [],
         selectedNodeId: null,
       });
+      get()._clearHistory();
       _persistActiveId(id);
       return id;
     },
@@ -291,6 +444,7 @@ export const useWorkflowStore = create<WorkflowState>()(
       await deleteWorkflowRecord(id);
       if (get().activeWorkflowId === id) {
         set({ activeWorkflowId: null, activeWorkflowName: "", nodes: [], edges: [], selectedNodeId: null });
+        get()._clearHistory();
         _persistActiveId(null);
       }
     },
@@ -318,6 +472,7 @@ export const useWorkflowStore = create<WorkflowState>()(
       const { activeWorkflowId, _saveCurrentWorkflow } = get();
       if (activeWorkflowId) await _saveCurrentWorkflow();
       set({ activeWorkflowId: null, activeWorkflowName: "", nodes: [], edges: [], selectedNodeId: null });
+      get()._clearHistory();
       _persistActiveId(null);
     },
   })

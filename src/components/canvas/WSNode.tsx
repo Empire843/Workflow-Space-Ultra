@@ -29,6 +29,7 @@ import {
 import { cn } from "@/lib/utils";
 import { runSingleNode } from "@/state/runWorkflow";
 import { useWorkflowStore } from "@/state/workflowStore";
+import { getEdgesByTarget, getNodesById } from "@/state/graphMaps";
 
 const VIDEO_MODE_LABELS: Record<string, string> = {
   "t2v.veo": "Text → Video (VEO)",
@@ -77,20 +78,20 @@ export default function WSNode(props: NodeProps) {
   const hasImageRef = useWorkflowStore((s) => {
     if (d.kind !== "gen.video") return false;
     if (genMode === "i2v.veo" || genMode === "i2v.grok") return false;
-    return s.edges
-      .filter((e) => e.target === id)
-      .some((e) => {
-        const src = s.nodes.find((n) => n.id === e.source);
-        if (!src) return false;
-        const k = src.data.kind;
-        return (
-          k === "content.image" ||
-          k === "content.upload" ||
-          k === "gen.image" ||
-          src.data.imageUrl ||
-          src.data.imageMediaId
-        );
-      });
+    const nodesById = getNodesById(s.nodes);
+    const parents = getEdgesByTarget(s.edges).get(id) ?? [];
+    return parents.some((e) => {
+      const src = nodesById.get(e.source);
+      if (!src) return false;
+      const k = src.data.kind;
+      return (
+        k === "content.image" ||
+        k === "content.upload" ||
+        k === "gen.image" ||
+        src.data.imageUrl ||
+        src.data.imageMediaId
+      );
+    });
   });
 
   const hasOutput =
@@ -106,26 +107,26 @@ export default function WSNode(props: NodeProps) {
    * to avoid confusion.
    */
   const hasPendingUpstream = useWorkflowStore((s) => {
-    const parentIds = s.edges.filter((e) => e.target === id).map((e) => e.source);
-    if (!parentIds.length) return false;
+    const nodesById = getNodesById(s.nodes);
+    const edgesByTarget = getEdgesByTarget(s.edges);
+    const direct = edgesByTarget.get(id);
+    if (!direct?.length) return false;
     // DFS to detect any upstream gen node that is not done and has no output yet.
     const seen = new Set<string>();
-    const stack = [...parentIds];
+    const stack = direct.map((e) => e.source);
     while (stack.length) {
       const pid = stack.pop()!;
       if (seen.has(pid)) continue;
       seen.add(pid);
-      const p = s.nodes.find((n) => n.id === pid);
+      const p = nodesById.get(pid);
       if (!p) continue;
       const pd = p.data;
       const hasOut = !!(pd.imageUrl || pd.videoUrl || pd.imageMediaId || pd.uploadBase64 || (pd.outputs && pd.outputs.length));
       if (!pd.kind.startsWith("content.") && pd.status !== "done" && !hasOut) {
         return true;
       }
-      // recurse up to ancestors (content chain or completed gen nodes)
-      for (const e of s.edges) {
-        if (e.target === pid) stack.push(e.source);
-      }
+      const up = edgesByTarget.get(pid);
+      if (up) for (const e of up) stack.push(e.source);
     }
     return false;
   });

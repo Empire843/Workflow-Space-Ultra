@@ -1,20 +1,11 @@
 import { NextResponse } from "next/server";
 
-import { loadConfig, saveConfig, type AccountType } from "@/server/config";
+import { SaveConfigSchema, type ClientSettings } from "@/lib/schemas/api";
+import { loadConfig, saveConfig } from "@/server/config";
+import { parseJsonBody } from "@/server/http/validate";
 import { setLaneConcurrency } from "@/server/lanes";
 
 export const runtime = "nodejs";
-
-interface ClientSettings {
-  accountType: AccountType;
-  veoProjectId: string;
-  veoSessionId: string;
-  createImageModel: string;
-  seedMode: "Random" | "Fixed";
-  seedValue: number;
-  veoConcurrency: number;
-  grokConcurrency: number;
-}
 
 export async function GET() {
   const c = loadConfig();
@@ -32,9 +23,10 @@ export async function GET() {
 }
 
 export async function POST(req: Request) {
-  const body = (await req.json()) as { settings?: ClientSettings };
-  if (!body.settings) return NextResponse.json({ ok: false, message: "Missing settings" }, { status: 400 });
-  const s = body.settings;
+  const result = await parseJsonBody(req, SaveConfigSchema);
+  if ("response" in result) return result.response;
+  const s = result.data.settings;
+
   const c = loadConfig();
   c.account1.TYPE_ACCOUNT = s.accountType;
   c.account1.projectId = s.veoProjectId || undefined;
