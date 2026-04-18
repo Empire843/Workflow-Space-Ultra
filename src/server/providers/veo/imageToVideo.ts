@@ -46,6 +46,15 @@ export async function requestUploadUserImage(opts: UploadImageOptions): Promise<
   return postJsonWithToken(URL_UPLOAD_USER_IMAGE, payload, opts.accessToken, opts.cookie);
 }
 
+/**
+ * Parse the mediaId returned by `uploadUserImage`.
+ *
+ * As of 2026-04, the endpoint returns a nested wrapper:
+ *   { "mediaGenerationId": { "mediaGenerationId": "CAM..." }, "width": …, "height": … }
+ * Older firmware used flat keys (`mediaId`, `media.mediaId`, …). We accept
+ * every known shape and return the opaque id string. Callers that need the
+ * nested wrapper for downstream payloads can re-wrap it.
+ */
 export function parseUploadMediaId(body: string): string | null {
   try {
     const parsed = JSON.parse(body) as {
@@ -53,14 +62,15 @@ export function parseUploadMediaId(body: string): string | null {
       media?: { mediaId?: string };
       image?: { mediaId?: string };
       result?: { mediaId?: string };
+      mediaGenerationId?: string | { mediaGenerationId?: string };
     };
-    return (
-      parsed.mediaId ||
-      parsed.media?.mediaId ||
-      parsed.image?.mediaId ||
-      parsed.result?.mediaId ||
-      null
-    );
+    if (parsed.mediaId) return parsed.mediaId;
+    if (parsed.media?.mediaId) return parsed.media.mediaId;
+    if (parsed.image?.mediaId) return parsed.image.mediaId;
+    if (parsed.result?.mediaId) return parsed.result.mediaId;
+    if (typeof parsed.mediaGenerationId === "string") return parsed.mediaGenerationId;
+    if (parsed.mediaGenerationId?.mediaGenerationId) return parsed.mediaGenerationId.mediaGenerationId;
+    return null;
   } catch {
     return null;
   }

@@ -2,6 +2,7 @@
 
 import { Loader2, Send, Upload as UploadIcon, X } from "lucide-react";
 import { useEffect, useMemo, useRef } from "react";
+import { useShallow } from "zustand/react/shallow";
 
 import { NODE_CATALOG, type GenMode, type NodeDataBase } from "@/lib/nodes";
 import {
@@ -227,8 +228,47 @@ async function fileToBase64(file: File): Promise<string> {
 // gen.image
 // ---------------------------------------------------------------------------
 
+/** Models that accept reference images — mirror of server MODEL_SUPPORTS_REFERENCE. */
+const IMAGE_MODELS_SUPPORT_REFERENCE = new Set(["Nano Banana 2", "Nano Banana pro", "Nano Banana"]);
+
 function ImageGenConfig({ nodeId, data }: { nodeId: string; data: NodeDataBase }) {
   const updateNodeData = useWorkflowStore((s) => s.updateNodeData);
+
+  // Collect upstream image node data refs for the preview row.
+  //
+  // IMPORTANT: the selector must return STABLE references across renders,
+  // otherwise React + Zustand trigger "getSnapshot should be cached" (and
+  // ultimately an infinite update loop). Pitfall: if the selector builds new
+  // plain objects inside the array (e.g. `{ imageUrl: d.imageUrl, ... }`),
+  // `useShallow` still sees them as different refs every call. The fix is to
+  // return the ORIGINAL `data` refs from the store (those are only replaced
+  // when `updateNodeData` runs) and let a `useMemo` project them into the
+  // shape the UI consumes.
+  const rawRefs = useWorkflowStore(
+    useShallow((s): NodeDataBase[] => {
+      const parentIds = s.edges.filter((e) => e.target === nodeId).map((e) => e.source);
+      const refs: NodeDataBase[] = [];
+      for (const pid of parentIds) {
+        const d = s.nodes.find((n) => n.id === pid)?.data;
+        if (!d) continue;
+        if (!(d.imageUrl || d.imageMediaId || d.uploadBase64)) continue;
+        refs.push(d);
+      }
+      return refs;
+    })
+  );
+
+  const references = useMemo(
+    () =>
+      rawRefs.map((d) => ({
+        url: d.imageUrl || (d.uploadBase64 ? `data:${d.uploadMime || "image/png"};base64,${d.uploadBase64}` : ""),
+        label: d.label || d.kind,
+      })),
+    [rawRefs]
+  );
+
+  const modelLabel = data.modelLabel || "Nano Banana 2";
+  const supportsRef = IMAGE_MODELS_SUPPORT_REFERENCE.has(modelLabel);
 
   useEffect(() => {
     if (!data.modelLabel) {
@@ -243,10 +283,41 @@ function ImageGenConfig({ nodeId, data }: { nodeId: string; data: NodeDataBase }
         <Label>Prompt</Label>
         <PromptTextarea nodeId={nodeId} value={data.prompt || ""} />
       </div>
+      {references.length > 0 && (
+        <div>
+          <Label>
+            References · {references.length}
+            {!supportsRef && (
+              <span className="ml-2 text-[10px] font-normal text-amber-400">
+                {modelLabel} không hỗ trợ reference — ảnh sẽ bị bỏ qua. Chọn Nano Banana 2 / pro để dùng.
+              </span>
+            )}
+          </Label>
+          <div className="flex flex-wrap gap-1.5 mt-1">
+            {references.map((r, i) => (
+              <div
+                key={i}
+                className={cn(
+                  "relative h-12 w-12 rounded-md overflow-hidden border",
+                  supportsRef ? "border-[color:var(--color-accent)]/50" : "border-amber-500/40 opacity-60",
+                )}
+                title={r.label}
+              >
+                {r.url ? (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img src={r.url} alt={r.label} className="h-full w-full object-cover" />
+                ) : (
+                  <div className="h-full w-full grid place-items-center text-[9px] text-[color:var(--color-fg-dim)]">?</div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
       <div className="flex flex-wrap items-end gap-2">
         <Field label="Model">
           <Select
-            value={data.modelLabel || "Nano Banana 2"}
+            value={modelLabel}
             onChange={(v) => updateNodeData(nodeId, { modelLabel: v })}
             options={IMAGE_MODEL_OPTIONS.map((m) => ({ value: m, label: m }))}
           />

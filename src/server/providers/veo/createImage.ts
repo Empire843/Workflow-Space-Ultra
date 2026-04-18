@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import {
   clampSeed,
   CREATE_IMAGE_MODEL_TO_KEY,
@@ -29,6 +31,20 @@ import { postJsonWithToken, type HttpResult } from "./http";
  * imageModelKey/modelKey), `prompt` (not textInput). There is NO metadata.sceneId.
  */
 
+/**
+ * A reference / subject image for Nano Banana / edit-capable models.
+ *
+ * Schema source: useapi.net Flow docs (reverse-engineered). The batchGenerateImages
+ * endpoint accepts per-request `imageInputs: [{ mediaGenerationId, imageInputType }]`.
+ * `mediaGenerationId` is the flat string returned by `uploadUserImage`.
+ * `imageInputType` enum: "IMAGE_INPUT_TYPE_REFERENCE" (default here).
+ */
+export interface ReferenceImageInput {
+  mediaGenerationId: string;
+  /** Role enum — full protobuf name e.g. "IMAGE_INPUT_TYPE_REFERENCE". */
+  imageInputType?: string;
+}
+
 export interface CreateImageOptions {
   prompt: string;
   sessionId: string;
@@ -42,7 +58,17 @@ export interface CreateImageOptions {
   outputCount?: number;
   accountType?: "NORMAL" | "PRO" | "ULTRA";
   seed?: number;
+  /** Upstream reference images (Nano Banana). Ignored by pure T2I models. */
+  referenceImages?: ReferenceImageInput[];
 }
+
+/** Models that accept `imageInputs` (reference / edit). Imagen is pure T2I. */
+export const MODEL_SUPPORTS_REFERENCE: Record<string, boolean> = {
+  NARWHAL: true,      // Nano Banana 2
+  GEM_PIX_2: true,    // Nano Banana pro
+  GEM_PIX: true,      // Nano Banana (legacy)
+  IMAGEN_3_5: false,  // Imagen 4 — text-only
+};
 
 function randomSeed(): number {
   return Math.floor(Math.random() * (SEED_MAX + 1));
@@ -73,6 +99,29 @@ export function buildCreateImagePayload(opts: CreateImageOptions) {
     tool: "PINHOLE",
   };
 
+  // Schema confirmed from captured labs.google UI payload (VEO_CAPTURE_PAYLOADS=1):
+  //   top-level:   clientContext, mediaGenerationContext.batchId, useNewMedia, requests[]
+  //   per-request: clientContext, imageModelName, imageAspectRatio,
+  //                structuredPrompt.parts[].text, seed, imageInputs[]
+  //   imageInputs[i]: { imageInputType: "IMAGE_INPUT_TYPE_REFERENCE", name: <uuid> }
+  //
+  // `name` is the plain UUID identifier of a previously-seen Flow media asset
+  // (returned by both `batchGenerateImages` responses — under `name`/`mediaId` —
+  // and `uploadUserImage` responses — nested under `mediaGenerationId`).
+  //
+  // Rejected shapes (do NOT bring these back without re-capturing a new UI payload):
+  //   top-of-request:      imageGenerationRequestData | requestData | imageGenerationImageInputs
+  //   imageInputs[0].<x>:  mediaId | mediaGenerationId | mimeType | imageRole
+  //                         | image | generatedImage
+  const supportsRef = MODEL_SUPPORTS_REFERENCE[modelName] ?? false;
+  const refs = opts.referenceImages ?? [];
+  const referenceItems = supportsRef
+    ? refs.map((r) => ({
+        imageInputType: r.imageInputType || "IMAGE_INPUT_TYPE_REFERENCE",
+        name: r.mediaGenerationId,
+      }))
+    : [];
+
   const count = outputCount > 0 ? outputCount : 1;
   const requests = Array.from({ length: count }, (_, i) => {
     let effectiveSeed: number;
@@ -82,18 +131,23 @@ export function buildCreateImagePayload(opts: CreateImageOptions) {
       effectiveSeed = randomSeed();
     }
 
-    return {
+    const requestItem: Record<string, unknown> = {
       clientContext: JSON.parse(JSON.stringify(clientContext)),
-      imageAspectRatio: aspectRatio,
-      seed: effectiveSeed,
       imageModelName: modelName,
-      prompt,
-      imageInputs: [] as unknown[],
+      imageAspectRatio: aspectRatio,
+      // Real UI: structuredPrompt preferred; flat `prompt` is legacy.
+      structuredPrompt: { parts: [{ text: prompt || "" }] },
+      seed: effectiveSeed,
+      imageInputs: JSON.parse(JSON.stringify(referenceItems)),
     };
+    return requestItem;
   });
 
   return {
     clientContext,
+    // One batchId per call (UUID); `useNewMedia: true` is always set by UI.
+    mediaGenerationContext: { batchId: randomUUID() },
+    useNewMedia: true,
     requests,
   };
 }

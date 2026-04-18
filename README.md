@@ -74,6 +74,16 @@ That's it. Sessions are cached locally; you only need to re-login when they expi
 
 Defaults work out of the box. To override, copy `.env.example` → `.env.local` or use the in-app **Settings** dialog.
 
+### Debugging undocumented VEO endpoints
+
+If VEO/Flow changes its payload schema and calls start returning `400 Unknown name "…" at "…"`, enable **capture mode** to record the real payload that labs.google's UI sends and compare it against what the tool sends:
+
+```powershell
+$env:VEO_CAPTURE_PAYLOADS="1"; npm run dev
+```
+
+Then perform the action in the labs.google tab that the tool keeps open (upload a reference image, hit Generate, …). Every intercepted `batchGenerateImages` / `batchAsync*` request is logged as a `[VEO CAPTURE]` block in the terminal — URL, full request body, no truncation. The requests are still short-circuited with `403` so nothing actually fires against your quota. Unset the env var to return to normal run mode.
+
 ## License
 
 Private / personal use only.
