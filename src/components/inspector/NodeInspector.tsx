@@ -153,11 +153,17 @@ function UploadNodeConfig({ nodeId, data }: { nodeId: string; data: NodeDataBase
 
   const handleFile = async (file: File) => {
     const b64 = await fileToBase64(file);
+    const dataUri = `data:${file.type};base64,${b64}`;
+    const isImage = file.type.startsWith("image/");
+    const isVideo = file.type.startsWith("video/");
+    const isAudio = file.type.startsWith("audio/");
     updateNodeData(nodeId, {
       uploadBase64: b64,
       uploadMime: file.type,
       uploadFilePath: file.name,
-      imageUrl: file.type.startsWith("image/") ? `data:${file.type};base64,${b64}` : undefined,
+      imageUrl: isImage ? dataUri : undefined,
+      videoUrl: isVideo ? dataUri : undefined,
+      audioUrl: isAudio ? dataUri : undefined,
       status: "done",
     });
   };

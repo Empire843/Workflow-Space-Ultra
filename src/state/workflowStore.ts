@@ -161,8 +161,8 @@ export const useWorkflowStore = create<WorkflowState>()(
 
     // Transient UI state
     canvasTool: "select" as CanvasTool,
-    showPalette: true,
-    showMinimap: true,
+    showPalette: false,
+    showMinimap: false,
 
     _past: [],
     _future: [],

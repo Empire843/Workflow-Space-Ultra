@@ -41,10 +41,12 @@ export interface NodeCatalogEntry {
 
 export const NODE_CATALOG: NodeCatalogEntry[] = [
   // Content
-  { kind: "content.image", label: "Image", group: "content", icon: "image", description: "Ảnh tĩnh" },
-  { kind: "content.video", label: "Video", group: "content", icon: "video", description: "Video có sẵn" },
+  // Note: `content.image`, `content.video`, `content.audio` kinds are kept in
+  // the NodeKind union for back-compat with older saved workflows, but they're
+  // intentionally omitted from the catalog (and thus the quick-add menu /
+  // palette) — they had no inspector and no way to input data. Use `Upload`
+  // instead for local files, or generation nodes for AI output.
   { kind: "content.text", label: "Text", group: "content", icon: "type", description: "Prompt text" },
-  { kind: "content.audio", label: "Audio", group: "content", icon: "music", description: "Audio track" },
   { kind: "content.upload", label: "Upload", group: "content", icon: "upload", description: "Upload file từ máy" },
 
   // Generation
