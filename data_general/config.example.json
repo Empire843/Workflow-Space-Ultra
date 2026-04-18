@@ -1,0 +1,10 @@
+{
+  "account1": {
+    "TYPE_ACCOUNT": "ULTRA"
+  },
+  "CREATE_IMAGE_MODEL": "Nano Banana 2",
+  "SEED_MODE": "Random",
+  "SEED_VALUE": 0,
+  "VEO_CONCURRENCY": 1,
+  "GROK_CONCURRENCY": 2
+}

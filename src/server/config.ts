@@ -1,0 +1,92 @@
+import path from "node:path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+
+export type AccountType = "NORMAL" | "PRO" | "ULTRA";
+export type WindowMode = "headful" | "offscreen" | "headless";
+
+export const BASE_DIR = process.cwd();
+
+export const DATA_GENERAL_DIR = path.join(BASE_DIR, "data_general");
+export const DOWNLOADS_DIR = path.join(BASE_DIR, "downloads");
+export const WORKFLOWS_DIR = path.join(BASE_DIR, "Workflows");
+
+// Chrome profiles (keep the original Python tool's names so users can share profiles)
+export const VEO_USER_DATA_DIR = process.env.VEO_CHROME_USER_DATA_DIR
+  ? path.resolve(BASE_DIR, process.env.VEO_CHROME_USER_DATA_DIR)
+  : path.join(BASE_DIR, "chrome_user_data");
+
+export const GROK_USER_DATA_ROOT = process.env.GROK_CHROME_USER_DATA_ROOT
+  ? path.resolve(BASE_DIR, process.env.GROK_CHROME_USER_DATA_ROOT)
+  : path.join(BASE_DIR, "chrome_user_data_grok");
+
+export const GROK_PROFILE_NAME = process.env.GROK_PROFILE_NAME || "PROFILE_1";
+
+export const VEO_CDP_HOST = process.env.VEO_CDP_HOST || "127.0.0.1";
+export const VEO_CDP_PORT = Number(process.env.VEO_CDP_PORT || 9222);
+export const GROK_CDP_HOST = process.env.GROK_CDP_HOST || "127.0.0.1";
+export const GROK_CDP_PORT = Number(process.env.GROK_CDP_PORT || 9223);
+
+export const VEO_FLOW_URL = process.env.VEO_FLOW_URL || "https://labs.google/fx/vi/tools/flow";
+export const GROK_URL = process.env.GROK_URL || "https://grok.com/";
+
+export const WINDOW_MODE: WindowMode =
+  (process.env.CHROME_WINDOW_MODE as WindowMode) || "headful";
+
+export const CHROME_EXE_PATH_ENV = process.env.CHROME_EXE_PATH || "";
+
+export const RECAPTCHA_SITE_KEY = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV";
+
+export const CONFIG_FILE = path.join(DATA_GENERAL_DIR, "config.json");
+
+export function ensureDirs() {
+  for (const d of [DATA_GENERAL_DIR, DOWNLOADS_DIR, WORKFLOWS_DIR, VEO_USER_DATA_DIR, GROK_USER_DATA_ROOT]) {
+    if (!existsSync(d)) mkdirSync(d, { recursive: true });
+  }
+}
+
+export interface AppConfig {
+  account1: {
+    TYPE_ACCOUNT: AccountType;
+    projectId?: string;
+    sessionId?: string;
+    video_model_key_landscape?: string;
+    video_model_key_portrait?: string;
+  };
+  CREATE_IMAGE_MODEL?: string;
+  SEED_MODE?: "Random" | "Fixed";
+  SEED_VALUE?: number;
+  VEO_CONCURRENCY?: number;
+  GROK_CONCURRENCY?: number;
+}
+
+const DEFAULT_CONFIG: AppConfig = {
+  account1: {
+    TYPE_ACCOUNT: (process.env.VEO_TYPE_ACCOUNT as AccountType) || "ULTRA",
+    projectId: process.env.VEO_PROJECT_ID || undefined,
+    sessionId: process.env.VEO_SESSION_ID || undefined,
+  },
+  CREATE_IMAGE_MODEL: "Nano Banana 2",
+  SEED_MODE: "Random",
+  SEED_VALUE: 9797,
+  VEO_CONCURRENCY: 1,
+  GROK_CONCURRENCY: 1,
+};
+
+export function loadConfig(): AppConfig {
+  ensureDirs();
+  try {
+    if (existsSync(CONFIG_FILE)) {
+      const raw = readFileSync(CONFIG_FILE, "utf-8");
+      const parsed = JSON.parse(raw) as AppConfig;
+      return { ...DEFAULT_CONFIG, ...parsed, account1: { ...DEFAULT_CONFIG.account1, ...(parsed.account1 || {}) } };
+    }
+  } catch {
+    // ignore
+  }
+  return DEFAULT_CONFIG;
+}
+
+export function saveConfig(config: AppConfig) {
+  ensureDirs();
+  writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), "utf-8");
+}

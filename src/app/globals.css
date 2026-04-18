@@ -1,0 +1,141 @@
+@import "tailwindcss";
+@import "@xyflow/react/dist/style.css";
+
+@theme {
+  --color-bg: #0b0b0c;
+  --color-bg-elev-1: #121214;
+  --color-bg-elev-2: #17171a;
+  --color-border: #242428;
+  --color-border-strong: #34343a;
+  --color-fg: #e6e6e9;
+  --color-fg-muted: #a0a0a8;
+  --color-fg-dim: #6a6a72;
+  --color-accent: #ff3c8e;
+  --color-accent-hover: #ff5aa0;
+  --color-accent-subtle: rgba(255, 60, 142, 0.12);
+  --color-ok: #3ecf8e;
+  --color-warn: #f5a623;
+  --color-err: #ef4444;
+}
+
+html,
+body {
+  height: 100%;
+  background: var(--color-bg);
+  color: var(--color-fg);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow: hidden;
+}
+
+/* React Flow overrides cho dark theme */
+.react-flow {
+  --xy-background-color: var(--color-bg);
+  --xy-background-pattern-color: #26262a;
+  --xy-edge-stroke: #3a3a42;
+  --xy-edge-stroke-selected: var(--color-accent);
+  --xy-node-border: var(--color-border-strong);
+  --xy-node-background-color: var(--color-bg-elev-1);
+}
+
+.react-flow__minimap {
+  background: var(--color-bg-elev-2);
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+}
+
+.react-flow__controls {
+  background: var(--color-bg-elev-2);
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  box-shadow: none;
+}
+
+.react-flow__controls-button {
+  background: transparent;
+  border: none;
+  color: var(--color-fg-muted);
+}
+
+.react-flow__controls-button:hover {
+  background: var(--color-bg-elev-1);
+  color: var(--color-fg);
+}
+
+/* --- Edge hover cue — easier to pick an edge before pressing Delete --- */
+.react-flow__edge .react-flow__edge-path {
+  transition: stroke 120ms ease, stroke-width 120ms ease;
+}
+
+.react-flow__edge:hover .react-flow__edge-path {
+  stroke: var(--color-accent);
+  stroke-width: 2.5;
+}
+
+.react-flow__edge.selected .react-flow__edge-path {
+  stroke-width: 2.5;
+}
+
+/* --- Custom "+" handles for WSNode (Picsart-style) --- */
+.react-flow__handle.ws-handle {
+  width: 18px;
+  height: 18px;
+  border-radius: 9999px;
+  border: 2px solid var(--color-bg);
+  background: var(--color-bg-elev-2);
+  display: grid;
+  place-items: center;
+  color: var(--color-fg-muted);
+  transition: background 120ms ease, color 120ms ease, transform 120ms ease;
+}
+
+.react-flow__handle.ws-handle-in {
+  background: var(--color-bg-elev-1);
+  color: #7dd3fc; /* sky-300 */
+}
+
+.react-flow__handle.ws-handle-out {
+  background: var(--color-bg-elev-1);
+  color: var(--color-accent);
+}
+
+.react-flow__handle.ws-handle:hover {
+  background: var(--color-bg);
+  box-shadow: 0 0 0 3px rgba(236, 72, 153, 0.25);
+}
+
+.react-flow__handle.ws-handle-in:hover {
+  box-shadow: 0 0 0 3px rgba(125, 211, 252, 0.25);
+}
+
+.ws-handle-glyph {
+  font-size: 14px;
+  line-height: 1;
+  font-weight: 700;
+  pointer-events: none;
+  user-select: none;
+  margin-top: -1px;
+}
+
+.react-flow__handle.ws-handle.connectionindicator {
+  cursor: crosshair;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #2a2a30;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #3a3a42;
+}
