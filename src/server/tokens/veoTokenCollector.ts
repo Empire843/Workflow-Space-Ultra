@@ -413,24 +413,53 @@ export class VeoTokenCollector {
     if (this._routeBlockedPages.has(page)) return;
     const keywords = VeoTokenCollector.GENERATE_BLOCK_KEYWORDS;
 
+    // Capture mode: set `VEO_CAPTURE_PAYLOADS=1` to log the full request body
+    // of every blocked generation call. Useful when Google's proto schema
+    // changes — press "Tạo" in labs.google UI with reference images and we'll
+    // see the exact payload they send. When enabled we also disable the CDP
+    // network block so the request reaches Playwright's route handler (CDP
+    // would abort it earlier, hiding the post body).
+    const capturePayloads = process.env.VEO_CAPTURE_PAYLOADS === "1";
+
     // Layer 1: CDP Network.setBlockedURLs (primary — most reliable)
-    try {
-      const cdp = await this.context!.newCDPSession(page);
-      await cdp.send("Network.enable");
-      await cdp.send("Network.setBlockedURLs", {
-        urls: keywords.map((k) => `*${k}*`),
-      });
-      console.log(`[VEO] CDP Network.setBlockedURLs applied (${keywords.length} patterns)`);
-    } catch (err) {
-      console.warn(`[VEO] CDP block failed, relying on Playwright route only:`, err);
+    if (!capturePayloads) {
+      try {
+        const cdp = await this.context!.newCDPSession(page);
+        await cdp.send("Network.enable");
+        await cdp.send("Network.setBlockedURLs", {
+          urls: keywords.map((k) => `*${k}*`),
+        });
+        console.log(`[VEO] CDP Network.setBlockedURLs applied (${keywords.length} patterns)`);
+      } catch (err) {
+        console.warn(`[VEO] CDP block failed, relying on Playwright route only:`, err);
+      }
+    } else {
+      console.log("[VEO] CAPTURE MODE ON — CDP block disabled, bodies will be logged");
     }
 
-    // Layer 2: Playwright page.route (backup)
+    // Layer 2: Playwright page.route (backup + capture)
     await page.route(
       (url) => keywords.some((k) => url.toString().includes(k)),
       async (route) => {
         try {
-          console.log(`[VEO] Route blocked: ${route.request().url().slice(0, 120)}`);
+          const req = route.request();
+          const url = req.url();
+          const keyword = keywords.find((k) => url.includes(k)) || "unknown";
+          if (capturePayloads) {
+            const body = req.postData() || "";
+            // Pretty-print in chunks so long payloads are still readable in
+            // the terminal. Sensitive tokens are left intact — user is in
+            // control when setting VEO_CAPTURE_PAYLOADS.
+            console.log(`\n========== [VEO CAPTURE] ${keyword} ==========`);
+            console.log(`URL: ${url}`);
+            console.log(`Body (${body.length} chars):`);
+            for (let i = 0; i < body.length; i += 2000) {
+              console.log(body.slice(i, i + 2000));
+            }
+            console.log("========== [VEO CAPTURE END] ==========\n");
+          } else {
+            console.log(`[VEO] Route blocked: ${url.slice(0, 120)}`);
+          }
           await route.fulfill({
             status: 403,
             contentType: "application/json",

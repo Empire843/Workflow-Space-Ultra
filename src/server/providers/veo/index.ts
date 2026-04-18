@@ -2,6 +2,7 @@ import { loadConfig, type AccountType } from "../../config";
 import { getVeoCollector } from "../../tokens/veoTokenCollector";
 
 import {
+  buildCreateImagePayload,
   parseGeneratedImages,
   requestCreateImage,
   type CreateImageOptions,
@@ -140,7 +141,43 @@ export async function veoCreateImage(
       accountType: ctx.accountType,
     });
     if (!res.ok) {
-      throw new Error(`VEO createImage ${res.status}: ${res.body.slice(0, 400)}`);
+      const refCount = opts.referenceImages?.length ?? 0;
+      // Rebuild payload once for logging so the shape we sent is visible in
+      // the SSE log. Reference mediaGenerationIds are trimmed to 24 chars
+      // each to keep the output readable while still being diff-able.
+      let payloadDebug = "";
+      try {
+        const payload = buildCreateImagePayload({
+          ...opts,
+          recaptchaToken: recaptcha,
+          accessToken: ctx.accessToken,
+          sessionId: ctx.sessionId,
+          projectId: ctx.projectId,
+          cookie: ctx.cookie,
+          accountType: ctx.accountType,
+        });
+        const sanitized = JSON.parse(JSON.stringify(payload)) as Record<string, unknown>;
+        const clientCtx = sanitized.clientContext as
+          | { recaptchaContext?: { token?: string } }
+          | undefined;
+        if (clientCtx?.recaptchaContext?.token) {
+          clientCtx.recaptchaContext.token = "<redacted>";
+        }
+        const reqs = sanitized.requests as Array<Record<string, unknown>> | undefined;
+        reqs?.forEach((r) => {
+          const inner = r.clientContext as { recaptchaContext?: { token?: string } } | undefined;
+          if (inner?.recaptchaContext?.token) inner.recaptchaContext.token = "<redacted>";
+        });
+        payloadDebug = JSON.stringify(sanitized).slice(0, 1200);
+      } catch {
+        // ignore — the error message below is still useful without it.
+      }
+      if (payloadDebug) {
+        onLog?.(`DEBUG payload gửi: ${payloadDebug}`);
+      }
+      throw new Error(
+        `VEO createImage ${res.status}${refCount ? ` (with ${refCount} reference image${refCount > 1 ? "s" : ""})` : ""}: ${res.body.slice(0, 800)}`
+      );
     }
     onLog?.("Đã nhận kết quả ảnh.");
     return { raw: parseGeneratedImages(res.body) };

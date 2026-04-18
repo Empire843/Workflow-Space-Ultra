@@ -12,6 +12,8 @@ import {
 } from "./providers/grok";
 import { GROK_ASSETS_BASE } from "./providers/grok/constants";
 import {
+  CREATE_IMAGE_MODEL_TO_KEY,
+  MODEL_SUPPORTS_REFERENCE,
   veoCreateImage,
   veoDownload,
   veoImageToVideo,
@@ -78,11 +80,14 @@ export async function executeNode(
     const combinedPrompt = buildCombinedPrompt(nodeData.prompt, inputs);
     const genData: NodeDataBase = { ...nodeData, prompt: combinedPrompt };
 
-    // Resolve primary / secondary image inputs
-    const primary = inputs.find((i) => i && (i.imageMediaId || i.uploadBase64 || i.imageUrl));
-    const secondary = inputs.filter(
+    // Resolve all upstream image inputs (edge order). Indices 0 / 1 map to
+    // start / end frames for Start+End pipelines; extras are ignored.
+    const imageInputs = inputs.filter(
       (i) => i && (i.imageMediaId || i.uploadBase64 || i.imageUrl)
-    )[1];
+    );
+    const primary = imageInputs[0];
+    const secondary = imageInputs[1];
+    const extraImages = Math.max(0, imageInputs.length - 2);
 
     let output: NodeDataBase = { ...nodeData };
 
@@ -95,24 +100,49 @@ export async function executeNode(
     const genMode = nodeData.genMode;
 
     if (kind === "gen.image") {
-      log("Bắt đầu tạo ảnh VEO…");
-      const items = await runVeoCreateImage(job, genData, log);
+      // Collect every upstream image (not just primary) — Nano Banana can take
+      // multiple references. For Imagen or other T2I-only models, the
+      // createImage payload silently drops these.
+      const allRefs = inputs.filter(
+        (i) => i && (i.imageMediaId || i.uploadBase64 || i.imageUrl)
+      );
+      if (allRefs.length) {
+        log(`Phát hiện ${allRefs.length} ảnh upstream → dùng làm reference cho Nano Banana…`);
+      } else {
+        log("Bắt đầu tạo ảnh VEO…");
+      }
+      const items = await runVeoCreateImage(job, genData, allRefs, log);
       assignOutputItems(output, items, "image");
       setJobProgress(job.id, 100);
     } else if (kind === "gen.video") {
+      // Helper: warn when user connected >2 images (Start+End only uses 2).
+      const warnExtras = () => {
+        if (extraImages > 0) {
+          log(`Lưu ý: có ${imageInputs.length} ảnh upstream, chỉ dùng 2 ảnh đầu (bỏ qua ${extraImages} ảnh cuối).`);
+        }
+      };
       if (genMode === "i2v.veo") {
         if (!primary) throw new Error("Cần Image upstream (mediaId hoặc base64)");
-        log("Bắt đầu tạo video VEO (image-to-video)…");
-        const items = await runVeoI2V(job, genData, primary, undefined, log);
+        if (secondary) {
+          log("Phát hiện 2 ảnh upstream → dùng VEO Start+End (ảnh 1 = start frame, ảnh 2 = end frame)…");
+        } else {
+          log("Bắt đầu tạo video VEO (image-to-video)…");
+        }
+        warnExtras();
+        const items = await runVeoI2V(job, genData, primary, secondary, log);
         assignOutputItems(output, items, "video");
       } else if (genMode === "i2v.grok") {
         if (!primary) throw new Error("Cần Image upstream cho Grok I2V");
+        if (secondary) log("Grok I2V chỉ hỗ trợ 1 ảnh — dùng ảnh đầu, bỏ qua ảnh thứ 2.");
+        warnExtras();
         log("Bắt đầu tạo video Grok (image-to-video)…");
         const items = await runGrokI2V(job, genData, primary, log);
         assignOutputItems(output, items, "video");
       } else if (genMode === "t2v.grok") {
         if (primary) {
           log("Phát hiện ảnh upstream → dùng Grok I2V…");
+          if (secondary) log("Grok I2V chỉ hỗ trợ 1 ảnh — dùng ảnh đầu, bỏ qua ảnh thứ 2.");
+          warnExtras();
         } else {
           log("Bắt đầu tạo video Grok…");
         }
@@ -121,14 +151,18 @@ export async function executeNode(
           : await runGrokT2V(job, genData, log);
         assignOutputItems(output, items, "video");
       } else {
-        // Default: t2v.veo (auto-route to I2V if upstream image)
-        if (primary) {
+        // Default: t2v.veo — auto-route based on how many upstream images:
+        //   0 → T2V, 1 → I2V (start frame), 2 → Start+End
+        if (primary && secondary) {
+          log("Phát hiện 2 ảnh upstream → auto-route sang VEO Start+End (ảnh 1 = start frame, ảnh 2 = end frame)…");
+          warnExtras();
+        } else if (primary) {
           log("Phát hiện ảnh upstream → dùng I2V API (ảnh = start frame)…");
         } else {
           log("Bắt đầu tạo video VEO (text-to-video)…");
         }
         const items = primary
-          ? await runVeoI2V(job, genData, primary, undefined, log)
+          ? await runVeoI2V(job, genData, primary, secondary, log)
           : await runVeoT2V(job, genData, log);
         assignOutputItems(output, items, "video");
       }
@@ -228,20 +262,59 @@ type LogFn = (msg: string) => void;
 async function runVeoCreateImage(
   job: JobRecord,
   nodeData: NodeDataBase,
+  references: NodeDataBase[],
   log: LogFn
 ): Promise<OutputItem[]> {
+  const aspectRatio =
+    nodeData.aspectRatio === "9:16"
+      ? "IMAGE_ASPECT_RATIO_PORTRAIT"
+      : nodeData.aspectRatio === "1:1"
+        ? "IMAGE_ASPECT_RATIO_SQUARE"
+        : "IMAGE_ASPECT_RATIO_LANDSCAPE";
+
+  const modelLabel = nodeData.modelLabel || "Nano Banana 2";
+  const modelKey = CREATE_IMAGE_MODEL_TO_KEY[modelLabel] || "NARWHAL";
+  const supportsRef = MODEL_SUPPORTS_REFERENCE[modelKey] ?? false;
+
+  // Resolve each upstream image to a Flow media-asset id. For reference images
+  // we pass whatever id we have (plain UUID from generated images, or CAM-prefixed
+  // id from uploads) as the `name` field — both formats are accepted by the
+  // `batchGenerateImages` API. Only bytes-only images (no cached id) need upload.
+  const referenceImages: Array<{ mediaGenerationId: string; imageInputType?: string }> = [];
+  if (references.length && !supportsRef) {
+    log(`Model "${modelLabel}" không hỗ trợ reference image — ảnh upstream sẽ bị bỏ qua. Chọn Nano Banana 2 / pro nếu muốn dùng reference.`);
+  } else {
+    for (let i = 0; i < references.length; i++) {
+      const r = references[i];
+      try {
+        const mediaGenerationId = await resolveVeoMediaId(
+          r,
+          nodeData.aspectRatio || "16:9",
+          log
+        );
+        referenceImages.push({
+          mediaGenerationId,
+          imageInputType: "IMAGE_INPUT_TYPE_REFERENCE",
+        });
+        log(`Reference #${i + 1} ready (name=${mediaGenerationId.slice(0, 24)}…).`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        log(`Chuẩn bị reference #${i + 1} thất bại: ${msg} — bỏ qua ảnh này.`);
+      }
+    }
+    if (references.length && !referenceImages.length) {
+      log("Không có reference nào khả dụng — fallback sang text-to-image thuần.");
+    }
+  }
+
   const { raw } = await veoCreateImage(
     {
       prompt: nodeData.prompt || "",
-      modelLabel: nodeData.modelLabel || "Nano Banana 2",
+      modelLabel,
       outputCount: nodeData.outputCount || 1,
-      aspectRatio:
-        nodeData.aspectRatio === "9:16"
-          ? "IMAGE_ASPECT_RATIO_PORTRAIT"
-          : nodeData.aspectRatio === "1:1"
-            ? "IMAGE_ASPECT_RATIO_SQUARE"
-            : "IMAGE_ASPECT_RATIO_LANDSCAPE",
+      aspectRatio,
       seed: typeof nodeData.seed === "number" ? nodeData.seed : undefined,
+      referenceImages: referenceImages.length ? referenceImages : undefined,
     },
     log
   );
