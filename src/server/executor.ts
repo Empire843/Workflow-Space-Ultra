@@ -1,6 +1,4 @@
-import path from "node:path";
-
-import type { NodeDataBase, NodeKind, OutputItem } from "@/lib/nodes";
+import type { GenMode, NodeDataBase, NodeKind, OutputItem } from "@/lib/nodes";
 import { buildCombinedPrompt, joinTextSegments } from "@/lib/prompt";
 import { resolveI2vModelKey, resolveT2vModelKey } from "@/lib/veoVideoModels";
 
@@ -30,6 +28,11 @@ import {
   setJobStatus,
   type JobRecord,
 } from "./queue";
+import {
+  downloadedAssetUrl,
+  resolveLocalMediaPath,
+  writeBase64Asset,
+} from "./paths/workflowAssets";
 import { logError } from "./telemetry/errorLog";
 import { timedSpan } from "./telemetry/timing";
 import { pMapLimited } from "./util/pMap";
@@ -155,30 +158,23 @@ async function _executeNode(
       assignOutputItems(output, items, "image");
       setJobProgress(job.id, 100);
     } else if (kind === "gen.video") {
-      // Helper: warn when user connected >2 images (Start+End only uses 2).
+      // T2V and I2V collapsed into one node kind — the executor picks the
+      // pipeline on the fly: connect 0 images → T2V, 1 → I2V (start frame),
+      // 2 → VEO Start+End. The legacy `i2v.*` modes route to the matching
+      // `t2v.*` branch below so un-migrated workflows keep running.
       const warnExtras = () => {
         if (extraImages > 0) {
           log(`Lưu ý: có ${imageInputs.length} ảnh upstream, chỉ dùng 2 ảnh đầu (bỏ qua ${extraImages} ảnh cuối).`);
         }
       };
-      if (genMode === "i2v.veo") {
-        if (!primary) throw new Error("Cần Image upstream (mediaId hoặc base64)");
-        if (secondary) {
-          log("Phát hiện 2 ảnh upstream → dùng VEO Start+End (ảnh 1 = start frame, ảnh 2 = end frame)…");
-        } else {
-          log("Bắt đầu tạo video VEO (image-to-video)…");
-        }
-        warnExtras();
-        const items = await runVeoI2V(job, genData, primary, secondary, log);
-        assignOutputItems(output, items, "video");
-      } else if (genMode === "i2v.grok") {
-        if (!primary) throw new Error("Cần Image upstream cho Grok I2V");
-        if (secondary) log("Grok I2V chỉ hỗ trợ 1 ảnh — dùng ảnh đầu, bỏ qua ảnh thứ 2.");
-        warnExtras();
-        log("Bắt đầu tạo video Grok (image-to-video)…");
-        const items = await runGrokI2V(job, genData, primary, log);
-        assignOutputItems(output, items, "video");
-      } else if (genMode === "t2v.grok") {
+      const effectiveMode: GenMode =
+        genMode === "i2v.veo"
+          ? "t2v.veo"
+          : genMode === "i2v.grok"
+            ? "t2v.grok"
+            : (genMode as GenMode) || "t2v.veo";
+
+      if (effectiveMode === "t2v.grok") {
         if (primary) {
           log("Phát hiện ảnh upstream → dùng Grok I2V…");
           if (secondary) log("Grok I2V chỉ hỗ trợ 1 ảnh — dùng ảnh đầu, bỏ qua ảnh thứ 2.");
@@ -191,8 +187,6 @@ async function _executeNode(
           : await runGrokT2V(job, genData, log);
         assignOutputItems(output, items, "video");
       } else {
-        // Default: t2v.veo — auto-route based on how many upstream images:
-        //   0 → T2V, 1 → I2V (start frame), 2 → Start+End
         if (primary && secondary) {
           log("Phát hiện 2 ảnh upstream → auto-route sang VEO Start+End (ảnh 1 = start frame, ảnh 2 = end frame)…");
           warnExtras();
@@ -291,6 +285,16 @@ async function urlToBase64(url: string): Promise<string> {
     const comma = url.indexOf(",");
     return comma > 0 ? url.slice(comma + 1) : "";
   }
+  // A URL pointing at this tool's own files (/api/workflows/... or
+  // /api/files/...) is on the same disk — skip the HTTP roundtrip so the
+  // executor works even when the Next server is busy or the port isn't
+  // accessible from the node fetching context.
+  const local = resolveLocalMediaPath(url);
+  if (local) {
+    const { readFile } = await import("node:fs/promises");
+    const buf = await readFile(local);
+    return buf.toString("base64");
+  }
   const { request } = await import("undici");
   const { body } = await request(url);
   const buf = Buffer.from(await body.arrayBuffer());
@@ -386,12 +390,56 @@ async function runVeoCreateImage(
     log
   );
   if (!raw.length) throw new Error("VEO không trả về image nào");
-  return raw.map((img) => {
-    const url = img.rawBytes
-      ? `data:${img.mimeType || "image/png"};base64,${img.rawBytes}`
-      : img.imageUrl;
-    return { imageUrl: url, imageMediaId: img.mediaId, mimeType: img.mimeType };
-  });
+
+  // Persist every result to disk so the preview doesn't die when the user
+  // signs out of the Google account that generated it. VEO returns either a
+  // signed CDN URL (download via `veoDownload`) or inline base64 bytes (just
+  // write them). When we have no workflow id the file lands in downloads/ —
+  // still better than a remote URL that can vanish.
+  return await Promise.all(
+    raw.map(async (img, i) => {
+      const ext = extFromMime(img.mimeType) || "png";
+      const fileName = `veo_img_${job.id}_${i}.${ext}`;
+      let url: string | undefined;
+      try {
+        if (img.rawBytes) {
+          const file = await writeBase64Asset(
+            job.workflowRunId,
+            fileName,
+            img.rawBytes,
+          );
+          url = downloadedAssetUrl(job.workflowRunId, file);
+        } else if (img.imageUrl) {
+          const file = await veoDownload(
+            img.imageUrl,
+            fileName,
+            undefined,
+            undefined,
+            job.workflowRunId,
+          );
+          url = downloadedAssetUrl(job.workflowRunId, file);
+        }
+      } catch (err) {
+        log(`Không lưu được ảnh #${i + 1} (${err instanceof Error ? err.message : err}) — dùng URL gốc.`);
+      }
+      if (!url) {
+        url = img.rawBytes
+          ? `data:${img.mimeType || "image/png"};base64,${img.rawBytes}`
+          : img.imageUrl;
+      }
+      return { imageUrl: url, imageMediaId: img.mediaId, mimeType: img.mimeType };
+    }),
+  );
+}
+
+function extFromMime(mime: string | undefined): string | null {
+  if (!mime) return null;
+  const m = mime.toLowerCase();
+  if (m.includes("jpeg") || m.includes("jpg")) return "jpg";
+  if (m.includes("png")) return "png";
+  if (m.includes("webp")) return "webp";
+  if (m.includes("gif")) return "gif";
+  return null;
 }
 
 async function runVeoT2V(
@@ -430,8 +478,14 @@ async function runVeoT2V(
     videos.map(async (v, i) => {
       let url = v.videoUrl!;
       try {
-        const file = await veoDownload(url, `veo_${job.id}_${i}.mp4`);
-        url = `/api/files/${path.basename(file)}`;
+        const file = await veoDownload(
+          url,
+          `veo_${job.id}_${i}.mp4`,
+          undefined,
+          undefined,
+          job.workflowRunId,
+        );
+        url = downloadedAssetUrl(job.workflowRunId, file);
       } catch { /* keep original */ }
       return { videoUrl: url } satisfies OutputItem;
     })
@@ -495,8 +549,14 @@ async function runVeoI2V(
     videos.map(async (v, i) => {
       let url = v.videoUrl!;
       try {
-        const file = await veoDownload(url, `veo_${job.id}_${i}.mp4`);
-        url = `/api/files/${path.basename(file)}`;
+        const file = await veoDownload(
+          url,
+          `veo_${job.id}_${i}.mp4`,
+          undefined,
+          undefined,
+          job.workflowRunId,
+        );
+        url = downloadedAssetUrl(job.workflowRunId, file);
       } catch { /* keep */ }
       return { videoUrl: url } satisfies OutputItem;
     })
@@ -516,7 +576,9 @@ async function runGrokT2V(
     config: {
       aspectRatio: (nodeData.aspectRatio as "9:16" | "16:9" | "1:1") || "9:16",
       videoLength: clampGrokLength(nodeData.videoLength),
-      resolutionName: nodeData.resolution || "480p",
+      // Default to 720p so workflow previews match the "min 720p" policy;
+      // respect the user's explicit pick if they lowered it to 480p.
+      resolutionName: nodeData.resolution || "720p",
     },
     onProgress: (p) => {
       if (p.progress) log(`Grok đang xử lý… ${p.progress}%`);
@@ -534,8 +596,13 @@ async function runGrokT2V(
   const hdMediaUrl = normalizeGrokMediaUrl(res.hdMediaUrl);
   let vUrl = mediaUrl;
   try {
-    const file = await grokDownloadVideo(mediaUrl, `grok_${job.id}.mp4`);
-    vUrl = `/api/files/${path.basename(file)}`;
+    const file = await grokDownloadVideo(
+      mediaUrl,
+      `grok_${job.id}.mp4`,
+      undefined,
+      job.workflowRunId,
+    );
+    vUrl = downloadedAssetUrl(job.workflowRunId, file);
     log("Video đã lưu thành công.");
   } catch (dlErr) {
     log(`Download thất bại (${dlErr instanceof Error ? dlErr.message : dlErr}), dùng URL gốc.`);
@@ -628,7 +695,7 @@ async function runGrokI2V(
     config: {
       aspectRatio: (nodeData.aspectRatio as "9:16" | "16:9" | "1:1") || "9:16",
       videoLength: clampGrokLength(nodeData.videoLength),
-      resolutionName: nodeData.resolution || "480p",
+      resolutionName: nodeData.resolution || "720p",
     },
     onProgress: (p) => {
       if (p.progress) log(`Grok đang xử lý… ${p.progress}%`);
@@ -646,8 +713,13 @@ async function runGrokI2V(
   const hdMediaUrl = normalizeGrokMediaUrl(res.hdMediaUrl);
   let vUrl = mediaUrl;
   try {
-    const file = await grokDownloadVideo(mediaUrl, `grok_${job.id}.mp4`);
-    vUrl = `/api/files/${path.basename(file)}`;
+    const file = await grokDownloadVideo(
+      mediaUrl,
+      `grok_${job.id}.mp4`,
+      undefined,
+      job.workflowRunId,
+    );
+    vUrl = downloadedAssetUrl(job.workflowRunId, file);
     log("Video đã lưu thành công.");
   } catch (dlErr) {
     log(`Download thất bại (${dlErr instanceof Error ? dlErr.message : dlErr}), dùng URL gốc.`);

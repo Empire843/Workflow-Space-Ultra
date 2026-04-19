@@ -32,10 +32,12 @@ import { useWorkflowStore } from "@/state/workflowStore";
 import { getEdgesByTarget, getNodesById } from "@/state/graphMaps";
 
 const VIDEO_MODE_LABELS: Record<string, string> = {
-  "t2v.veo": "Text → Video (VEO)",
-  "t2v.grok": "Text → Video (Grok)",
-  "i2v.veo": "Image → Video (VEO)",
-  "i2v.grok": "Image → Video (Grok)",
+  "t2v.veo": "Video (VEO)",
+  "t2v.grok": "Video (Grok)",
+  // Legacy modes kept so un-migrated nodes still render a sensible header if
+  // the migration hook didn't run (e.g. tests that seed state directly).
+  "i2v.veo": "Video (VEO)",
+  "i2v.grok": "Video (Grok)",
 };
 
 /**
@@ -62,7 +64,6 @@ export default function WSNode(props: NodeProps) {
   const meta = NODE_CATALOG.find((c) => c.kind === d.kind);
   const removeNode = useWorkflowStore((s) => s.removeNode);
   const cloneNode = useWorkflowStore((s) => s.cloneNode);
-  const selectNode = useWorkflowStore((s) => s.selectNode);
 
   const isContent = d.kind.startsWith("content.");
   const isText = d.kind === "content.text";
@@ -163,11 +164,14 @@ export default function WSNode(props: NodeProps) {
 
   const frame = resolveFrameDims(d);
 
+  // Selection (which drives the bottom inspector) is handled by React Flow's
+  // `onNodeClick` in the parent Canvas — React Flow distinguishes a real click
+  // from a drag, while a native `onClick` on this wrapper would still fire at
+  // the end of a node drag (mousedown + mouseup on the same element) and make
+  // the inspector pop open *during* the drag, which intercepts the pointerup
+  // and leaves the node stuck following the cursor.
   return (
-    <div
-      onClick={() => selectNode(id)}
-      className="group relative cursor-pointer"
-    >
+    <div className="group relative cursor-pointer">
       <NodeLabel meta={meta} label={headerLabel()} status={d.status} statusLog={d.statusLog} hasImageRef={hasImageRef} provider={isGrokMode ? "grok" : meta?.provider} />
 
       {/* The framed card. Do NOT use `overflow-hidden` on the outer element because it

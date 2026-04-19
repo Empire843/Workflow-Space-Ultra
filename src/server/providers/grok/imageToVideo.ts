@@ -87,6 +87,7 @@ export async function grokCreateImagePost(
     })
   `;
 
+  if (page.isClosed()) throw new Error("Grok page đã bị đóng trước khi tạo image post");
   const res = (await page.evaluate(`(${script})(${JSON.stringify(payload)})`)) as {
     status: number;
     postId: string | null;
@@ -136,6 +137,7 @@ export async function grokUploadImage(
     })
   `;
 
+  if (page.isClosed()) throw new Error("Grok page đã bị đóng trước khi upload ảnh");
   const res = (await page.evaluate(`(${script})(${JSON.stringify(payload)})`)) as {
     status: number;
     data: { fileMetadataId?: string; fileUri?: string } | null;
@@ -319,6 +321,7 @@ export async function grokImageToVideo(page: Page, opts: GrokI2VOptions) {
     })
   `;
 
+  if (page.isClosed()) throw new Error("Grok page đã bị đóng trước khi tạo video");
   const result = (await page.evaluate(`(${script})(${JSON.stringify(payload)})`)) as {
     convoStatus: number;
     convoError?: string | null;
@@ -360,6 +363,7 @@ export async function grokUpscale(
       return { status: 0, hdMediaUrl: null };
     })
   `;
+  if (page.isClosed()) throw new Error("Grok page đã bị đóng trước khi upscale video");
   return (await page.evaluate(`(${script})(${JSON.stringify(payload)})`)) as {
     status: number;
     hdMediaUrl: string | null;

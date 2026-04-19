@@ -64,6 +64,31 @@ function stripRuntimeFields(nodes: WSNode[]): WSNode[] {
 }
 
 // ---------------------------------------------------------------------------
+// Node data migration
+// ---------------------------------------------------------------------------
+/**
+ * The Text→Video and Image→Video nodes were consolidated into a single
+ * `gen.video` node per provider — the executor auto-routes on upstream
+ * images. Any previously-saved `i2v.veo` / `i2v.grok` workflow is rewritten
+ * to the matching `t2v.*` genMode on load so the behavior stays identical
+ * (connecting an image node still runs the I2V pipeline) without leaving the
+ * deprecated option visible in the inspector dropdown.
+ */
+function migrateNodes(nodes: WSNode[]): WSNode[] {
+  let changed = false;
+  const out: WSNode[] = nodes.map((n) => {
+    const mode = (n.data as { genMode?: string }).genMode;
+    if (mode === "i2v.veo" || mode === "i2v.grok") {
+      changed = true;
+      const canonical = mode === "i2v.veo" ? "t2v.veo" : "t2v.grok";
+      return { ...n, data: { ...n.data, genMode: canonical } } as WSNode;
+    }
+    return n;
+  });
+  return changed ? out : nodes;
+}
+
+// ---------------------------------------------------------------------------
 // Debounced auto-save
 // ---------------------------------------------------------------------------
 let _saveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -387,7 +412,7 @@ export const useWorkflowStore = create<WorkflowState>()(
       set({
         activeWorkflowId: rec.id,
         activeWorkflowName: rec.name,
-        nodes: (rec.data.nodes ?? []) as WSNode[],
+        nodes: migrateNodes((rec.data.nodes ?? []) as WSNode[]),
         edges: (rec.data.edges ?? []) as WSEdge[],
         selectedNodeId: null,
       });
@@ -590,7 +615,7 @@ async function _boot() {
       useWorkflowStore.setState({
         activeWorkflowId: rec.id,
         activeWorkflowName: rec.name,
-        nodes: (rec.data.nodes ?? []) as WSNode[],
+        nodes: migrateNodes((rec.data.nodes ?? []) as WSNode[]),
         edges: (rec.data.edges ?? []) as WSEdge[],
       });
       return;

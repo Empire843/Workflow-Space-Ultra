@@ -31,9 +31,9 @@ A node-based AI workflow canvas (Picsart Flow / Freepik AI Suite–style) for **
 ## What it does
 
 - Compose AI image/video pipelines visually on an infinite canvas: drop nodes, wire them up, hit run.
-- Generate with **VEO 3.1 Ultra** (text→image, text→video, image→video, start+end frame).
-- Generate with **Grok Imagine** (text→video, image→video, auto-upscale to HD).
-- Manage many separate workflows from a dashboard, all auto-saved locally.
+- Generate with **VEO 3.1 Ultra** (text→image, video, start+end frame — text or image input is auto-detected from the upstream graph).
+- Generate with **Grok Imagine** (video with auto-upscale to HD — image input is auto-detected from the upstream graph).
+- Manage many separate workflows from a dashboard, all auto-saved locally. Generated media and uploads live under `Workflows/<id>/assets/` so previews keep working even after you switch Google / xAI accounts.
 
 ## Highlights
 
@@ -94,6 +94,25 @@ the batcher transparently falls back to per-caller individual calls — zero
 data loss, only no speedup for that round. Measure via `npm run bench`:
 look for a new `veo.batch.createImage` span and a drop in `veo.recaptcha.image`
 count relative to `executor.gen.image`.
+
+### Workflow assets on disk
+
+Every generated image / video and every file the user drags into an Upload
+node is copied to `Workflows/<workflowId>/assets/`:
+
+```
+Workflows/
+  wf_<ts>_<rand>/
+    assets/
+      outputs/   ← generated VEO/Grok results (≥ 2K images, ≥ 720p video)
+      uploads/   ← files uploaded via Upload nodes
+```
+
+Preview URLs on the canvas point at `/api/workflows/<id>/assets/<path>` so
+they stay valid after an account switch or restart, and the whole workflow
+can be archived by zipping its folder. Runs initiated outside of any open
+workflow still work — they fall back to the flat `downloads/` directory as
+before.
 
 ### Debugging undocumented VEO endpoints
 

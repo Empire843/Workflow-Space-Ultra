@@ -54,10 +54,16 @@ async function enqueueAndWait(
 ): Promise<NodeDataBase | null> {
   onUpdate({ status: "queued", progress: 0, error: undefined, jobId: undefined });
 
+  // Pass the active workflow id so the server can park generated media under
+  // `Workflows/<id>/assets/` — keeps previews working across account switches
+  // and makes clean-up per workflow trivial. Ad-hoc runs without an open
+  // workflow still work; the server just falls back to the flat downloads/ dir.
+  const workflowRunId = useWorkflowStore.getState().activeWorkflowId || undefined;
+
   const res = await fetch("/api/jobs", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ nodeId, kind, data, inputs }),
+    body: JSON.stringify({ nodeId, kind, data, inputs, workflowRunId }),
   });
   const json = (await res.json()) as { ok: boolean; jobId?: string; message?: string };
   if (!json.ok || !json.jobId) {

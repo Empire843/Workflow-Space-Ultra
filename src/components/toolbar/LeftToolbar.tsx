@@ -6,7 +6,6 @@ import {
   FileVideo,
   Hand,
   Image as ImageIcon,
-  ImagePlay,
   Layers,
   MousePointer2,
   Shapes,
@@ -86,6 +85,12 @@ const IMAGE_FLYOUT: FlyoutItem[] = [
   },
 ];
 
+/**
+ * Video flyout — one generation entry per provider. The former
+ * "Image → Video" entries were removed because the executor auto-routes to
+ * the I2V pipeline whenever an image node is connected upstream, so a
+ * dedicated node kind is redundant.
+ */
 const VIDEO_FLYOUT: FlyoutItem[] = [
   {
     icon: FileVideo,
@@ -96,27 +101,17 @@ const VIDEO_FLYOUT: FlyoutItem[] = [
   },
   {
     icon: Wand2,
-    label: "Text → Video · VEO",
+    label: "Video · VEO",
+    sublabel: "Text / Image → Video",
     nodeKind: "gen.video",
     extra: { genMode: "t2v.veo" satisfies GenMode },
   },
   {
     icon: Sparkles,
-    label: "Text → Video · Grok",
+    label: "Video · Grok",
+    sublabel: "Text / Image → Video",
     nodeKind: "gen.video",
     extra: { genMode: "t2v.grok" satisfies GenMode },
-  },
-  {
-    icon: ImagePlay,
-    label: "Image → Video · VEO",
-    nodeKind: "gen.video",
-    extra: { genMode: "i2v.veo" satisfies GenMode },
-  },
-  {
-    icon: ImagePlay,
-    label: "Image → Video · Grok",
-    nodeKind: "gen.video",
-    extra: { genMode: "i2v.grok" satisfies GenMode },
   },
   {
     icon: ArrowLeftRight,

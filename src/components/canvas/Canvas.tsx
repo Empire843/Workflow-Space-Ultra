@@ -55,6 +55,14 @@ function Inner() {
   const { screenToFlowPosition } = useReactFlow();
   const wrapperRef = useRef<HTMLDivElement>(null);
 
+  // Tracks whether the user is currently (or just was) dragging a node.
+  // `onNodeClick` can still fire after a drag in some edge cases (e.g.
+  // sub-threshold jitter or when d3-drag decides the gesture is a click).
+  // Without this flag the bottom inspector would pop open mid-gesture and
+  // intercept the pointerup, leaving the node stuck to the cursor.
+  const draggingRef = useRef(false);
+  const dragGuardTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   // Quick-add menu: right-click the empty pane to open a searchable node picker
   // at the cursor. `flow*` = world coords where the spawned node will land;
   // `screen*` = viewport pixels for positioning the menu.
@@ -163,6 +171,60 @@ function Inner() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [addNode, setCanvasTool, togglePalette, toggleMinimap, screenToFlowPosition]);
 
+  // Clear any pending drag-guard timer on unmount to avoid a stale ref write
+  // into a detached component.
+  useEffect(() => {
+    return () => {
+      if (dragGuardTimerRef.current) {
+        clearTimeout(dragGuardTimerRef.current);
+        dragGuardTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  // Last-resort safety net for the "node stuck to cursor" bug.
+  //
+  // React Flow uses d3-drag which tracks an internal `dragStarted` flag and
+  // emits `position` changes with `dragging: true` until it receives a
+  // `mouseup`. If that teardown ever fails to complete (e.g. a React re-render
+  // triggered mid-gesture causes pointer-events to be re-routed elsewhere),
+  // nodes keep following the cursor even after the user has released the
+  // mouse. We cannot force d3-drag's internal state from the outside, but we
+  // can make React Flow stop tracking the node as dragged by emitting a final
+  // `dragging: false` position change ourselves. That resets the store
+  // snapshot machinery (via `onNodesChange`) and, more importantly, breaks
+  // the render loop that would otherwise render the node at every mousemove.
+  useEffect(() => {
+    function forceEndDrag() {
+      const store = useWorkflowStore.getState();
+      const stuck = store.nodes.filter(
+        (n) => (n as unknown as { dragging?: boolean }).dragging,
+      );
+      if (!stuck.length) return;
+      store.onNodesChange(
+        stuck.map((n) => ({
+          type: "position" as const,
+          id: n.id,
+          position: n.position,
+          dragging: false,
+        })),
+      );
+    }
+    // Capture phase so we run before React's synthetic handlers; `mouseup`
+    // (not `pointerup`) because d3-drag's own listener is on `mouseup` and
+    // we want to piggy-back on the same lifecycle.
+    window.addEventListener("mouseup", forceEndDrag, true);
+    window.addEventListener("pointerup", forceEndDrag, true);
+    window.addEventListener("pointercancel", forceEndDrag, true);
+    window.addEventListener("blur", forceEndDrag);
+    return () => {
+      window.removeEventListener("mouseup", forceEndDrag, true);
+      window.removeEventListener("pointerup", forceEndDrag, true);
+      window.removeEventListener("pointercancel", forceEndDrag, true);
+      window.removeEventListener("blur", forceEndDrag);
+    };
+  }, []);
+
   const isPan = canvasTool === "pan";
 
   return (
@@ -186,6 +248,32 @@ function Inner() {
         onPaneContextMenu={onPaneContextMenu}
         onMoveStart={() => setQuickAdd(null)}
         onNodeContextMenu={() => setQuickAdd(null)}
+        // Drag lifecycle — used purely to gate `onNodeClick` below so the
+        // bottom inspector does not pop open at the end of a drag gesture.
+        onNodeDragStart={() => {
+          draggingRef.current = true;
+          if (dragGuardTimerRef.current) clearTimeout(dragGuardTimerRef.current);
+        }}
+        onNodeDragStop={() => {
+          // Keep the flag up for one microtask: any trailing `onNodeClick`
+          // that d3-drag still decides to fire must be ignored, otherwise
+          // the layout shift from mounting the inspector could swallow the
+          // pointerup event and leave the node stuck following the cursor.
+          if (dragGuardTimerRef.current) clearTimeout(dragGuardTimerRef.current);
+          dragGuardTimerRef.current = setTimeout(() => {
+            draggingRef.current = false;
+            dragGuardTimerRef.current = null;
+          }, 50);
+        }}
+        // Also require a non-trivial movement before a press is treated as
+        // a drag. At the default 0px threshold any jitter while clicking
+        // triggers a full drag gesture that the runtime then has to end —
+        // and that race is exactly where the "stuck node" bug was born.
+        nodeDragThreshold={3}
+        onNodeClick={(_, node) => {
+          if (draggingRef.current) return;
+          selectNode(node.id);
+        }}
         defaultEdgeOptions={defaultEdgeOptions}
         proOptions={{ hideAttribution: true }}
         fitView

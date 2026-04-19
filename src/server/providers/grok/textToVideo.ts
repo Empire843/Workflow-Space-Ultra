@@ -260,6 +260,7 @@ export async function grokTextToVideo(page: Page, opts: GrokT2VOptions): Promise
       })
     `;
 
+    if (page.isClosed()) throw new Error("Grok page đã bị đóng trước khi tạo video");
     const evalPromise = page.evaluate(
       `(${script})(${JSON.stringify(payload)})`
     ) as Promise<GrokT2VResult>;

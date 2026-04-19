@@ -6,7 +6,8 @@ import { finished } from "node:stream/promises";
 
 import { request } from "undici";
 
-import { DOWNLOADS_DIR, GROK_PROFILE_NAME, ensureDirs } from "../../config";
+import { GROK_PROFILE_NAME, ensureDirs } from "../../config";
+import { resolveDownloadDir } from "../../paths/workflowAssets";
 import { timedSpan } from "../../telemetry/timing";
 import { getGrokCollector, resetGrokCollector } from "../../tokens/grokTokenCollector";
 
@@ -79,7 +80,7 @@ export async function grokT2V(
       grokTextToVideo(page, { ...opts, statsigHeaders: statsig })
     );
   } catch (err) {
-    if (err instanceof Error && /timeout|not ready|login|session/i.test(err.message)) {
+    if (err instanceof Error && /timeout|not ready|login|session|closed|disconnect/i.test(err.message)) {
       resetGrokCollector();
     }
     throw err;
@@ -117,7 +118,7 @@ export async function grokI2V(
       })
     );
   } catch (err) {
-    if (err instanceof Error && /timeout|not ready|login|session/i.test(err.message)) {
+    if (err instanceof Error && /timeout|not ready|login|session|closed|disconnect/i.test(err.message)) {
       resetGrokCollector();
     }
     throw err;
@@ -149,12 +150,14 @@ export async function grokUpscaleVideo(opts: { videoId: string; profileName?: st
 export async function grokDownloadVideo(
   url: string,
   fileName: string,
-  profileName?: string
+  profileName?: string,
+  workflowRunId?: string | null,
 ): Promise<string> {
   return timedSpan("grok.download", async () => {
     ensureDirs();
-    await mkdir(DOWNLOADS_DIR, { recursive: true });
-    const abs = path.join(DOWNLOADS_DIR, fileName);
+    const { dir } = resolveDownloadDir(workflowRunId);
+    await mkdir(dir, { recursive: true });
+    const abs = path.join(dir, fileName);
     const { page } = await ensureGrokReady(profileName);
 
     // R1.4 — stream via undici with browser cookies so the body is never
