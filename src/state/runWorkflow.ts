@@ -52,7 +52,7 @@ async function enqueueAndWait(
   inputs: NodeDataBase[],
   onUpdate: (patch: Partial<NodeDataBase>) => void
 ): Promise<NodeDataBase | null> {
-  onUpdate({ status: "queued", progress: 0, error: undefined });
+  onUpdate({ status: "queued", progress: 0, error: undefined, jobId: undefined });
 
   const res = await fetch("/api/jobs", {
     method: "POST",
@@ -67,62 +67,122 @@ async function enqueueAndWait(
     return null;
   }
 
+  const jobId = json.jobId;
+  onUpdate({ jobId });
+
+  /**
+   * SSE is our primary channel; HTTP polling is a safety net.
+   *
+   * Failure modes we now handle:
+   *  1. The server restarts mid-job (HMR / crash): SSE drops, the job no longer
+   *     exists → we poll /api/jobs/:id, see 404, mark the node as "error" instead
+   *     of leaving it yellow forever.
+   *  2. The SSE controller crashes (legacy "ERR_INVALID_STATE"): same as above.
+   *  3. Network blip: EventSource auto-reconnects; polling fills any gap.
+   */
   return new Promise<NodeDataBase | null>((resolve) => {
     let finalOutput: NodeDataBase | null = null;
-    const es = new EventSource(`/api/jobs/${json.jobId}/stream`);
+    let settled = false;
+    let pollTimer: ReturnType<typeof setInterval> | null = null;
+
+    const finish = (output: NodeDataBase | null) => {
+      if (settled) return;
+      settled = true;
+      if (pollTimer) clearInterval(pollTimer);
+      try { es.close(); } catch { /* ignore */ }
+      onUpdate({ jobId: undefined });
+      resolve(output);
+    };
+
+    const applyMsg = (msg: JobStreamMsg) => {
+      if (msg.type === "snapshot" && msg.job) {
+        onUpdate({ status: msg.job.status as NodeDataBase["status"], progress: msg.job.progress });
+      } else if (msg.type === "progress" && typeof msg.progress === "number") {
+        onUpdate({ progress: msg.progress });
+      } else if (msg.type === "status" && msg.status) {
+        if (msg.status === "queued") onUpdate({ status: "queued" });
+        if (msg.status === "running") onUpdate({ status: "running", progress: 1 });
+        if (msg.status === "cancelled") onUpdate({ status: "error", error: "Cancelled" });
+      } else if (msg.type === "output" && msg.output) {
+        // Split overflow items into clone nodes before updating the original node
+        if (msg.output.outputsOverflow?.length) {
+          const overflow = msg.output.outputsOverflow;
+          const store = useWorkflowStore.getState();
+          for (let i = 0; i < overflow.length; i++) {
+            const ov = overflow[i];
+            store.cloneNode(nodeId, i + 1, {
+              outputCount: 1,
+              outputs: [ov],
+              imageUrl: ov.imageUrl,
+              imageMediaId: ov.imageMediaId,
+              videoUrl: ov.videoUrl,
+              videoHdUrl: ov.videoHdUrl,
+              status: "done",
+              progress: 100,
+            });
+          }
+          delete msg.output.outputsOverflow;
+        }
+        finalOutput = msg.output;
+        onUpdate({ ...msg.output, status: "done", progress: 100, statusLog: undefined });
+      } else if (msg.type === "error" && msg.error) {
+        onUpdate({ status: "error", error: msg.error });
+        reportIfSessionError(nodeId, msg.error);
+      } else if (msg.type === "log" && msg.log) {
+        onUpdate({ statusLog: msg.log });
+      }
+      if (msg.type === "status" && (msg.status === "done" || msg.status === "error" || msg.status === "cancelled")) {
+        finish(finalOutput);
+      }
+    };
+
+    const es = new EventSource(`/api/jobs/${jobId}/stream`);
     es.onmessage = (ev) => {
       try {
-        const msg = JSON.parse(ev.data) as JobStreamMsg;
-        if (msg.type === "snapshot" && msg.job) {
-          onUpdate({ status: msg.job.status as NodeDataBase["status"], progress: msg.job.progress });
-        } else if (msg.type === "progress" && typeof msg.progress === "number") {
-          onUpdate({ progress: msg.progress });
-        } else if (msg.type === "status" && msg.status) {
-          if (msg.status === "queued") onUpdate({ status: "queued" });
-          if (msg.status === "running") onUpdate({ status: "running", progress: 1 });
-          if (msg.status === "cancelled") onUpdate({ status: "error", error: "Cancelled" });
-        } else if (msg.type === "output" && msg.output) {
-          // Split overflow items into clone nodes before updating the original node
-          if (msg.output.outputsOverflow?.length) {
-            const overflow = msg.output.outputsOverflow;
-            const store = useWorkflowStore.getState();
-            for (let i = 0; i < overflow.length; i++) {
-              const ov = overflow[i];
-              store.cloneNode(nodeId, i + 1, {
-                outputCount: 1,
-                outputs: [ov],
-                imageUrl: ov.imageUrl,
-                imageMediaId: ov.imageMediaId,
-                videoUrl: ov.videoUrl,
-                videoHdUrl: ov.videoHdUrl,
-                status: "done",
-                progress: 100,
-              });
-            }
-            // Do not store overflow back on the original node
-            delete msg.output.outputsOverflow;
-          }
-          finalOutput = msg.output;
-          onUpdate({ ...msg.output, status: "done", progress: 100, statusLog: undefined });
-        } else if (msg.type === "error" && msg.error) {
-          onUpdate({ status: "error", error: msg.error });
-          reportIfSessionError(nodeId, msg.error);
-        } else if (msg.type === "log" && msg.log) {
-          onUpdate({ statusLog: msg.log });
-        }
-        if (msg.type === "status" && (msg.status === "done" || msg.status === "error" || msg.status === "cancelled")) {
-          es.close();
-          resolve(finalOutput);
-        }
+        applyMsg(JSON.parse(ev.data) as JobStreamMsg);
       } catch {
         // ignore parse errors
       }
     };
     es.onerror = () => {
-      es.close();
-      onUpdate({ status: "error", error: "SSE connection error" });
-      resolve(null);
+      // Don't immediately fail the node — the browser auto-reconnects EventSource
+      // for transient network issues. The polling loop below is the authoritative
+      // fallback that decides when to give up.
     };
+
+    // Polling safety net: every 4s, ask the server for the job's current state.
+    // If the server doesn't know about the job (404) → server restarted, treat as
+    // error. If the job is in a terminal state → honor that and finish.
+    pollTimer = setInterval(async () => {
+      if (settled) return;
+      try {
+        const r = await fetch(`/api/jobs/${jobId}`);
+        if (r.status === 404) {
+          onUpdate({ status: "error", error: "Server forgot this job (restarted?)" });
+          finish(null);
+          return;
+        }
+        const body = (await r.json()) as {
+          ok: boolean;
+          job?: { status: string; progress: number; error?: string; output?: NodeDataBase };
+        };
+        if (!body.ok || !body.job) return;
+        const j = body.job;
+        if (j.status === "done" && j.output) {
+          finalOutput = j.output;
+          onUpdate({ ...j.output, status: "done", progress: 100, statusLog: undefined });
+          finish(finalOutput);
+        } else if (j.status === "error") {
+          onUpdate({ status: "error", error: j.error || "Job failed" });
+          finish(null);
+        } else if (j.status === "cancelled") {
+          onUpdate({ status: "error", error: "Cancelled" });
+          finish(null);
+        }
+      } catch {
+        // network error — keep trying
+      }
+    }, 4000);
   });
 }
 

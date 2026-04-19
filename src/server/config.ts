@@ -9,6 +9,7 @@ export const BASE_DIR = process.cwd();
 export const DATA_GENERAL_DIR = path.join(BASE_DIR, "data_general");
 export const DOWNLOADS_DIR = path.join(BASE_DIR, "downloads");
 export const WORKFLOWS_DIR = path.join(BASE_DIR, "Workflows");
+export const LOGS_DIR = path.join(BASE_DIR, "logs");
 
 // Chrome profiles (keep the original Python tool's names so users can share profiles)
 export const VEO_USER_DATA_DIR = process.env.VEO_CHROME_USER_DATA_DIR
@@ -39,7 +40,7 @@ export const RECAPTCHA_SITE_KEY = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV";
 export const CONFIG_FILE = path.join(DATA_GENERAL_DIR, "config.json");
 
 export function ensureDirs() {
-  for (const d of [DATA_GENERAL_DIR, DOWNLOADS_DIR, WORKFLOWS_DIR, VEO_USER_DATA_DIR, GROK_USER_DATA_ROOT]) {
+  for (const d of [DATA_GENERAL_DIR, DOWNLOADS_DIR, WORKFLOWS_DIR, LOGS_DIR, VEO_USER_DATA_DIR, GROK_USER_DATA_ROOT]) {
     if (!existsSync(d)) mkdirSync(d, { recursive: true });
   }
 }

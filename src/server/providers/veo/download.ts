@@ -7,6 +7,7 @@ import { finished } from "node:stream/promises";
 import { request } from "undici";
 
 import { DOWNLOADS_DIR, ensureDirs } from "../../config";
+import { timedSpan } from "../../telemetry/timing";
 
 export async function downloadToDisk(
   url: string,
@@ -14,21 +15,23 @@ export async function downloadToDisk(
   accessToken?: string,
   cookie?: string
 ): Promise<string> {
-  ensureDirs();
-  await mkdir(DOWNLOADS_DIR, { recursive: true });
-  const absPath = path.join(DOWNLOADS_DIR, fileName);
+  return timedSpan("veo.download", async () => {
+    ensureDirs();
+    await mkdir(DOWNLOADS_DIR, { recursive: true });
+    const absPath = path.join(DOWNLOADS_DIR, fileName);
 
-  const headers: Record<string, string> = {};
-  if (accessToken) headers["Authorization"] = `Bearer ${accessToken}`;
-  if (cookie) headers["Cookie"] = cookie;
+    const headers: Record<string, string> = {};
+    if (accessToken) headers["Authorization"] = `Bearer ${accessToken}`;
+    if (cookie) headers["Cookie"] = cookie;
 
-  const { body, statusCode } = await request(url, { method: "GET", headers });
-  if (statusCode < 200 || statusCode >= 300) {
-    throw new Error(`Download failed ${statusCode} ${url}`);
-  }
+    const { body, statusCode } = await request(url, { method: "GET", headers });
+    if (statusCode < 200 || statusCode >= 300) {
+      throw new Error(`Download failed ${statusCode} ${url}`);
+    }
 
-  const out = createWriteStream(absPath);
-  // body is a Readable from undici
-  await finished(Readable.from(body).pipe(out));
-  return absPath;
+    const out = createWriteStream(absPath);
+    // body is a Readable from undici
+    await finished(Readable.from(body).pipe(out));
+    return absPath;
+  });
 }

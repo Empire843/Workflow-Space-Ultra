@@ -1,6 +1,13 @@
 import { loadConfig, type AccountType } from "../../config";
+import { timedSpan } from "../../telemetry/timing";
 import { getVeoCollector } from "../../tokens/veoTokenCollector";
 
+import { getCreateImageBatcher, readBatcherConfig } from "./batcher";
+import {
+  cooldownRemainingMs,
+  recordRecaptchaStrike,
+  waitForCooldown,
+} from "./cooldown";
 import {
   buildCreateImagePayload,
   parseGeneratedImages,
@@ -47,13 +54,15 @@ interface AuthCtx {
 }
 
 async function buildBaseAuth(onLog?: LogFn) {
-  onLog?.("Kết nối VEO session…");
-  const collector = await getVeoCollector();
-  const auth = await collector.collectAuth();
-  const config = loadConfig();
-  const accountType: AccountType = config.account1.TYPE_ACCOUNT || "ULTRA";
-  onLog?.("Session OK. Chuẩn bị reCAPTCHA…");
-  return { collector, auth, accountType };
+  return timedSpan("veo.buildAuth", async () => {
+    onLog?.("Kết nối VEO session…");
+    const collector = await getVeoCollector();
+    const auth = await collector.collectAuth();
+    const config = loadConfig();
+    const accountType: AccountType = config.account1.TYPE_ACCOUNT || "ULTRA";
+    onLog?.("Session OK. Chuẩn bị reCAPTCHA…");
+    return { collector, auth, accountType };
+  });
 }
 
 /**
@@ -78,6 +87,8 @@ function isUnauthenticated(err: unknown): boolean {
   return / 401/.test(msg) || /UNAUTHENTICATED/i.test(msg);
 }
 
+const MAX_RECAPTCHA_ATTEMPTS = 4;
+
 async function withRecaptcha<T>(
   fn: (recaptcha: string, ctx: AuthCtx) => Promise<T>,
   mode: "video" | "image" = "video",
@@ -87,8 +98,20 @@ async function withRecaptcha<T>(
   let attempt = 0;
   while (true) {
     attempt++;
-    onLog?.(attempt > 1 ? "Lấy reCAPTCHA token (retry)… (~15-25s)" : "Lấy reCAPTCHA token… (~15-25s)");
-    const recaptcha = await collector.getFreshRecaptchaToken(25_000, mode);
+
+    // Wait out any global VEO cooldown before spending another reCAPTCHA.
+    // Without this, every attempt inside the punishment window simply burns
+    // tokens and resets the timer. waitForCooldown loops with periodic log
+    // messages so the UI can show a live countdown.
+    if (cooldownRemainingMs() > 0) {
+      await waitForCooldown(onLog);
+    }
+
+    onLog?.(attempt > 1 ? `Lấy reCAPTCHA token (retry ${attempt}/${MAX_RECAPTCHA_ATTEMPTS})… (~15-25s)` : "Lấy reCAPTCHA token… (~15-25s)");
+    const recaptcha = await timedSpan(
+      `veo.recaptcha.${mode}`,
+      () => collector.getFreshRecaptchaToken(25_000, mode)
+    );
     onLog?.("reCAPTCHA OK. Đang gửi request…");
     const ctx: AuthCtx = {
       accessToken: auth.accessToken,
@@ -100,7 +123,7 @@ async function withRecaptcha<T>(
     try {
       return await fn(recaptcha, ctx);
     } catch (err) {
-      if (attempt < 2 && isUnauthenticated(err)) {
+      if (attempt < MAX_RECAPTCHA_ATTEMPTS && isUnauthenticated(err)) {
         // access_token expired — clear cache and re-collect from page
         onLog?.("Token hết hạn (401) — đang refresh session… (~15s)");
         collector.invalidateAuth();
@@ -112,10 +135,17 @@ async function withRecaptcha<T>(
         collector.invalidateRecaptchaCache();
         continue;
       }
-      if (attempt < 2 && isRecaptchaError(err)) {
-        onLog?.("Lỗi reCAPTCHA — thử lại…");
+      if (attempt < MAX_RECAPTCHA_ATTEMPTS && isRecaptchaError(err)) {
+        // Record a strike: this extends the lane-wide cooldown so every
+        // *other* in-flight VEO job also waits. Without the lane-wide
+        // state, N parallel jobs would each hit UNUSUAL_ACTIVITY in
+        // sequence and cumulatively push the ban into hours.
+        const { delayMs, strikes } = recordRecaptchaStrike();
+        onLog?.(
+          `Google flag UNUSUAL_ACTIVITY (strike #${strikes}). Đợi cooldown ${Math.round(delayMs / 1000)}s rồi thử lại…`,
+        );
         collector.invalidateRecaptchaCache();
-        await new Promise((r) => setTimeout(r, 1500));
+        await waitForCooldown(onLog);
         continue;
       }
       throw err;
@@ -130,16 +160,25 @@ export async function veoCreateImage(
   >,
   onLog?: LogFn
 ): Promise<{ raw: GeneratedImage[] }> {
+  // R2 — when VEO_IMAGE_BATCH=1, coalesce concurrent callers into a single
+  // batchGenerateImages API call (one reCAPTCHA for N prompts). The batcher
+  // internally manages auth/reCAPTCHA/demux + falls back to individual calls
+  // when the response can't be safely split.
+  if (readBatcherConfig().enabled) {
+    return getCreateImageBatcher().submit(opts, onLog);
+  }
   return withRecaptcha(async (recaptcha, ctx) => {
-    const res = await requestCreateImage({
-      ...opts,
-      recaptchaToken: recaptcha,
-      accessToken: ctx.accessToken,
-      sessionId: ctx.sessionId,
-      projectId: ctx.projectId,
-      cookie: ctx.cookie,
-      accountType: ctx.accountType,
-    });
+    const res = await timedSpan("veo.api.createImage", () =>
+      requestCreateImage({
+        ...opts,
+        recaptchaToken: recaptcha,
+        accessToken: ctx.accessToken,
+        sessionId: ctx.sessionId,
+        projectId: ctx.projectId,
+        cookie: ctx.cookie,
+        accountType: ctx.accountType,
+      })
+    );
     if (!res.ok) {
       const refCount = opts.referenceImages?.length ?? 0;
       // Rebuild payload once for logging so the shape we sent is visible in
@@ -190,12 +229,14 @@ export async function veoUploadImage(
 ): Promise<string> {
   const { auth } = await buildBaseAuth(onLog);
   onLog?.("Đang upload ảnh tham chiếu lên VEO…");
-  const res = await requestUploadUserImage({
-    ...opts,
-    accessToken: auth.accessToken,
-    sessionId: auth.sessionId,
-    cookie: auth.cookie,
-  });
+  const res = await timedSpan("veo.api.uploadImage", () =>
+    requestUploadUserImage({
+      ...opts,
+      accessToken: auth.accessToken,
+      sessionId: auth.sessionId,
+      cookie: auth.cookie,
+    })
+  );
   if (!res.ok) {
     throw new Error(`VEO uploadImage ${res.status}: ${res.body.slice(0, 400)}`);
   }
@@ -213,15 +254,17 @@ export async function veoTextToVideo(
   onLog?: LogFn
 ): Promise<{ operations: OperationRef[] }> {
   return withRecaptcha(async (recaptcha, ctx) => {
-    const res = await requestCreateT2V({
-      ...opts,
-      recaptchaToken: recaptcha,
-      accessToken: ctx.accessToken,
-      sessionId: ctx.sessionId,
-      projectId: ctx.projectId,
-      cookie: ctx.cookie,
-      accountType: ctx.accountType,
-    });
+    const res = await timedSpan("veo.api.t2v", () =>
+      requestCreateT2V({
+        ...opts,
+        recaptchaToken: recaptcha,
+        accessToken: ctx.accessToken,
+        sessionId: ctx.sessionId,
+        projectId: ctx.projectId,
+        cookie: ctx.cookie,
+        accountType: ctx.accountType,
+      })
+    );
     if (!res.ok) {
       throw new Error(`VEO t2v create ${res.status}: ${res.body.slice(0, 400)}`);
     }
@@ -247,15 +290,17 @@ export async function veoImageToVideo(
       cookie: ctx.cookie,
       accountType: ctx.accountType,
     });
-    const res = await requestCreateI2V({
-      ...opts,
-      recaptchaToken: recaptcha,
-      accessToken: ctx.accessToken,
-      sessionId: ctx.sessionId,
-      projectId: ctx.projectId,
-      cookie: ctx.cookie,
-      accountType: ctx.accountType,
-    });
+    const res = await timedSpan("veo.api.i2v", () =>
+      requestCreateI2V({
+        ...opts,
+        recaptchaToken: recaptcha,
+        accessToken: ctx.accessToken,
+        sessionId: ctx.sessionId,
+        projectId: ctx.projectId,
+        cookie: ctx.cookie,
+        accountType: ctx.accountType,
+      })
+    );
     if (!res.ok) {
       throw new Error(`VEO i2v create ${res.status}: ${res.body.slice(0, 400)}`);
     }
@@ -274,11 +319,8 @@ export async function veoPollStatus(operations: OperationRef[]): Promise<PollRes
   let attempt = 0;
   while (true) {
     attempt++;
-    const { http, entries } = await requestCheckStatus(
-      operations,
-      auth.accessToken,
-      auth.sessionId,
-      auth.cookie
+    const { http, entries } = await timedSpan("veo.api.pollStatus", () =>
+      requestCheckStatus(operations, auth.accessToken, auth.sessionId, auth.cookie)
     );
     if (!http.ok) {
       if (attempt < 2 && http.status === 401) {

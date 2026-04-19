@@ -126,6 +126,13 @@ export interface NodeDataBase extends Record<string, unknown> {
   statusLog?: string;
   progress?: number;
   error?: string;
+  /**
+   * Server-assigned job id (set by the client while a job is in flight). Kept
+   * on the node so the Queue panel can show "which node runs which job" and so
+   * the per-node Cancel button knows which job to DELETE. Cleared when the job
+   * settles or the user starts a new run.
+   */
+  jobId?: string;
   // Primary output (legacy / first item convenience)
   imageUrl?: string;
   imageMediaId?: string;

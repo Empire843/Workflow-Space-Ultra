@@ -4,6 +4,7 @@ import {
   ArrowLeft,
   CheckCircle2,
   Download,
+  ListOrdered,
   Loader2,
   LogOut,
   Play,
@@ -20,7 +21,14 @@ import { cn } from "@/lib/utils";
 import { runWorkflow } from "@/state/runWorkflow";
 import { useWorkflowStore } from "@/state/workflowStore";
 
+import QueuePanel from "../queue/QueuePanel";
 import SettingsDialog from "../settings/SettingsDialog";
+
+interface LaneStats {
+  concurrency: number;
+  active: number;
+  queued: number;
+}
 
 interface AuthStatus {
   veo: { ok: boolean };
@@ -29,6 +37,8 @@ interface AuthStatus {
 
 export default function TopBar() {
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [queueOpen, setQueueOpen] = useState(false);
+  const [queueBadge, setQueueBadge] = useState<{ running: number; queued: number } | null>(null);
   const [running, setRunning] = useState(false);
   const [auth, setAuth] = useState<AuthStatus | null>(null);
 
@@ -51,6 +61,38 @@ export default function TopBar() {
   useEffect(() => {
     refreshAuth();
   }, []);
+
+  /**
+   * Light-weight poller for the queue badge. Only runs while the panel is closed
+   * (open = the panel owns its own 2s poll). 5s cadence is plenty to surface a
+   * "jobs are piling up" indicator without hammering the API.
+   */
+  useEffect(() => {
+    if (queueOpen) return;
+    let alive = true;
+    const tick = async () => {
+      try {
+        const r = await fetch("/api/queue", { cache: "no-store" });
+        const body = (await r.json()) as {
+          ok: boolean;
+          jobs: { status: string }[];
+          lanes: Record<string, LaneStats>;
+        };
+        if (!alive || !body.ok) return;
+        const running = body.jobs.filter((j) => j.status === "running").length;
+        const queued = body.jobs.filter((j) => j.status === "queued").length;
+        setQueueBadge(running + queued > 0 ? { running, queued } : null);
+      } catch {
+        // ignore
+      }
+    };
+    void tick();
+    const id = setInterval(tick, 5000);
+    return () => {
+      alive = false;
+      clearInterval(id);
+    };
+  }, [queueOpen]);
 
   const handleLogoutAll = async () => {
     if (!confirm("Xoá cache đăng nhập VEO + Grok? App sẽ yêu cầu login lại.")) return;
@@ -173,6 +215,30 @@ export default function TopBar() {
       </button>
       <button
         type="button"
+        onClick={() => setQueueOpen(true)}
+        title="Xem queue, cancel job, reset lanes"
+        className={cn(
+          "relative h-8 px-3 rounded-md bg-[color:var(--color-bg-elev-2)] border hover:bg-[color:var(--color-bg-elev-1)] text-xs flex items-center gap-1.5",
+          queueBadge
+            ? "border-amber-500/40 text-amber-300"
+            : "border-[color:var(--color-border)] text-[color:var(--color-fg-muted)]",
+        )}
+      >
+        <ListOrdered className="h-3.5 w-3.5" /> Queue
+        {queueBadge && (
+          <span className="ml-0.5 inline-flex items-center gap-0.5 text-[10px] font-semibold">
+            {queueBadge.running > 0 && <span className="text-blue-300">{queueBadge.running}</span>}
+            {queueBadge.queued > 0 && (
+              <span className="text-amber-300">
+                {queueBadge.running > 0 ? "+" : ""}
+                {queueBadge.queued}
+              </span>
+            )}
+          </span>
+        )}
+      </button>
+      <button
+        type="button"
         onClick={() => setSettingsOpen(true)}
         className="h-8 px-3 rounded-md bg-[color:var(--color-bg-elev-2)] border border-[color:var(--color-border)] hover:bg-[color:var(--color-bg-elev-1)] text-[color:var(--color-fg-muted)] text-xs flex items-center gap-1.5"
       >
@@ -193,6 +259,7 @@ export default function TopBar() {
       </button>
 
       <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
+      <QueuePanel open={queueOpen} onClose={() => setQueueOpen(false)} />
     </div>
   );
 }

@@ -74,6 +74,27 @@ That's it. Sessions are cached locally; you only need to re-login when they expi
 
 Defaults work out of the box. To override, copy `.env.example` → `.env.local` or use the in-app **Settings** dialog.
 
+### Parallel speed: VEO image batcher (R2)
+
+When the workflow has several `gen.image` nodes firing at once, setting
+`VEO_IMAGE_BATCH=1` merges them into a single `batchGenerateImages` API call
+using **one reCAPTCHA token** instead of N. Expected win scales with parallel
+image nodes (1 reCAPTCHA ≈ 8–25s, so 4 merged → save 3 × reCAPTCHA).
+
+```powershell
+$env:VEO_IMAGE_BATCH="1"
+$env:VEO_IMAGE_BATCH_MAX="4"      # max prompts per batch (default 4, cap 8)
+$env:VEO_IMAGE_BATCH_WINDOW_MS="300"  # coalesce window (default 300ms)
+npm run dev
+```
+
+Guarantees: same result as the non-batched path. Different `modelLabel`s are
+never merged (API rejects mixed-model requests). On any demux/API failure,
+the batcher transparently falls back to per-caller individual calls — zero
+data loss, only no speedup for that round. Measure via `npm run bench`:
+look for a new `veo.batch.createImage` span and a drop in `veo.recaptcha.image`
+count relative to `executor.gen.image`.
+
 ### Debugging undocumented VEO endpoints
 
 If VEO/Flow changes its payload schema and calls start returning `400 Unknown name "…" at "…"`, enable **capture mode** to record the real payload that labs.google's UI sends and compare it against what the tool sends:

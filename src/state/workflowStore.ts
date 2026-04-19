@@ -35,6 +35,7 @@ const RUNTIME_KEYS: (keyof NodeDataBase)[] = [
   "error",
   "outputsOverflow",
   "uploadBase64",
+  "jobId",
 ];
 
 const RUNTIME_KEY_SET = new Set<string>(RUNTIME_KEYS as unknown as string[]);

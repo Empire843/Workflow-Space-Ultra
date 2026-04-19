@@ -71,10 +71,33 @@ export class GrokTokenCollector {
     this.profileName = profileName;
   }
 
+  /**
+   * Lightweight liveness check for the singleton — returns false when the
+   * user has closed the Chrome window (CDP disconnected) so the caller can
+   * reinit instead of blowing up on the next newPage() call.
+   */
+  isAlive(): boolean {
+    try {
+      return !!(this.browser && this.browser.isConnected() && this.context);
+    } catch {
+      return false;
+    }
+  }
+
   async init() {
     const handle = await openGrokChrome({ profileName: this.profileName });
     const { chromium } = await import("playwright");
     this.browser = await chromium.connectOverCDP(`http://${GROK_CDP_HOST}:${handle.port}`);
+
+    this.browser.on("disconnected", () => {
+      console.warn("[Grok] Browser disconnected — invalidating singleton");
+      const store = getGrokStore();
+      if (store.instance === this) {
+        store.instance = null;
+        store.initPromise = null;
+      }
+    });
+
     const contexts = this.browser.contexts();
     this.context = contexts[0] || (await this.browser.newContext());
     const pages = this.context.pages();
@@ -174,30 +197,98 @@ export class GrokTokenCollector {
   }
 }
 
-let _singleton: GrokTokenCollector | null = null;
-let _initPromise: Promise<GrokTokenCollector> | null = null;
+// Stash on globalThis so the instance survives Next.js dev-mode HMR reloads
+// (otherwise every code change would drop the reference and the next call
+// would reconnect + spawn a duplicate Grok tab).
+type GrokSingletonStore = {
+  instance: GrokTokenCollector | null;
+  initPromise: Promise<GrokTokenCollector> | null;
+};
+const GROK_GLOBAL_KEY = "__grokTokenCollectorSingleton__";
+function getGrokStore(): GrokSingletonStore {
+  const g = globalThis as unknown as Record<string, GrokSingletonStore | undefined>;
+  if (!g[GROK_GLOBAL_KEY]) g[GROK_GLOBAL_KEY] = { instance: null, initPromise: null };
+  return g[GROK_GLOBAL_KEY]!;
+}
+
+/**
+ * Same rationale as VEO's dropStaleInstance — see that file for the full
+ * explanation. Summary: an `instanceof` check against the *current* class
+ * catches stale HMR prototypes in one principled step, while `isAlive()`
+ * catches the legitimate "user closed Chrome while idle" case. Either
+ * failure triggers a full reinit, not a per-method workaround.
+ */
+async function dropStaleGrokInstance(store: GrokSingletonStore): Promise<void> {
+  const inst = store.instance;
+  if (!inst) return;
+  const isCurrentClass = inst instanceof GrokTokenCollector;
+  const alive = isCurrentClass ? safeGrokIsAlive(inst) : false;
+  if (isCurrentClass && alive) return;
+  console.warn(
+    `[Grok] Dropping cached collector (currentClass=${isCurrentClass}, alive=${alive}) — reinitialising`,
+  );
+  try {
+    const closer = (inst as { close?: () => Promise<void> }).close;
+    if (typeof closer === "function") await closer.call(inst);
+  } catch {
+    // ignore
+  }
+  store.instance = null;
+  store.initPromise = null;
+}
+
+function safeGrokIsAlive(inst: GrokTokenCollector): boolean {
+  try {
+    return inst.isAlive();
+  } catch {
+    return false;
+  }
+}
 
 export async function getGrokCollector(profileName: string): Promise<GrokTokenCollector> {
-  if (_singleton && _singleton.profileName === profileName) return _singleton;
-  if (_initPromise) return _initPromise;
-  _initPromise = (async () => {
-    if (_singleton) await _singleton.close().catch(() => undefined);
+  const store = getGrokStore();
+  await dropStaleGrokInstance(store);
+  if (store.instance && store.instance.profileName === profileName) return store.instance;
+  // Profile changed — close the previous instance cleanly before starting
+  // a new one so we don't leak the CDP connection.
+  if (store.instance && store.instance.profileName !== profileName) {
+    try { await store.instance.close(); } catch { /* ignore */ }
+    store.instance = null;
+    store.initPromise = null;
+  }
+  if (store.initPromise) {
+    try {
+      const pending = await store.initPromise;
+      if (
+        pending instanceof GrokTokenCollector &&
+        pending.profileName === profileName &&
+        safeGrokIsAlive(pending)
+      ) {
+        return pending;
+      }
+    } catch {
+      // fall through
+    }
+    await dropStaleGrokInstance(store);
+  }
+  store.initPromise = (async () => {
     const inst = new GrokTokenCollector(profileName);
     try {
       await inst.init();
-      _singleton = inst;
+      store.instance = inst;
       return inst;
     } finally {
-      _initPromise = null;
+      store.initPromise = null;
     }
   })();
-  return _initPromise;
+  return store.initPromise;
 }
 
 export function resetGrokCollector() {
-  if (_singleton) {
-    _singleton.close().catch(() => undefined);
-    _singleton = null;
+  const store = getGrokStore();
+  if (store.instance) {
+    store.instance.close().catch(() => undefined);
+    store.instance = null;
   }
-  _initPromise = null;
+  store.initPromise = null;
 }

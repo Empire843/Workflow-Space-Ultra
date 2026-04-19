@@ -22,6 +22,7 @@ import {
   veoWaitForVideos,
 } from "./providers/veo";
 import {
+  getJob,
   setJobError,
   setJobLog,
   setJobOutput,
@@ -29,6 +30,31 @@ import {
   setJobStatus,
   type JobRecord,
 } from "./queue";
+import { logError } from "./telemetry/errorLog";
+import { timedSpan } from "./telemetry/timing";
+import { pMapLimited } from "./util/pMap";
+
+/**
+ * Thrown when the executor detects `job.cancelRequested`. A dedicated error
+ * class lets callers in /api/jobs/route.ts distinguish "user cancelled" from
+ * a real provider failure and set status accordingly.
+ */
+export class JobCancelledError extends Error {
+  constructor(msg = "Cancelled") {
+    super(msg);
+    this.name = "JobCancelledError";
+  }
+}
+
+/**
+ * Throw a `JobCancelledError` if the user requested cancellation since the last
+ * check. Called at the top of every long-running branch (image gen, video
+ * poll, download) so the executor stops at the next safe point.
+ */
+function assertNotCancelled(jobId: string): void {
+  const rec = getJob(jobId);
+  if (rec?.cancelRequested) throw new JobCancelledError();
+}
 
 /**
  * Execute a single node. Upstream outputs are already available in `inputs`.
@@ -40,6 +66,20 @@ export async function executeNode(
   nodeData: NodeDataBase,
   inputs: NodeDataBase[]
 ): Promise<NodeDataBase> {
+  const log = (msg: string) => setJobLog(job.id, msg);
+  return timedSpan(
+    `executor.${nodeData.kind}`,
+    () => _executeNode(job, nodeData, inputs),
+    log
+  );
+}
+
+async function _executeNode(
+  job: JobRecord,
+  nodeData: NodeDataBase,
+  inputs: NodeDataBase[]
+): Promise<NodeDataBase> {
+  assertNotCancelled(job.id);
   setJobStatus(job.id, "running");
   setJobProgress(job.id, 1);
 
@@ -190,6 +230,24 @@ export async function executeNode(
     setJobStatus(job.id, "done");
     return output;
   } catch (err) {
+    if (err instanceof JobCancelledError) {
+      setJobStatus(job.id, "cancelled", { error: "Cancelled" });
+      throw err;
+    }
+    // Log the full error object (with stack + any attached fields) BEFORE
+    // converting to string — setJobError will log too, but only the short
+    // message. We want the stack on disk for post-mortem debugging.
+    logError({
+      context: `executor.${nodeData.kind}`,
+      error: err,
+      extra: {
+        jobId: job.id,
+        nodeId: job.nodeId,
+        workflowRunId: job.workflowRunId,
+        kind: nodeData.kind,
+        inputsCount: inputs.length,
+      },
+    });
     const msg = err instanceof Error ? err.message : String(err);
     setJobError(job.id, msg);
     throw err;
@@ -265,6 +323,7 @@ async function runVeoCreateImage(
   references: NodeDataBase[],
   log: LogFn
 ): Promise<OutputItem[]> {
+  assertNotCancelled(job.id);
   const aspectRatio =
     nodeData.aspectRatio === "9:16"
       ? "IMAGE_ASPECT_RATIO_PORTRAIT"
@@ -283,26 +342,34 @@ async function runVeoCreateImage(
   const referenceImages: Array<{ mediaGenerationId: string; imageInputType?: string }> = [];
   if (references.length && !supportsRef) {
     log(`Model "${modelLabel}" không hỗ trợ reference image — ảnh upstream sẽ bị bỏ qua. Chọn Nano Banana 2 / pro nếu muốn dùng reference.`);
-  } else {
-    for (let i = 0; i < references.length; i++) {
-      const r = references[i];
+  } else if (references.length) {
+    // R1.1 — resolve references in parallel. Each upload is an independent
+    // HTTP call (no reCAPTCHA involved), and VEO's UI itself fires these in
+    // parallel. We cap concurrency at 3 to avoid overwhelming the account.
+    const resolved = await pMapLimited(references, 3, async (r, i) => {
       try {
         const mediaGenerationId = await resolveVeoMediaId(
           r,
           nodeData.aspectRatio || "16:9",
           log
         );
-        referenceImages.push({
-          mediaGenerationId,
-          imageInputType: "IMAGE_INPUT_TYPE_REFERENCE",
-        });
         log(`Reference #${i + 1} ready (name=${mediaGenerationId.slice(0, 24)}…).`);
+        return { ok: true as const, mediaGenerationId };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         log(`Chuẩn bị reference #${i + 1} thất bại: ${msg} — bỏ qua ảnh này.`);
+        return { ok: false as const };
+      }
+    });
+    for (const r of resolved) {
+      if (r.ok) {
+        referenceImages.push({
+          mediaGenerationId: r.mediaGenerationId,
+          imageInputType: "IMAGE_INPUT_TYPE_REFERENCE",
+        });
       }
     }
-    if (references.length && !referenceImages.length) {
+    if (!referenceImages.length) {
       log("Không có reference nào khả dụng — fallback sang text-to-image thuần.");
     }
   }
@@ -332,6 +399,7 @@ async function runVeoT2V(
   nodeData: NodeDataBase,
   log: LogFn
 ): Promise<OutputItem[]> {
+  assertNotCancelled(job.id);
   const aspect =
     nodeData.aspectRatio === "9:16"
       ? "VIDEO_ASPECT_RATIO_PORTRAIT"
@@ -357,15 +425,17 @@ async function runVeoT2V(
   const videos = entries.filter((e) => e.videoUrl);
   if (!videos.length) throw new Error("VEO không trả về videoUrl");
   log("Video xong, đang tải về…");
-  const items: OutputItem[] = [];
-  for (let i = 0; i < videos.length; i++) {
-    let url = videos[i].videoUrl!;
-    try {
-      const file = await veoDownload(url, `veo_${job.id}_${i}.mp4`);
-      url = `/api/files/${path.basename(file)}`;
-    } catch { /* keep original */ }
-    items.push({ videoUrl: url });
-  }
+  // R1.2 — download outputs in parallel (typically 1-3 videos per job).
+  const items = await Promise.all(
+    videos.map(async (v, i) => {
+      let url = v.videoUrl!;
+      try {
+        const file = await veoDownload(url, `veo_${job.id}_${i}.mp4`);
+        url = `/api/files/${path.basename(file)}`;
+      } catch { /* keep original */ }
+      return { videoUrl: url } satisfies OutputItem;
+    })
+  );
   return items;
 }
 
@@ -380,6 +450,7 @@ async function runVeoI2V(
   endImage: NodeDataBase | undefined,
   log: LogFn
 ): Promise<OutputItem[]> {
+  assertNotCancelled(job.id);
   const aspect =
     nodeData.aspectRatio === "9:16"
       ? "VIDEO_ASPECT_RATIO_PORTRAIT"
@@ -419,15 +490,17 @@ async function runVeoI2V(
   const videos = entries.filter((e) => e.videoUrl);
   if (!videos.length) throw new Error("VEO không trả về videoUrl");
   log("Video xong, đang tải về…");
-  const items: OutputItem[] = [];
-  for (let i = 0; i < videos.length; i++) {
-    let url = videos[i].videoUrl!;
-    try {
-      const file = await veoDownload(url, `veo_${job.id}_${i}.mp4`);
-      url = `/api/files/${path.basename(file)}`;
-    } catch { /* keep */ }
-    items.push({ videoUrl: url });
-  }
+  // R1.2 — download outputs in parallel.
+  const items = await Promise.all(
+    videos.map(async (v, i) => {
+      let url = v.videoUrl!;
+      try {
+        const file = await veoDownload(url, `veo_${job.id}_${i}.mp4`);
+        url = `/api/files/${path.basename(file)}`;
+      } catch { /* keep */ }
+      return { videoUrl: url } satisfies OutputItem;
+    })
+  );
   return items;
 }
 
@@ -436,6 +509,7 @@ async function runGrokT2V(
   nodeData: NodeDataBase,
   log: LogFn
 ): Promise<OutputItem[]> {
+  assertNotCancelled(job.id);
   log("Đang gửi request tạo video Grok…");
   const res = await grokT2V({
     prompt: nodeData.prompt || "",
@@ -537,6 +611,7 @@ async function runGrokI2V(
   imageInput: NodeDataBase,
   log: LogFn
 ): Promise<OutputItem[]> {
+  assertNotCancelled(job.id);
   log("Đang upload ảnh lên Grok…");
   const base64 = imageInput.uploadBase64 || (await urlToBase64(imageInput.imageUrl || ""));
   const mime = imageInput.uploadMime || "image/png";

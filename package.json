@@ -10,7 +10,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "screenshots": "node scripts/screenshot.mjs"
+    "screenshots": "node scripts/screenshot.mjs",
+    "bench": "node scripts/bench.mjs"
   },
   "dependencies": {
     "@xyflow/react": "^12.3.5",

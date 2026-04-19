@@ -7,6 +7,7 @@ import { finished } from "node:stream/promises";
 import { request } from "undici";
 
 import { DOWNLOADS_DIR, GROK_PROFILE_NAME, ensureDirs } from "../../config";
+import { timedSpan } from "../../telemetry/timing";
 import { getGrokCollector, resetGrokCollector } from "../../tokens/grokTokenCollector";
 
 import {
@@ -36,29 +37,31 @@ async function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise
 }
 
 async function ensureGrokReady(profileName?: string) {
-  const name = profileName || GROK_PROFILE_NAME;
-  const collector = await withTimeout(
-    getGrokCollector(name),
-    30_000,
-    "Grok Chrome connect",
-  );
-  const page = collector.getPage();
-  if (!page) throw new Error("Grok page not ready — Chrome có thể chưa mở hoặc login chưa thành công");
+  return timedSpan("grok.ensureReady", async () => {
+    const name = profileName || GROK_PROFILE_NAME;
+    const collector = await withTimeout(
+      getGrokCollector(name),
+      30_000,
+      "Grok Chrome connect",
+    );
+    const page = collector.getPage();
+    if (!page) throw new Error("Grok page not ready — Chrome có thể chưa mở hoặc login chưa thành công");
 
-  try {
-    if (!page.url().includes("grok.com")) {
-      await page.goto("https://grok.com/imagine", { waitUntil: "domcontentloaded", timeout: 20_000 });
+    try {
+      if (!page.url().includes("grok.com")) {
+        await page.goto("https://grok.com/imagine", { waitUntil: "domcontentloaded", timeout: 20_000 });
+      }
+    } catch (err) {
+      throw new Error(`Không thể navigate tới grok.com: ${err instanceof Error ? err.message : err}`);
     }
-  } catch (err) {
-    throw new Error(`Không thể navigate tới grok.com: ${err instanceof Error ? err.message : err}`);
-  }
 
-  const statsig = await withTimeout(
-    collector.autoDiscoverStatsig(),
-    20_000,
-    "Grok statsig discovery",
-  );
-  return { page, statsig };
+    const statsig = await withTimeout(
+      collector.autoDiscoverStatsig(),
+      20_000,
+      "Grok statsig discovery",
+    );
+    return { page, statsig };
+  });
 }
 
 export async function grokT2V(
@@ -72,7 +75,9 @@ export async function grokT2V(
     throw err;
   }
   try {
-    return await grokTextToVideo(page, { ...opts, statsigHeaders: statsig });
+    return await timedSpan("grok.api.t2v", () =>
+      grokTextToVideo(page, { ...opts, statsigHeaders: statsig })
+    );
   } catch (err) {
     if (err instanceof Error && /timeout|not ready|login|session/i.test(err.message)) {
       resetGrokCollector();
@@ -99,17 +104,18 @@ export async function grokI2V(
     const assetUrl = rawUri.startsWith("http")
       ? rawUri
       : `${GROK_ASSETS_BASE}/${rawUri.replace(/^\//, "")}`;
-    const post = await grokCreateImagePost(page, {
-      mediaUrl: assetUrl,
-      statsigHeaders: statsig,
-    });
+    const post = await timedSpan("grok.api.createPost", () =>
+      grokCreateImagePost(page, { mediaUrl: assetUrl, statsigHeaders: statsig })
+    );
 
-    return await grokImageToVideo(page, {
-      ...opts,
-      parentPostId: post.postId,
-      parentMediaUrl: post.mediaUrl,
-      statsigHeaders: statsig,
-    });
+    return await timedSpan("grok.api.i2v", () =>
+      grokImageToVideo(page, {
+        ...opts,
+        parentPostId: post.postId,
+        parentMediaUrl: post.mediaUrl,
+        statsigHeaders: statsig,
+      })
+    );
   } catch (err) {
     if (err instanceof Error && /timeout|not ready|login|session/i.test(err.message)) {
       resetGrokCollector();
@@ -125,12 +131,16 @@ export async function grokUpload(opts: {
   profileName?: string;
 }) {
   const { page, statsig } = await ensureGrokReady(opts.profileName);
-  return grokUploadImage(page, { ...opts, statsigHeaders: statsig });
+  return timedSpan("grok.api.upload", () =>
+    grokUploadImage(page, { ...opts, statsigHeaders: statsig })
+  );
 }
 
 export async function grokUpscaleVideo(opts: { videoId: string; profileName?: string }) {
   const { page, statsig } = await ensureGrokReady(opts.profileName);
-  return grokUpscale(page, { videoId: opts.videoId, statsigHeaders: statsig });
+  return timedSpan("grok.api.upscale", () =>
+    grokUpscale(page, { videoId: opts.videoId, statsigHeaders: statsig })
+  );
 }
 
 /**
@@ -141,41 +151,66 @@ export async function grokDownloadVideo(
   fileName: string,
   profileName?: string
 ): Promise<string> {
-  ensureDirs();
-  await mkdir(DOWNLOADS_DIR, { recursive: true });
-  const abs = path.join(DOWNLOADS_DIR, fileName);
-  const { page } = await ensureGrokReady(profileName);
+  return timedSpan("grok.download", async () => {
+    ensureDirs();
+    await mkdir(DOWNLOADS_DIR, { recursive: true });
+    const abs = path.join(DOWNLOADS_DIR, fileName);
+    const { page } = await ensureGrokReady(profileName);
 
-  // Retry up to 3 times because assets.grok.com sometimes needs time for CDN propagation
-  for (let attempt = 1; attempt <= 3; attempt++) {
+    // R1.4 — stream via undici with browser cookies so the body is never
+    // held entirely in memory. Previously used `page.request.get → resp.body()`
+    // which buffers the whole ~30MB clip before writing to disk, spiking RAM
+    // when many Grok jobs finish in parallel.
+    const cookies = await page.context().cookies(["https://grok.com", "https://assets.grok.com"]);
+    const cookieHeader = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
+
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const { body, statusCode } = await request(url, {
+          method: "GET",
+          headers: cookieHeader
+            ? {
+                cookie: cookieHeader,
+                "user-agent":
+                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+              }
+            : {},
+          bodyTimeout: 60_000,
+          headersTimeout: 30_000,
+        });
+        if (statusCode < 200 || statusCode >= 300) {
+          throw new Error(`download status ${statusCode}`);
+        }
+        const out = createWriteStream(abs);
+        await finished(Readable.from(body).pipe(out));
+        return abs;
+      } catch (err) {
+        console.warn(
+          `[Grok download] attempt ${attempt}/3 (stream) failed:`,
+          err instanceof Error ? err.message : err
+        );
+        if (attempt < 3) await new Promise((r) => setTimeout(r, 2000 * attempt));
+      }
+    }
+
+    // Last-chance fallback: Playwright page.request (buffered) — used when
+    // assets.grok.com's TLS / SNI flow doesn't match undici defaults.
     try {
       const resp = await page.request.get(url, { timeout: 60_000 });
-      if (!resp.ok()) throw new Error(`download status ${resp.status()}`);
-      const buf = await resp.body();
-      await new Promise<void>((resolve, reject) => {
-        const out = createWriteStream(abs);
-        out.on("error", reject);
-        out.on("finish", () => resolve());
-        out.end(buf);
-      });
-      return abs;
-    } catch (err) {
-      console.warn(`[Grok download] attempt ${attempt}/3 failed:`, err instanceof Error ? err.message : err);
-      if (attempt < 3) await new Promise((r) => setTimeout(r, 2000 * attempt));
-    }
-  }
+      if (resp.ok()) {
+        const buf = await resp.body();
+        await new Promise<void>((resolve, reject) => {
+          const out = createWriteStream(abs);
+          out.on("error", reject);
+          out.on("finish", () => resolve());
+          out.end(buf);
+        });
+        return abs;
+      }
+    } catch { /* ignore */ }
 
-  // Fallback raw fetch (no cookies — may work for public CDN URLs)
-  try {
-    const { body, statusCode } = await request(url, { method: "GET" });
-    if (statusCode >= 200 && statusCode < 300) {
-      const out = createWriteStream(abs);
-      await finished(Readable.from(body).pipe(out));
-      return abs;
-    }
-  } catch { /* ignore fallback */ }
-
-  throw new Error(`Grok download failed sau 3 lần thử. URL: ${url}`);
+    throw new Error(`Grok download failed sau 3 lần thử. URL: ${url}`);
+  });
 }
 
 /**
