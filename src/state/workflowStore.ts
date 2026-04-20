@@ -89,6 +89,37 @@ function migrateNodes(nodes: WSNode[]): WSNode[] {
 }
 
 // ---------------------------------------------------------------------------
+// Snapshot bridge — mirror graph to Workflows/<id>/snapshot.json so the
+// Node-side MCP server can serve it. Coalesce overlapping POSTs per id.
+// ---------------------------------------------------------------------------
+const _snapshotInflight = new Map<string, Promise<void>>();
+
+async function pushWorkflowSnapshot(
+  id: string,
+  name: string,
+  nodes: unknown[],
+  edges: unknown[],
+): Promise<void> {
+  // If a previous POST for this id is still in flight, skip — the newest save
+  // will fire again in a moment and produce a fresher snapshot anyway.
+  if (_snapshotInflight.has(id)) return;
+  const body = JSON.stringify({ name, nodes, edges, updatedAt: Date.now() });
+  const promise = fetch(`/api/workflows/${encodeURIComponent(id)}/snapshot`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body,
+    keepalive: true,
+  })
+    .then(() => undefined)
+    .catch(() => undefined)
+    .finally(() => {
+      _snapshotInflight.delete(id);
+    });
+  _snapshotInflight.set(id, promise);
+  return promise;
+}
+
+// ---------------------------------------------------------------------------
 // Debounced auto-save
 // ---------------------------------------------------------------------------
 let _saveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -424,19 +455,25 @@ export const useWorkflowStore = create<WorkflowState>()(
     _saveCurrentWorkflow: async () => {
       const { activeWorkflowId, activeWorkflowName, nodes, edges } = get();
       if (!activeWorkflowId) return;
+      const strippedNodes = stripRuntimeFields(nodes) as unknown[];
       const record: WorkflowRecord = {
         id: activeWorkflowId,
         name: activeWorkflowName || "Untitled",
         createdAt: Date.now(),
         updatedAt: Date.now(),
         data: {
-          nodes: stripRuntimeFields(nodes) as unknown[],
+          nodes: strippedNodes,
           edges: edges as unknown[],
         },
       };
       const existing = await getWorkflow(activeWorkflowId);
       if (existing) record.createdAt = existing.createdAt;
       await putWorkflow(record);
+      // Mirror the graph to disk so the MCP server can serve it. Best-effort:
+      // MCP is an opt-in surface; if the PUT fails (Next.js down, disk full,
+      // CSRF tightened later) we still keep the IndexedDB copy, which is the
+      // source of truth for the UI.
+      void pushWorkflowSnapshot(record.id, record.name, strippedNodes, edges);
     },
 
     createWorkflow: async (name?: string) => {
