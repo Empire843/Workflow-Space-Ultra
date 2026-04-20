@@ -172,7 +172,15 @@ export default function WSNode(props: NodeProps) {
   // and leaves the node stuck following the cursor.
   return (
     <div className="group relative cursor-pointer">
-      <NodeLabel meta={meta} label={headerLabel()} status={d.status} statusLog={d.statusLog} hasImageRef={hasImageRef} provider={isGrokMode ? "grok" : meta?.provider} />
+      <NodeLabel
+        meta={meta}
+        label={headerLabel()}
+        status={d.status}
+        statusLog={d.statusLog}
+        hasImageRef={hasImageRef}
+        provider={isGrokMode ? "grok" : meta?.provider}
+        fromMcp={d.origin === "mcp"}
+      />
 
       {/* The framed card. Do NOT use `overflow-hidden` on the outer element because it
        * would clip half of the `+` handle (react-flow Position.Right/Left centers the
@@ -312,6 +320,7 @@ function NodeLabel({
   statusLog,
   hasImageRef,
   provider,
+  fromMcp,
 }: {
   meta?: NodeCatalogEntry;
   label: string;
@@ -319,6 +328,7 @@ function NodeLabel({
   statusLog?: string;
   hasImageRef: boolean;
   provider?: string;
+  fromMcp?: boolean;
 }) {
   const Icon = pickLabelIcon(meta?.icon || "image");
   const running = status === "running";
@@ -330,6 +340,14 @@ function NodeLabel({
       {provider && (
         <span className="shrink-0 px-1 py-px rounded text-[8px] font-semibold bg-white/5 text-[color:var(--color-fg-dim)] border border-white/10 uppercase tracking-wider">
           {provider}
+        </span>
+      )}
+      {fromMcp && (
+        <span
+          className="shrink-0 px-1 py-px rounded text-[8px] font-semibold bg-sky-500/20 text-sky-300 border border-sky-500/30 uppercase tracking-wider"
+          title="Được tạo qua MCP"
+        >
+          MCP
         </span>
       )}
       {hasImageRef && (

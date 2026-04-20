@@ -173,4 +173,14 @@ export interface NodeDataBase extends Record<string, unknown> {
    * locked back to a specific mime.
    */
   uploadAccept?: string;
+
+  // ─── MCP provenance ──────────────────────────────────────────────────────
+  // Set on nodes synthesised by the MCP server and merged into the canvas
+  // from `Workflows/<id>/snapshot.json`. `origin === "mcp"` is the flag the
+  // client uses to (a) badge the node visually and (b) offer a "convert to
+  // content reference" downgrade. Once the user edits the node, these fields
+  // stay but the badge remains so the provenance trail is preserved.
+  origin?: "mcp" | "ui";
+  mcpJobId?: string;
+  mcpCreatedAt?: number;
 }

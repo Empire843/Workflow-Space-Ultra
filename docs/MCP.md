@@ -18,12 +18,13 @@ Tài liệu tham chiếu đầy đủ cho module **Model Context Protocol (MCP)*
 7. [Tool catalog](#tool-catalog)
 8. [Resource catalog](#resource-catalog)
 9. [Snapshot bridge](#snapshot-bridge)
-10. [Bảo mật](#bảo-mật)
-11. [Kiểm thử](#kiểm-thử)
-12. [Quy ước & ràng buộc](#quy-ước--ràng-buộc)
-13. [Troubleshooting](#troubleshooting)
-14. [File reference](#file-reference)
-15. [Onboarding checklist](#onboarding-checklist)
+10. [MCP → canvas integration](#mcp--canvas-integration)
+11. [Bảo mật](#bảo-mật)
+12. [Kiểm thử](#kiểm-thử)
+13. [Quy ước & ràng buộc](#quy-ước--ràng-buộc)
+14. [Troubleshooting](#troubleshooting)
+15. [File reference](#file-reference)
+16. [Onboarding checklist](#onboarding-checklist)
 
 ---
 
@@ -364,6 +365,86 @@ Workflow graphs sống trong **browser IndexedDB** (xem `src/lib/db.ts`), Node.j
 
 ---
 
+## MCP → canvas integration
+
+Snapshot bridge mặc định chạy **một chiều** (browser → đĩa) để MCP có thể đọc graph. Khi AI client gọi một generation tool kèm `workflowId`, chúng ta cần hướng ngược lại: node vừa tạo phải xuất hiện trên canvas ở lần mở workflow kế tiếp. Module `src/server/mcp/snapshotWriter.ts` đảm nhiệm việc đó.
+
+### Luồng ghi (server)
+
+```text
+AI client ──gen_image(workflowId=wf_X)──▶ MCP tool handler
+                                           │
+                                           ▼
+                             runMcpJob ──▶ executor (queue + lanes)
+                                           │ outputs: OutputItem[]
+                                           ▼
+                   appendMcpNodeToSnapshot(wf_X, buildMcpImageNode(...))
+                                           │
+                                           ▼
+                         Workflows/wf_X/snapshot.json
+                         (node có data.origin = "mcp",
+                          id = mcp_<jobId>, auto-layout)
+```
+
+Tính chất của `appendMcpNodeToSnapshot`:
+
+- **Serialised per workflowId**: mutex theo map `_locks` đảm bảo 2 tool chạy song song (`gen_image` + `gen_video_t2v`) không ghi đè nhau.
+- **Idempotent**: dedupe theo `node.id` (`mcp_<jobId>`) — retry hay double-call không nhân đôi node.
+- **Tự khởi tạo**: nếu `snapshot.json` chưa tồn tại, tạo skeleton `{ id, name: "(auto)", nodes: [], edges: [], fromMcp: true }`. Client sẽ tự ghi đè `fromMcp` ở lần save tiếp theo.
+- **Auto-layout**: đặt node mới ở `(maxX + 320, maxY)` để không chồng lên graph user đang làm việc.
+- **Best-effort**: lỗi ghi đĩa được log `warn` chứ không throw — generation đã thành công, asset nằm sẵn trong `Workflows/<id>/assets/`.
+
+### Luồng đọc (client)
+
+```text
+User mở workflow ──▶ loadWorkflow(id)
+                       │
+                       ├─ set state từ IndexedDB (nguồn chân lý)
+                       ▼
+                   fetchMcpSnapshotDelta(id, existingIds)
+                       │ GET /api/workflows/<id>/snapshot
+                       ▼
+        Lọc nodes có data.origin === "mcp" chưa có trong IDB
+                       │
+                       ▼
+                 addNodes(delta) + _saveCurrentWorkflow()
+                       │
+                       ▼
+          Node trở thành "native" IDB node ở lần render sau
+```
+
+Safety net của client merge:
+
+- 404 (chưa từng mở workflow server-side), response malformed, fetch failure → delta rỗng, `loadWorkflow` vẫn trả về `true` với nodes từ IDB.
+- Dedupe qua `node.id` — reload lần 2 không double-add, vì node mcp đã nằm trong IDB từ lần merge trước.
+- Rewrite `type: "wsNode"` và `position` mặc định khi server-written node thiếu — React Flow không crash vì field rỗng.
+
+### Ký hiệu node MCP
+
+Trường `data.origin: "mcp" | "ui"` (tuỳ chọn, default `undefined` = ui cũ) là marker duy nhất để client biết node đến từ MCP:
+
+| Field | Ý nghĩa |
+|---|---|
+| `data.origin` | `"mcp"` khi snapshotWriter tạo ra. Giữ nguyên sau khi merge vào IDB để badge + downgrade action còn làm việc. |
+| `data.mcpJobId` | Queue job id (match với `list_jobs`). Dùng để trace ngược về run. |
+| `data.mcpCreatedAt` | `Date.now()` lúc append vào snapshot — khác với `updatedAt` của workflow record. |
+
+### UX
+
+- **Badge `MCP`**: hiển thị trên tiêu đề node (xem `src/components/canvas/WSNode.tsx`, `NodeLabel`) khi `data.origin === "mcp"`.
+- **Inspector banner + action "Convert to reference"** (xem `src/components/inspector/NodeInspector.tsx`, `McpProvenanceBanner`):
+  - Click để chuyển `kind` về `content.upload`, giữ `imageUrl`/`videoUrl`, set `uploadAccept` tương ứng.
+  - Xoá toàn bộ config generation (`prompt`, `modelLabel`, `genMode`, …) và marker MCP (`origin`, `mcpJobId`, `mcpCreatedAt`).
+  - Hữu ích khi user muốn dùng asset vừa tạo làm input tĩnh cho node khác thay vì để dưới dạng gen node re-runnable.
+
+### Hợp đồng
+
+- Tool gọi với `workflowId` **vắng mặt** → không ghi snapshot. Asset vẫn trả về URL như cũ, chỉ là không hiện sẵn trên canvas.
+- Client chưa bao giờ mở workflow đó trong browser → chưa có IndexedDB record → `loadWorkflow` không chạy → node MCP chỉ hiện sau khi user vào workflow 1 lần.
+- Conflict model: IDB luôn thắng snapshot cho nodes đã tồn tại. Merge chỉ **append** node mới, không overwrite node đang có.
+
+---
+
 ## Bảo mật
 
 ### Bearer token (HTTP)
@@ -411,13 +492,15 @@ Test coverage: `test/unit/mcp.resources.test.ts`.
 
 ## Kiểm thử
 
-3 file test chuyên cho MCP (chạy qua `npm test`):
+5 file test chuyên cho MCP (chạy qua `npm test`):
 
 | File | Phạm vi |
 |---|---|
 | `test/unit/mcp.schemas.test.ts` | Validate Zod shapes (`ImageInputShape`, `VideoT2VShape`, `VideoI2VShape`, `VideoStartEndShape`) — accept/reject edge cases. |
 | `test/unit/mcp.resources.test.ts` | Sandbox `workflowAssetPath()` — chặn `..`, accept path hợp lệ. |
 | `test/unit/mcp.auth.test.ts` | Bearer token flow — auto-generate, env override, constant-time compare. |
+| `test/unit/mcp.snapshotWriter.test.ts` | `appendMcpNodeToSnapshot` — tạo file mới, append, dedupe cùng `jobId`, concurrent writes, reject invalid workflowId. |
+| `test/unit/workflowStore.mcpMerge.test.ts` | `fetchMcpSnapshotDelta` — filter theo `origin=mcp`, dedupe qua `existingIds`, 404 / malformed / network failure → delta rỗng. |
 
 ---
 
@@ -426,7 +509,7 @@ Test coverage: `test/unit/mcp.resources.test.ts`.
 | Quy ước | Lý do |
 |---|---|
 | **Image inputs luôn là URL** (`/api/workflows/…`, `http(s)`, `data:`) | Base64 qua JSON-RPC phình payload; host đã có quyền đọc file. |
-| **`workflowId` là optional** ở mọi tool generation | Không truyền → output nằm ở `downloads/` (fallback legacy). |
+| **`workflowId` là optional** ở mọi tool generation | Không truyền → output nằm ở `downloads/` (fallback legacy). Truyền vào → node tương ứng tự xuất hiện trên canvas khi user mở workflow (xem [MCP → canvas integration](#mcp--canvas-integration)). |
 | **`modelLabel` / `videoModelKey` free-form** | Provider layer là nguồn sự thật; thêm model mới không cần bump schema. |
 | **Generation tool blocking** | Chờ job kết thúc rồi trả URL. Muốn background + progress → dùng `list_jobs` / `get_job`. |
 | **Lane & concurrency** | MCP tool đi qua `laneKeyOf(kind, genMode)` + `runInLane()` → tuân thủ concurrency limit y hệt UI. |
@@ -445,6 +528,8 @@ Test coverage: `test/unit/mcp.resources.test.ts`.
 | Client không thấy tool nào | (1) Sai `cwd` → server đọc sai `data_general/`. (2) Chưa build `dist-mcp/`. (3) Client chưa reload config. | Kiểm tra từng nguyên nhân theo thứ tự. |
 | `cancel_job` không dừng ngay | Executor check cancel tại safe checkpoint. | MCP trả 200 ngay khi request cancel được ghi nhận; job dừng sau vài giây tại checkpoint gần nhất. |
 | Snapshot `413 Payload Too Large` | Workflow > 10 MB. | Tách thành nhiều workflow hoặc tăng `MAX_SNAPSHOT_BYTES` trong `snapshot/route.ts`. |
+| Node MCP không xuất hiện trên canvas sau khi gen | (1) Tool được gọi không kèm `workflowId`. (2) `snapshot.json` cho workflow chưa tồn tại vì user chưa mở workflow đó trong browser lần nào. (3) Browser tab đang mở, chưa `loadWorkflow` lại. | (1) Gửi lại với `workflowId` hợp lệ. (2) Mở workflow 1 lần trong browser để client tạo `snapshot.json`. (3) Chuyển sang dashboard rồi mở lại workflow, hoặc reload tab — `loadWorkflow` chỉ merge MCP delta khi chạy. |
+| Node MCP xuất hiện 2 lần | `appendMcpNodeToSnapshot` dedupe theo `mcp_<jobId>`; nếu tool được invoke với cùng job id trong 2 run khác nhau (bị ghi IDB trước khi job thứ 2 ghi snapshot) thì client có thể thấy trùng. | Xoá 1 node thủ công. Kiểm tra `get_job` cho 2 jobId khác nhau — bình thường `runMcpJob` tạo id mới mỗi lần, trùng id chỉ xảy ra khi gọi API ngoài luồng. |
 | Log lẫn vào stdout → JSON-RPC hỏng | Code thêm `console.log` sau khi server connect trong code path MCP. | Redirect sang `console.error`. Trong `bin/wsu-mcp.mjs` đã redirect globally; chỉ cẩn thận với module load sau khi `server.connect(transport)`. |
 
 ---
@@ -461,11 +546,14 @@ Test coverage: `test/unit/mcp.resources.test.ts`.
 | Bearer auth | `src/server/mcp/auth.ts` |
 | HTTP endpoint | `src/app/api/mcp/route.ts` |
 | Snapshot bridge | `src/app/api/workflows/[id]/snapshot/route.ts` |
+| Server append MCP node vào snapshot | `src/server/mcp/snapshotWriter.ts` |
+| Client merge MCP delta vào IDB | `src/state/workflowStore.ts` (`fetchMcpSnapshotDelta`, `loadWorkflow`) |
+| Badge + downgrade action | `src/components/canvas/WSNode.tsx` (`NodeLabel.fromMcp`), `src/components/inspector/NodeInspector.tsx` (`McpProvenanceBanner`) |
 | Stdio entry | `bin/wsu-mcp.mjs` |
 | Build script | `scripts/build-mcp.mjs` |
 | Build output (gitignored) | `dist-mcp/createServer.mjs` |
 | Token file (gitignored) | `data_general/mcp_token.txt` |
-| Tests | `test/unit/mcp.schemas.test.ts`, `test/unit/mcp.resources.test.ts`, `test/unit/mcp.auth.test.ts` |
+| Tests | `test/unit/mcp.schemas.test.ts`, `test/unit/mcp.resources.test.ts`, `test/unit/mcp.auth.test.ts`, `test/unit/mcp.snapshotWriter.test.ts`, `test/unit/workflowStore.mcpMerge.test.ts` |
 
 ---
 

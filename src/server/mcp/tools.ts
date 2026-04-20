@@ -30,6 +30,11 @@ import {
   WorkflowIdShape,
 } from "./schemas";
 import { runMcpJob } from "./runJob";
+import {
+  appendMcpNodeToSnapshot,
+  buildMcpImageNode,
+  buildMcpVideoNode,
+} from "./snapshotWriter";
 
 /**
  * Register every MCP tool on `server`. Each tool is a thin wrapper that
@@ -76,6 +81,33 @@ function pickVideoGenMode(
   return `${kind}.${provider}` as const;
 }
 
+/**
+ * Fire-and-forget wrapper around `appendMcpNodeToSnapshot`. Generation has
+ * already succeeded by the time this runs, so any snapshot write failure is
+ * logged but never surfaced to the MCP caller — the asset is still on disk
+ * and reachable via the returned URLs.
+ */
+function appendNodeBestEffort(
+  workflowId: string | undefined,
+  node: Parameters<typeof appendMcpNodeToSnapshot>[1] | null,
+  jobId: string,
+): void {
+  if (!workflowId || !node) return;
+  void appendMcpNodeToSnapshot(workflowId, node)
+    .then((appended) => {
+      if (appended) {
+        console.info(`[mcp] appended node ${node.id} to wf=${workflowId}`);
+      }
+    })
+    .catch((err) => {
+      console.warn(
+        `[mcp] failed to append node for job ${jobId} to wf=${workflowId}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    });
+}
+
 // ─── registrations ─────────────────────────────────────────────────────────
 
 export function registerTools(server: McpServer): void {
@@ -116,6 +148,19 @@ function registerGenerationTools(server: McpServer): void {
         const urls = (output.outputs ?? [])
           .map((o) => o.imageUrl)
           .filter((u): u is string => Boolean(u));
+        if (urls.length) {
+          appendNodeBestEffort(
+            args.workflowId,
+            buildMcpImageNode({
+              jobId: job.id,
+              prompt: args.prompt,
+              outputs: output.outputs ?? [],
+              modelLabel: args.modelLabel,
+              aspectRatio: args.aspectRatio,
+            }),
+            job.id,
+          );
+        }
         return okText(
           urls.length
             ? `Generated ${urls.length} image(s):\n${urls.map((u) => `- ${u}`).join("\n")}`
@@ -160,6 +205,24 @@ function registerGenerationTools(server: McpServer): void {
         const urls = (output.outputs ?? [])
           .map((o) => o.videoUrl)
           .filter((u): u is string => Boolean(u));
+        if (urls.length) {
+          appendNodeBestEffort(
+            args.workflowId,
+            buildMcpVideoNode({
+              jobId: job.id,
+              prompt: args.prompt,
+              outputs: output.outputs ?? [],
+              kind: "gen.video",
+              genMode,
+              modelLabel: args.modelLabel,
+              videoModelKey: args.videoModelKey,
+              aspectRatio: args.aspectRatio,
+              resolution: args.resolution,
+              videoLength: args.videoLength,
+            }),
+            job.id,
+          );
+        }
         return okText(
           urls.length ? `Generated video: ${urls.join(", ")}` : "Job finished but returned no videoUrl.",
           { jobId: job.id, outputs: output.outputs ?? [], videoUrls: urls },
@@ -204,6 +267,24 @@ function registerGenerationTools(server: McpServer): void {
         const urls = (output.outputs ?? [])
           .map((o) => o.videoUrl)
           .filter((u): u is string => Boolean(u));
+        if (urls.length) {
+          appendNodeBestEffort(
+            args.workflowId,
+            buildMcpVideoNode({
+              jobId: job.id,
+              prompt: args.prompt,
+              outputs: output.outputs ?? [],
+              kind: "gen.video",
+              genMode,
+              modelLabel: args.modelLabel,
+              videoModelKey: args.videoModelKey,
+              aspectRatio: args.aspectRatio,
+              resolution: args.resolution,
+              videoLength: args.videoLength,
+            }),
+            job.id,
+          );
+        }
         return okText(
           urls.length ? `Generated video: ${urls.join(", ")}` : "Job finished but returned no videoUrl.",
           { jobId: job.id, outputs: output.outputs ?? [], videoUrls: urls },
@@ -245,6 +326,22 @@ function registerGenerationTools(server: McpServer): void {
         const urls = (output.outputs ?? [])
           .map((o) => o.videoUrl)
           .filter((u): u is string => Boolean(u));
+        if (urls.length) {
+          appendNodeBestEffort(
+            args.workflowId,
+            buildMcpVideoNode({
+              jobId: job.id,
+              prompt: args.prompt,
+              outputs: output.outputs ?? [],
+              kind: "gen.start-end",
+              genMode: "i2v.veo",
+              modelLabel: args.modelLabel,
+              videoModelKey: args.videoModelKey,
+              aspectRatio: args.aspectRatio,
+            }),
+            job.id,
+          );
+        }
         return okText(
           urls.length ? `Generated video: ${urls.join(", ")}` : "Job finished but returned no videoUrl.",
           { jobId: job.id, outputs: output.outputs ?? [], videoUrls: urls },

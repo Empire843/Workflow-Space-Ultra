@@ -94,6 +94,58 @@ function migrateNodes(nodes: WSNode[]): WSNode[] {
 // ---------------------------------------------------------------------------
 const _snapshotInflight = new Map<string, Promise<void>>();
 
+/**
+ * Fetch `Workflows/<id>/snapshot.json` and return any nodes the server has
+ * appended via MCP (`data.origin === "mcp"`) that are not already present in
+ * the given id set. The snapshot bridge is otherwise client→server, but MCP
+ * reverses direction for generations that run outside the browser; these
+ * nodes are materialised on the canvas the next time the workflow is loaded.
+ *
+ * Silently returns `[]` when:
+ *   - the snapshot file doesn't exist yet (workflow has never been opened
+ *     server-side),
+ *   - the response is malformed,
+ *   - or the network call fails.
+ *
+ * Any of these are expected during normal operation and must never block
+ * `loadWorkflow` — the IndexedDB graph is always the authoritative source.
+ */
+export async function fetchMcpSnapshotDelta(
+  id: string,
+  existingIds: Set<string>,
+): Promise<WSNode[]> {
+  try {
+    const res = await fetch(
+      `/api/workflows/${encodeURIComponent(id)}/snapshot`,
+      { method: "GET", headers: { accept: "application/json" } },
+    );
+    if (!res.ok) return [];
+    const body = (await res.json()) as { ok?: boolean; snapshot?: unknown };
+    if (!body?.ok || !body.snapshot || typeof body.snapshot !== "object") return [];
+    const snapshot = body.snapshot as { nodes?: unknown };
+    if (!Array.isArray(snapshot.nodes)) return [];
+    const delta: WSNode[] = [];
+    for (const raw of snapshot.nodes) {
+      if (!raw || typeof raw !== "object") continue;
+      const node = raw as WSNode;
+      if (!node.id || !node.data) continue;
+      if (existingIds.has(node.id)) continue;
+      if ((node.data as NodeDataBase).origin !== "mcp") continue;
+      // Ensure the node has a shape the canvas can render. React Flow keys
+      // every node by id + reuses a single renderer (`wsNode`), so we normalise
+      // both here rather than trusting whatever the server wrote.
+      delta.push({
+        ...node,
+        type: node.type ?? "wsNode",
+        position: node.position ?? { x: 0, y: 0 },
+      });
+    }
+    return delta;
+  } catch {
+    return [];
+  }
+}
+
 async function pushWorkflowSnapshot(
   id: string,
   name: string,
@@ -440,15 +492,37 @@ export const useWorkflowStore = create<WorkflowState>()(
     loadWorkflow: async (id: string) => {
       const rec = await getWorkflow(id);
       if (!rec) return false;
+      const idbNodes = migrateNodes((rec.data.nodes ?? []) as WSNode[]);
       set({
         activeWorkflowId: rec.id,
         activeWorkflowName: rec.name,
-        nodes: migrateNodes((rec.data.nodes ?? []) as WSNode[]),
+        nodes: idbNodes,
         edges: (rec.data.edges ?? []) as WSEdge[],
         selectedNodeId: null,
       });
       get()._clearHistory();
       _persistActiveId(rec.id);
+
+      // Merge any MCP-originated nodes the server has appended to
+      // snapshot.json since the last time this workflow was saved. Runs
+      // after the initial `set()` so the canvas paints immediately; the
+      // delta is merged in a follow-up tick and persisted back to IDB so
+      // these nodes become part of the canonical graph.
+      void (async () => {
+        const existingIds = new Set(idbNodes.map((n) => n.id));
+        const delta = await fetchMcpSnapshotDelta(rec.id, existingIds);
+        if (!delta.length) return;
+        // Re-check the active workflow — the user may have navigated away
+        // while we were waiting on the network.
+        if (get().activeWorkflowId !== rec.id) return;
+        const { addNodes, _saveCurrentWorkflow } = get();
+        addNodes(delta);
+        await _saveCurrentWorkflow();
+        console.info(
+          `[wsu] merged ${delta.length} MCP node(s) into workflow ${rec.id}`,
+        );
+      })();
+
       return true;
     },
 

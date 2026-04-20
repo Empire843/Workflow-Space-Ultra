@@ -1,6 +1,6 @@
 "use client";
 
-import { Loader2, Send, Upload as UploadIcon, X } from "lucide-react";
+import { Loader2, Send, Sparkles, Upload as UploadIcon, X } from "lucide-react";
 import { useEffect, useMemo, useRef } from "react";
 import { useShallow } from "zustand/react/shallow";
 
@@ -74,6 +74,9 @@ export default function NodeInspector() {
       <div className="pointer-events-auto rounded-2xl bg-[color:var(--color-bg-elev-1)]/95 backdrop-blur border border-[color:var(--color-border-strong)] shadow-2xl shadow-black/60">
         <InspectorHeader node={node} />
         <div className="p-3 space-y-3">
+          {node.data.origin === "mcp" && (
+            <McpProvenanceBanner nodeId={selectedId} data={node.data} />
+          )}
           <InspectorBody nodeId={selectedId} data={node.data} />
         </div>
       </div>
@@ -100,6 +103,86 @@ function InspectorHeader({ node }: { node: { id: string; data: NodeDataBase } })
         className="h-6 w-6 grid place-items-center rounded text-[color:var(--color-fg-muted)] hover:bg-[color:var(--color-bg-elev-2)] hover:text-[color:var(--color-fg)]"
       >
         <X className="h-3.5 w-3.5" />
+      </button>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// MCP provenance banner
+// ---------------------------------------------------------------------------
+//
+// Rendered at the top of the inspector body when a node was synthesised by
+// the MCP server (see src/server/mcp/snapshotWriter.ts). Offers the user a
+// one-click "downgrade" into a content reference node: strip the generation
+// config (prompt/model/etc.) but keep the produced asset. Useful when the
+// user wants the generated image/video on the canvas as a static input to
+// another pipeline step rather than as an editable generation spec.
+//
+function McpProvenanceBanner({
+  nodeId,
+  data,
+}: {
+  nodeId: string;
+  data: NodeDataBase;
+}) {
+  const updateNodeData = useWorkflowStore((s) => s.updateNodeData);
+
+  const firstOutput = data.outputs?.[0];
+  const hasImage = Boolean(firstOutput?.imageUrl ?? data.imageUrl);
+  const hasVideo = Boolean(firstOutput?.videoUrl ?? data.videoUrl);
+  // Only offer the downgrade when there's actually an asset to preserve.
+  const canDowngrade = hasImage || hasVideo;
+
+  const handleDowngrade = () => {
+    if (!canDowngrade) return;
+    // Collapse the node to `content.upload` — the canvas uses that kind as
+    // the generic "static asset reference" node. We explicitly undefine the
+    // generation-only fields so the serializer strips them on next save
+    // (Record<string, unknown> → missing keys ≠ `undefined` keys for JSON).
+    updateNodeData(nodeId, {
+      kind: "content.upload",
+      status: "done",
+      prompt: undefined,
+      modelLabel: undefined,
+      videoModelKey: undefined,
+      aspectRatio: undefined,
+      resolution: undefined,
+      videoLength: undefined,
+      outputCount: undefined,
+      seed: undefined,
+      genMode: undefined,
+      origin: undefined,
+      mcpJobId: undefined,
+      mcpCreatedAt: undefined,
+      // Preserve the asset URL(s) so the upload node renders the media.
+      imageUrl: hasImage ? firstOutput?.imageUrl ?? data.imageUrl : undefined,
+      videoUrl: hasVideo ? firstOutput?.videoUrl ?? data.videoUrl : undefined,
+      uploadAccept: hasImage ? "image/*" : hasVideo ? "video/*" : undefined,
+    });
+  };
+
+  return (
+    <div className="flex items-start gap-2 rounded-lg border border-sky-500/30 bg-sky-500/10 px-2.5 py-2 text-[11px] text-sky-100">
+      <Sparkles className="h-3.5 w-3.5 shrink-0 mt-0.5 text-sky-300" />
+      <div className="flex-1 min-w-0">
+        <div className="font-medium">Tạo bởi MCP</div>
+        <div className="text-sky-200/80 leading-snug">
+          Node này được server tạo qua MCP tool. Bạn có thể giữ nguyên để re-run, hoặc chuyển thành tham chiếu tĩnh để dùng làm input cho node khác.
+        </div>
+      </div>
+      <button
+        type="button"
+        onClick={handleDowngrade}
+        disabled={!canDowngrade}
+        className="shrink-0 h-7 px-2 rounded-md border border-sky-500/40 bg-sky-500/20 text-[10px] font-medium hover:bg-sky-500/30 disabled:opacity-40 disabled:cursor-not-allowed"
+        title={
+          canDowngrade
+            ? "Chuyển sang content reference (giữ media, xoá prompt/model)"
+            : "Chưa có media để giữ lại"
+        }
+      >
+        Convert to reference
       </button>
     </div>
   );
