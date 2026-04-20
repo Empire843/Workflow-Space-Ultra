@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 
+import type { Page } from "playwright";
+
 import {
   clampSeed,
   DEFAULT_SEED,
@@ -11,7 +13,7 @@ import {
   VIDEO_ASPECT_RATIO_LANDSCAPE,
   selectI2vModelKey,
 } from "./constants";
-import { postJsonWithToken, type HttpResult } from "./http";
+import { postJsonViaBrowser, postJsonWithToken, type HttpResult } from "./http";
 
 /**
  * Port of API_image_to_video.py + upload portion from SORA_API_UPLOAD_IMAGE.py
@@ -44,6 +46,20 @@ export function buildUploadImagePayload(opts: UploadImageOptions) {
 export async function requestUploadUserImage(opts: UploadImageOptions): Promise<HttpResult> {
   const payload = buildUploadImagePayload(opts);
   return postJsonWithToken(URL_UPLOAD_USER_IMAGE, payload, opts.accessToken, opts.cookie);
+}
+
+/**
+ * Browser-routed upload: the upload endpoint also scores traffic through
+ * reCAPTCHA Enterprise, and anything that isn't in the Flow tab's
+ * fingerprint gets deprioritised. So we push uploads through the same
+ * page that will later submit the I2V request.
+ */
+export async function requestUploadUserImageViaBrowser(
+  page: Page,
+  opts: UploadImageOptions,
+): Promise<HttpResult> {
+  const payload = buildUploadImagePayload(opts);
+  return postJsonViaBrowser(page, URL_UPLOAD_USER_IMAGE, payload, opts.accessToken);
 }
 
 /**
@@ -154,4 +170,20 @@ export async function requestCreateI2V(opts: I2VCreateOptions): Promise<HttpResu
     ? URL_GENERATE_IMAGE_TO_VIDEO_START_END
     : URL_GENERATE_IMAGE_TO_VIDEO;
   return postJsonWithToken(url, payload, opts.accessToken, opts.cookie);
+}
+
+/**
+ * Browser-routed variant of `requestCreateI2V`. Must be called with the
+ * same `page` that produced `opts.recaptchaToken` (i.e. the "video" mode
+ * tab from `VeoTokenCollector.getPageForMode("video")`).
+ */
+export async function requestCreateI2VViaBrowser(
+  page: Page,
+  opts: I2VCreateOptions,
+): Promise<HttpResult> {
+  const payload = buildI2VPayload(opts);
+  const url = opts.endMediaId
+    ? URL_GENERATE_IMAGE_TO_VIDEO_START_END
+    : URL_GENERATE_IMAGE_TO_VIDEO;
+  return postJsonViaBrowser(page, url, payload, opts.accessToken);
 }

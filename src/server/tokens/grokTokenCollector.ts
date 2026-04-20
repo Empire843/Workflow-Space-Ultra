@@ -75,6 +75,12 @@ export class GrokTokenCollector {
    * Lightweight liveness check for the singleton — returns false when the
    * user has closed the Chrome window (CDP disconnected) so the caller can
    * reinit instead of blowing up on the next newPage() call.
+   *
+   * Note: this deliberately does NOT inspect `this.page`. A single tab can
+   * die (user closed it, Chrome crashed the renderer, navigation dropped
+   * the target) while the browser + context are still healthy; in that
+   * case we want to swap the page handle in-place instead of tearing down
+   * the whole CDP session. See `getLivePage()` for that path.
    */
   isAlive(): boolean {
     try {
@@ -120,6 +126,56 @@ export class GrokTokenCollector {
     return this.page;
   }
 
+  /**
+   * Return a Page handle that is guaranteed to be `!isClosed()` at the
+   * moment of the call. If the cached `this.page` died (e.g. user closed
+   * that specific tab, a navigation dropped the target, or the renderer
+   * crashed), pick the next best Grok tab from the same browser context,
+   * or open a fresh one. This is the single entry point every external
+   * caller should use before `page.evaluate(...)` or `page.goto(...)`.
+   *
+   * Root cause this fixes: the symptom
+   *   "page.evaluate: Target page, context or browser has been closed"
+   * while the Grok window is still visibly open — the user just happened
+   * to close the tab we cached at `init()`. Without this recovery, every
+   * subsequent i2v / t2v would fail even though Chrome + the login are
+   * fine; the user had to restart the dev server to clear the handle.
+   */
+  async getLivePage(): Promise<Page> {
+    if (!this.browser || !this.context) {
+      throw new Error("Grok collector chưa init");
+    }
+    const page = this.page;
+    if (page && !page.isClosed()) return page;
+
+    // Prefer an existing grok.com tab so we reuse the user's live
+    // session/cookies instead of opening yet another window.
+    const pages = this.context.pages();
+    const grokPage = pages.find((p) => {
+      try {
+        return !p.isClosed() && /grok\.com/i.test(p.url());
+      } catch {
+        return false;
+      }
+    });
+    if (grokPage) {
+      console.warn(
+        "[Grok] Cached page was stale — reclaiming existing Grok tab: " +
+          grokPage.url(),
+      );
+      this.page = grokPage;
+      return grokPage;
+    }
+
+    // No existing Grok tab → open a fresh one. autoDiscoverStatsig() or
+    // the caller's `ensureGrokReady` will navigate it to /imagine as part
+    // of the normal prep step.
+    console.warn("[Grok] Cached page was stale — opening a new tab");
+    const fresh = await this.context.newPage();
+    this.page = fresh;
+    return fresh;
+  }
+
   async autoDiscoverStatsig(opts?: { force?: boolean; persist?: boolean }): Promise<GrokHeaders> {
     const { force = false, persist = true } = opts || {};
 
@@ -128,7 +184,9 @@ export class GrokTokenCollector {
       if (cached) return cached;
     }
 
-    if (!this.page) throw new Error("Grok page not ready");
+    // Use a live page handle — not `this.page` directly — so we don't
+    // trip over a closed tab when the user killed the one we cached.
+    const page = await this.getLivePage();
 
     const statsigPromise = new Promise<string>((resolve) => {
       const handler = (req: { headers(): Record<string, string> }) => {
@@ -136,18 +194,18 @@ export class GrokTokenCollector {
           const h = req.headers();
           const v = h["x-statsig-id"];
           if (v) {
-            this.page?.off("request", handler);
+            page.off("request", handler);
             resolve(v);
           }
         } catch {
           // ignore
         }
       };
-      this.page?.on("request", handler);
+      page.on("request", handler);
     });
 
     try {
-      await this.page.goto(`${GROK_URL.replace(/\/$/, "")}/imagine`, {
+      await page.goto(`${GROK_URL.replace(/\/$/, "")}/imagine`, {
         waitUntil: "domcontentloaded",
         timeout: 20_000,
       });
@@ -167,7 +225,7 @@ export class GrokTokenCollector {
 
     if (!statsig) {
       try {
-        statsig = await this.page.evaluate(() => {
+        statsig = await page.evaluate(() => {
           try {
             return localStorage.getItem("x-statsig-id");
           } catch {

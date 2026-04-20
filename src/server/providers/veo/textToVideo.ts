@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 
+import type { Page } from "playwright";
+
 import {
   clampSeed,
   DEFAULT_SEED,
@@ -9,7 +11,7 @@ import {
   VIDEO_ASPECT_RATIO_LANDSCAPE,
   selectT2vModelKey,
 } from "./constants";
-import { postJsonWithToken, type HttpResult } from "./http";
+import { postJsonViaBrowser, postJsonWithToken, type HttpResult } from "./http";
 
 /**
  * Port API_text_to_video.py
@@ -103,6 +105,21 @@ export function parseOperationsFromCreateResponse(body: string): OperationRef[] 
 export async function requestCreateT2V(opts: T2VCreateOptions): Promise<HttpResult> {
   const payload = buildT2VPayload(opts);
   return postJsonWithToken(URL_GENERATE_TEXT_TO_VIDEO, payload, opts.accessToken, opts.cookie);
+}
+
+/**
+ * Browser-routed variant of `requestCreateT2V`: POSTs the payload through
+ * `page.context().request`, so the request inherits the same UA / TLS /
+ * Sec-CH-UA / Origin / cookie jar that minted `opts.recaptchaToken`.
+ * This is the path used from the happy path (`withRecaptcha`) — the Node
+ * path is kept only as a fallback / for `requestCheckStatus` polling.
+ */
+export async function requestCreateT2VViaBrowser(
+  page: Page,
+  opts: T2VCreateOptions,
+): Promise<HttpResult> {
+  const payload = buildT2VPayload(opts);
+  return postJsonViaBrowser(page, URL_GENERATE_TEXT_TO_VIDEO, payload, opts.accessToken);
 }
 
 export interface StatusEntry {

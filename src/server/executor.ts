@@ -2,6 +2,7 @@ import type { GenMode, NodeDataBase, NodeKind, OutputItem } from "@/lib/nodes";
 import { buildCombinedPrompt, joinTextSegments } from "@/lib/prompt";
 import { resolveI2vModelKey, resolveT2vModelKey } from "@/lib/veoVideoModels";
 
+import { JobCancelledError, type ShouldCancel } from "./providers/cancellation";
 import {
   grokDownloadVideo,
   grokI2V,
@@ -38,16 +39,13 @@ import { timedSpan } from "./telemetry/timing";
 import { pMapLimited } from "./util/pMap";
 
 /**
- * Thrown when the executor detects `job.cancelRequested`. A dedicated error
- * class lets callers in /api/jobs/route.ts distinguish "user cancelled" from
- * a real provider failure and set status accordingly.
+ * Re-export so existing API routes (`/api/jobs/route.ts`) keep their
+ * `import { JobCancelledError } from "@/server/executor"` path working.
+ * Actual class + cancel helpers live in `./providers/cancellation` so
+ * provider-side code can import them without creating a cycle back into
+ * the executor/queue layer.
  */
-export class JobCancelledError extends Error {
-  constructor(msg = "Cancelled") {
-    super(msg);
-    this.name = "JobCancelledError";
-  }
-}
+export { JobCancelledError } from "./providers/cancellation";
 
 /**
  * Throw a `JobCancelledError` if the user requested cancellation since the last
@@ -57,6 +55,15 @@ export class JobCancelledError extends Error {
 function assertNotCancelled(jobId: string): void {
   const rec = getJob(jobId);
   if (rec?.cancelRequested) throw new JobCancelledError();
+}
+
+/**
+ * Build a `ShouldCancel` closure that the VEO/Grok provider layer can
+ * poll from inside its own loops. Reads the live queue record every
+ * call so new cancel requests are seen the moment they're flipped.
+ */
+function makeShouldCancel(jobId: string): ShouldCancel {
+  return () => Boolean(getJob(jobId)?.cancelRequested);
 }
 
 /**
@@ -305,7 +312,8 @@ async function urlToBase64(url: string): Promise<string> {
 async function resolveVeoMediaId(
   img: NodeDataBase,
   aspectRatio: string,
-  log?: LogFn
+  log?: LogFn,
+  shouldCancel?: ShouldCancel,
 ): Promise<string> {
   if (img.imageMediaId) return img.imageMediaId;
   let b64 = img.uploadBase64;
@@ -316,7 +324,7 @@ async function resolveVeoMediaId(
   }
   if (!b64) throw new Error("Không có dữ liệu ảnh để upload lên VEO");
   const ar = aspectRatio === "9:16" ? "IMAGE_ASPECT_RATIO_PORTRAIT" : "IMAGE_ASPECT_RATIO_LANDSCAPE";
-  return veoUploadImage({ base64Image: b64, mimeType: mime, aspectRatio: ar }, log);
+  return veoUploadImage({ base64Image: b64, mimeType: mime, aspectRatio: ar }, log, shouldCancel);
 }
 
 type LogFn = (msg: string) => void;
@@ -328,6 +336,7 @@ async function runVeoCreateImage(
   log: LogFn
 ): Promise<OutputItem[]> {
   assertNotCancelled(job.id);
+  const shouldCancel = makeShouldCancel(job.id);
   const aspectRatio =
     nodeData.aspectRatio === "9:16"
       ? "IMAGE_ASPECT_RATIO_PORTRAIT"
@@ -355,11 +364,13 @@ async function runVeoCreateImage(
         const mediaGenerationId = await resolveVeoMediaId(
           r,
           nodeData.aspectRatio || "16:9",
-          log
+          log,
+          shouldCancel,
         );
         log(`Reference #${i + 1} ready (name=${mediaGenerationId.slice(0, 24)}…).`);
         return { ok: true as const, mediaGenerationId };
       } catch (err) {
+        if (err instanceof JobCancelledError) throw err;
         const msg = err instanceof Error ? err.message : String(err);
         log(`Chuẩn bị reference #${i + 1} thất bại: ${msg} — bỏ qua ảnh này.`);
         return { ok: false as const };
@@ -387,7 +398,8 @@ async function runVeoCreateImage(
       seed: typeof nodeData.seed === "number" ? nodeData.seed : undefined,
       referenceImages: referenceImages.length ? referenceImages : undefined,
     },
-    log
+    log,
+    shouldCancel,
   );
   if (!raw.length) throw new Error("VEO không trả về image nào");
 
@@ -448,6 +460,7 @@ async function runVeoT2V(
   log: LogFn
 ): Promise<OutputItem[]> {
   assertNotCancelled(job.id);
+  const shouldCancel = makeShouldCancel(job.id);
   const aspect =
     nodeData.aspectRatio === "9:16"
       ? "VIDEO_ASPECT_RATIO_PORTRAIT"
@@ -462,14 +475,15 @@ async function runVeoT2V(
       seed: typeof nodeData.seed === "number" ? nodeData.seed : undefined,
       modelKey,
     },
-    log
+    log,
+    shouldCancel,
   );
   const entries = await veoWaitForVideos(operations, (es) => {
     const pcts = es.map((e) => e.progressPercent || 0).filter((p) => p > 0);
     const avg = pcts.length ? Math.round(pcts.reduce((a, b) => a + b, 0) / pcts.length) : 0;
     if (avg > 0) log(`Đang xử lý… ${avg}%`);
     setJobProgress(job.id, Math.min(99, avg || 5));
-  });
+  }, { shouldCancel });
   const videos = entries.filter((e) => e.videoUrl);
   if (!videos.length) throw new Error("VEO không trả về videoUrl");
   log("Video xong, đang tải về…");
@@ -505,18 +519,29 @@ async function runVeoI2V(
   log: LogFn
 ): Promise<OutputItem[]> {
   assertNotCancelled(job.id);
+  const shouldCancel = makeShouldCancel(job.id);
   const aspect =
     nodeData.aspectRatio === "9:16"
       ? "VIDEO_ASPECT_RATIO_PORTRAIT"
       : "VIDEO_ASPECT_RATIO_LANDSCAPE";
   const isStartEnd = Boolean(endImage);
 
-  const startMediaId = await resolveVeoMediaId(startImage, nodeData.aspectRatio || "16:9", log);
+  const startMediaId = await resolveVeoMediaId(
+    startImage,
+    nodeData.aspectRatio || "16:9",
+    log,
+    shouldCancel,
+  );
 
   let endMediaId: string | undefined;
   if (endImage) {
     log("Đang upload ảnh end frame…");
-    endMediaId = await resolveVeoMediaId(endImage, nodeData.aspectRatio || "16:9", log);
+    endMediaId = await resolveVeoMediaId(
+      endImage,
+      nodeData.aspectRatio || "16:9",
+      log,
+      shouldCancel,
+    );
   }
 
   const modelKey =
@@ -533,14 +558,15 @@ async function runVeoI2V(
       seed: typeof nodeData.seed === "number" ? nodeData.seed : undefined,
       modelKey,
     },
-    log
+    log,
+    shouldCancel,
   );
   const entries = await veoWaitForVideos(operations, (es) => {
     const pcts = es.map((e) => e.progressPercent || 0).filter((p) => p > 0);
     const avg = pcts.length ? Math.round(pcts.reduce((a, b) => a + b, 0) / pcts.length) : 0;
     if (avg > 0) log(`Đang xử lý… ${avg}%`);
     setJobProgress(job.id, Math.min(99, avg || 5));
-  });
+  }, { shouldCancel });
   const videos = entries.filter((e) => e.videoUrl);
   if (!videos.length) throw new Error("VEO không trả về videoUrl");
   log("Video xong, đang tải về…");
@@ -586,7 +612,9 @@ async function runGrokT2V(
     },
   });
   if (!res.mediaUrl) {
-    const hint = interpretGrokError(res.convoStatus, res.convoError);
+    const promptForScan = nodeData.prompt || "";
+    const rejectHint = interpretGrokRejection(res.convoError, promptForScan);
+    const hint = rejectHint ?? interpretGrokError(res.convoStatus, res.convoError);
     throw new Error(
       `Grok t2v failed (status=${res.convoStatus})${hint ? ` — ${hint}` : ""}${res.convoError ? `\nGrok response: ${res.convoError}` : ""}`
     );
@@ -608,6 +636,100 @@ async function runGrokT2V(
     log(`Download thất bại (${dlErr instanceof Error ? dlErr.message : dlErr}), dùng URL gốc.`);
   }
   return [{ videoUrl: vUrl, videoHdUrl: hdMediaUrl || undefined }];
+}
+
+/**
+ * Scan a prompt for patterns that frequently trigger Grok's silent
+ * content-moderation ("hallucinatedSuccess"). Returns the list of exact
+ * substrings found so we can show the user concrete evidence instead of
+ * hand-wavy "thường do bikini/…".
+ *
+ * Grouped by category:
+ *   - swimwear/underwear
+ *   - sexualized motion
+ *   - close-up + subject combo (NSFW-adjacent framing)
+ *   - identity-sensitive (celebrity, copyrighted characters — lists kept
+ *     short; rely on user to add custom patterns later if needed)
+ *   - violence / weapon
+ *
+ * We match case-insensitively and return the canonical matched phrase from
+ * the prompt (not the regex). Duplicates are deduped.
+ */
+function scanGrokRiskyTriggers(prompt: string): string[] {
+  if (!prompt) return [];
+  const patterns: Array<{ re: RegExp; label: string }> = [
+    { re: /\bbikini\b/gi, label: "bikini" },
+    { re: /\bswimsuit\b/gi, label: "swimsuit" },
+    { re: /\blingerie\b/gi, label: "lingerie" },
+    { re: /\bunderwear\b/gi, label: "underwear" },
+    { re: /\btopless\b/gi, label: "topless" },
+    { re: /\bnaked\b|\bnude\b/gi, label: "naked/nude" },
+    { re: /\bsways?\s+(?:her|his|their)\s+hips?\b/gi, label: "sways hips" },
+    { re: /\bhips?\s+sway(?:ing|s)?\b/gi, label: "hips sway" },
+    { re: /\b(?:body|hips?|chest)\s+moves?\b/gi, label: "body/hips moves" },
+    { re: /\bsensual(?:ly)?\b|\bseductive(?:ly)?\b|\bflirty\b|\berotic\b/gi, label: "sensual/seductive" },
+    { re: /\bsuggestive(?:ly)?\b/gi, label: "suggestive" },
+    { re: /\bdanc(?:e|es|ing)\s+(?:slowly|sensual|seductive|close)/gi, label: "suggestive dancing" },
+    { re: /\bclose[-\s]?up\b/gi, label: "close-up" },
+    { re: /\byoung\s+(?:woman|girl|female|lady)\b/gi, label: "young woman/girl" },
+    { re: /\bfabric\s+(?:moves|flows|clings)\b/gi, label: "fabric moves/flows" },
+    { re: /\bwet\s+(?:shirt|top|clothes|body)\b/gi, label: "wet clothes" },
+    { re: /\b(?:gun|rifle|pistol|firearm)\b/gi, label: "weapon" },
+    { re: /\b(?:blood|gore|violent|stab|shoot)\b/gi, label: "violence" },
+  ];
+  const found = new Set<string>();
+  for (const { re, label } of patterns) {
+    if (re.test(prompt)) found.add(label);
+    re.lastIndex = 0;
+  }
+  return Array.from(found);
+}
+
+/**
+ * Build a deterministic, evidence-backed error hint for Grok rejections.
+ * Called from runGrokI2V / runGrokT2V when we already have the structured
+ * body (`convoError`) AND the original prompt.
+ *
+ * Strategy: detect if the body contains a soft-rejection signal
+ * (hallucinatedSuccess / silentRejection / moderation / finishReason=safety).
+ * If yes, scan the prompt for known triggers and assemble a hint that says
+ * "100% reject + triggers found + evidence + concrete fix" — no "có thể".
+ *
+ * Returns null when the failure isn't a content-policy reject, so the
+ * caller falls back to interpretGrokError's generic handling.
+ */
+function interpretGrokRejection(body: string | null | undefined, prompt: string): string | null {
+  if (!body) return null;
+  const b = body.toLowerCase();
+  const isHallucinated = b.includes("hallucinatedsuccess=true");
+  const isSilent = b.includes("silentrejection=true");
+  const isModerated =
+    b.includes("moderation=") ||
+    b.includes("finishreason=safety") ||
+    b.includes("finishreason=recitation");
+  if (!isHallucinated && !isSilent && !isModerated) return null;
+
+  const triggers = scanGrokRiskyTriggers(prompt);
+  const triggerPart = triggers.length
+    ? `Triggers phát hiện trong prompt: [${triggers.join(", ")}]`
+    : "Không phát hiện trigger rõ ràng trong text prompt → khả năng cao do ẢNH input chứa yếu tố nhạy cảm (bikini/underwear/NSFW/celebrity…)";
+
+  let evidence: string;
+  let verdict: string;
+  if (isHallucinated) {
+    verdict = "BỊ REJECT BỞI GROK MODERATION (không phải bug, không phải transient)";
+    evidence =
+      'Bằng chứng: Grok KHÔNG gọi tool videoGen (sawSvr=false), chỉ trả text template "I generated a video…" — đây là cách Grok từ chối ngầm.';
+  } else if (isSilent) {
+    verdict = "BỊ REJECT BỞI GROK MODERATION (silent — không giải thích)";
+    evidence =
+      "Bằng chứng: Grok nhận prompt, echo lại, rồi đóng stream KHÔNG emit model output hay videoGen event.";
+  } else {
+    verdict = "BỊ REJECT BỞI GROK MODERATION (có flag safety/recitation)";
+    evidence = "Bằng chứng: Grok trả moderation/finishReason flag trong stream.";
+  }
+
+  return `${verdict}. ${evidence} ${triggerPart}. Fix: bỏ/đổi các cụm trên khỏi prompt VÀ/HOẶC thay ảnh input, hoặc chuyển node sang Veo I2V (policy lỏng hơn)`;
 }
 
 /**
@@ -644,6 +766,68 @@ function interpretGrokError(status: number, body?: string | null): string {
   }
   if (status === 429) return "rate limit — thử lại sau 1-2 phút";
   if (status === 0) return "request bị cancel/timeout";
+  // Status 200 but no media URL — body contains our structured hint
+  // (moderation=… / finishReason=… / grokSays=… / streamAborted=… /
+  // noMediaUrl progress=… videoId=… parentPostId=…). Translate the
+  // most useful shapes to VN so the user knows whether to retry, edit
+  // the prompt, or re-login.
+  if (status === 200) {
+    // Grok internal backend errors — NOT content policy. These are
+    // transient failures on Grok's side (prompt upsampler returning
+    // empty, downstream model timeout, capacity issues). Surface them
+    // distinctly so the user knows to retry, not to rewrite the prompt.
+    if (
+      b.includes("upsampler") || b.includes("upsampling") ||
+      b.includes("prompt upsampling failed") ||
+      b.includes("internal error") || b.includes("internal_error") ||
+      b.includes("backend error") || b.includes("service unavailable") ||
+      b.includes("temporarily unavailable") || b.includes("try again")
+    ) {
+      return "Grok backend lỗi tạm thời (prompt upsampler/model internal error) — KHÔNG phải content policy. Hãy thử lại sau vài giây";
+    }
+    // Hallucinated success: Grok's text model viết kiểu
+    // "I generated a video with the prompt: '…'" NHƯNG không
+    // thực sự invoke videoGen tool. Đây là lớp moderation thứ hai
+    // của Grok: từ chối bọc bằng phrasing lịch sự "tôi đã tạo".
+    // Các trigger thường gặp: "bikini", "sways her hips",
+    // "dancing (casually)", người phụ nữ close-up + chuyển động gợi
+    // cảm, celebrity name, copyrighted character, bạo lực.
+    if (b.includes("hallucinatedsuccess=true")) {
+      return "Grok giả vờ đã tạo video nhưng thực tế không chạy videoGen — content bị moderation tinh vi (thường do: bikini/swimsuit, chuyển động cơ thể gợi cảm 'sways hips/dances slowly', người thật/celebrity, close-up phụ nữ). Bỏ/đổi các yếu tố này trong prompt rồi thử lại";
+    }
+    // Silent moderation: Grok nhận prompt, echo lại, rồi đóng stream
+    // KHÔNG emit model output hay SVR event nào. Đây là dấu hiệu gần
+    // như chắc chắn content bị chặn ngầm (hoặc ảnh hoặc prompt có yếu
+    // tố nhạy cảm mà Grok không muốn giải thích — NSFW, bạo lực,
+    // người thật/celebrity, copyright…).
+    if (b.includes("silentrejection=true")) {
+      return "Grok chặn ngầm không giải thích — gần như chắc chắn content bị coi là nhạy cảm (người thật/celebrity, NSFW, bạo lực, copyright…). Hãy đổi ảnh/prompt tránh các yếu tố này rồi thử lại";
+    }
+    if (b.includes("moderation=") || b.includes("finishreason=safety") || b.includes("finishreason=recitation")) {
+      return "Grok từ chối tạo video do content policy (moderation flag) — đổi ảnh/prompt bớt nhạy cảm rồi thử lại";
+    }
+    if (b.includes("can't create") || b.includes("cannot create") ||
+        b.includes("unable to create") || b.includes("content policy") || b.includes("guidelines") ||
+        b.includes("not allowed") || b.includes("không thể tạo") ||
+        (b.includes("against") && b.includes("policy"))) {
+      return "Grok giải thích không thể tạo do content policy — xem nội dung grokSays bên dưới để biết chi tiết";
+    }
+    if (b.includes("finishreason=")) {
+      return "Grok kết thúc sớm với finishReason bất thường — xem chi tiết trong Grok response bên dưới";
+    }
+    if (b.includes("streamaborted=") || b.includes("stream aborted")) {
+      return "stream Grok bị ngắt giữa chừng — có thể do tab Grok navigate đi chỗ khác hoặc mạng chập chờn. Thử lại sau vài giây";
+    }
+    if (b.includes("no events received")) {
+      return "Grok không gửi event nào — session có thể đã hết hạn (mở Chrome Grok kiểm tra)";
+    }
+    if (b.includes("grok says") || b.includes("grok response") || b.includes("grokSays")) {
+      return "Grok trả lời bằng text thay vì tạo video — xem nội dung trong Grok response bên dưới (thường là lý do content policy)";
+    }
+    if (b.includes("nomediaurl") || b.includes("no mediaurl") || b.includes("progress=")) {
+      return "Grok kết thúc stream nhưng không có videoUrl — có thể content bị reject ngầm hoặc Grok backend lỗi. Thử đổi prompt hoặc chạy lại";
+    }
+  }
   return "";
 }
 
@@ -703,7 +887,9 @@ async function runGrokI2V(
     },
   });
   if (!res.mediaUrl) {
-    const hint = interpretGrokError(res.convoStatus, res.convoError);
+    const promptForScan = nodeData.prompt || "";
+    const rejectHint = interpretGrokRejection(res.convoError, promptForScan);
+    const hint = rejectHint ?? interpretGrokError(res.convoStatus, res.convoError);
     throw new Error(
       `Grok i2v failed (status=${res.convoStatus})${hint ? ` — ${hint}` : ""}${res.convoError ? `\nGrok response: ${res.convoError}` : ""}`
     );

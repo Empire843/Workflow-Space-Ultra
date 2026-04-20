@@ -39,14 +39,22 @@ const s = (n: number) => n * 1000;
 
 /**
  * How long to wait after each strike, in order. Beyond the list, reuse the
- * last entry (so escalation caps at ~5 minutes instead of growing forever).
+ * last entry (so escalation caps at ~1 minute instead of growing forever).
  *
- * These values are tuned for real Google behavior observed in logs:
- *  - One or two fast strikes usually clear in ~60s.
- *  - After the third strike Google tightens the screws; 3–5 minutes is
- *    typical before a fresh token is accepted again.
+ * Since the refactor that routes every request through the Chrome tab
+ * that minted its reCAPTCHA token, the genuine strike rate dropped to
+ * near-zero — the "huge cooldown" strategy was only needed to dig out of
+ * a lockout that browser-binding now prevents. These delays are kept as
+ * a last-resort safety net for a truly misbehaving account:
+ *  - 10s → first blip, usually self-heals.
+ *  - 20/30s → still probably transient.
+ *  - 60s → Google is actually angry; stop hammering the service.
+ *
+ * If a user still sees strikes piling up with these values, the root
+ * cause is *not* rate limiting — investigate the browser tab health
+ * (clearSiteStorage / restartBrowser) instead.
  */
-const STRIKE_DELAYS_MS = [s(60), s(90), s(180), s(300)];
+const STRIKE_DELAYS_MS = [s(10), s(20), s(30), s(60)];
 
 /**
  * If no new strike happens for this long, reset the escalation counter. We
@@ -83,10 +91,20 @@ export function cooldownRemainingMs(now: number = Date.now()): number {
 /**
  * Block until the cooldown is cleared. Emits progress updates every ~5s
  * via `onLog` so the UI can show a countdown instead of appearing frozen.
+ *
+ * `shouldCancel` is polled between ticks so a cancelled job unwinds in
+ * <= 200ms instead of sitting through the full 10-60s punishment window.
  */
-export async function waitForCooldown(onLog?: (msg: string) => void): Promise<void> {
+import { ensureNotCancelled, type ShouldCancel } from "../cancellation";
+
+export async function waitForCooldown(
+  onLog?: (msg: string) => void,
+  shouldCancel?: ShouldCancel,
+): Promise<void> {
   const tickMs = 5000;
+  const pollMs = 200;
   while (true) {
+    ensureNotCancelled(shouldCancel);
     const remaining = cooldownRemainingMs();
     if (remaining <= 0) return;
     const secs = Math.ceil(remaining / 1000);
@@ -95,7 +113,16 @@ export async function waitForCooldown(onLog?: (msg: string) => void): Promise<vo
       `Đang đợi Google cooldown (${secs}s còn lại, strike #${st.strikes}) — giữ tab Chrome VEO, ` +
         `đừng tắt…`,
     );
-    await new Promise((r) => setTimeout(r, Math.min(tickMs, remaining)));
+    // Fine-grained sleep so cancel is observed ~5x per second even
+    // though log emission only fires every 5s.
+    const sleepBudget = Math.min(tickMs, remaining);
+    const sleepDeadline = Date.now() + sleepBudget;
+    while (Date.now() < sleepDeadline) {
+      ensureNotCancelled(shouldCancel);
+      const step = Math.min(pollMs, sleepDeadline - Date.now());
+      if (step <= 0) break;
+      await new Promise((r) => setTimeout(r, step));
+    }
   }
 }
 

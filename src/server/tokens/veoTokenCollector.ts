@@ -30,14 +30,31 @@ export interface VeoAuth {
   updatedAt: string;
 }
 
+/**
+ * Google OAuth access tokens are valid for ~1h. We treat anything older
+ * than this as stale so the first request after a long idle period
+ * doesn't have to eat a 401 before refreshing. A safe margin below the
+ * real TTL keeps us from racing the token's actual expiry.
+ */
+const VEO_AUTH_CACHE_TTL_MS = 45 * 60_000;
+
 export function loadCachedVeoAuth(): VeoAuth | null {
   try {
     ensureDirs();
     if (!existsSync(TOKENS_CACHE_FILE)) return null;
     const raw = readFileSync(TOKENS_CACHE_FILE, "utf-8");
     const parsed = JSON.parse(raw) as VeoAuth;
-    if (parsed.sessionId && parsed.projectId && parsed.accessToken) return parsed;
-    return null;
+    if (!parsed.sessionId || !parsed.projectId || !parsed.accessToken) return null;
+    // Drop tokens older than the TTL. Without this check the server
+    // would happily hand out a 2-hour-old accessToken and let every
+    // caller eat a 401 before the batcher / withRecaptcha ladder force
+    // a refresh — exactly the "VEO đã sẵn sàng nhưng bấm tạo vẫn 401"
+    // symptom the user saw.
+    if (parsed.updatedAt) {
+      const age = Date.now() - new Date(parsed.updatedAt).getTime();
+      if (Number.isFinite(age) && age > VEO_AUTH_CACHE_TTL_MS) return null;
+    }
+    return parsed;
   } catch {
     return null;
   }
@@ -818,6 +835,162 @@ export class VeoTokenCollector {
     } finally {
       this._pageInitPromises[mode] = undefined;
     }
+  }
+
+  /**
+   * Public wrapper around the internal `_getPageForMode` so the provider
+   * layer (withRecaptcha, batcher) can grab the SAME tab that minted the
+   * reCAPTCHA token and route the API POST through its browser context.
+   *
+   * This is the core of the "Option 2" fingerprint-binding fix: the
+   * request.post goes out with the tab's UA, Sec-CH-UA, Origin, Referer
+   * and cookie jar, matching what grecaptcha.enterprise.execute saw.
+   */
+  async getPageForMode(mode: "video" | "image"): Promise<Page> {
+    return this._getPageForMode(mode);
+  }
+
+  /**
+   * Drop the cached page handle for `mode` without touching auth or the
+   * rest of the Chrome session. Called by the provider layer when a
+   * request throws a transient page-level error (e.g. "Target closed",
+   * "socket hang up", status=0) — the tab may still be alive in Chrome
+   * but the Playwright handle is no longer usable, so we want the next
+   * `getPageForMode(mode)` call to re-scan and attach to a fresh tab.
+   *
+   * Cheaper than `restartBrowser()` and preserves OAuth cache.
+   */
+  invalidatePageForMode(mode: "video" | "image"): void {
+    const p = this._pages[mode];
+    if (p && !p.isClosed()) {
+      // Don't try to close — the error that triggered this may have
+      // already killed the underlying target, and .close() would throw.
+      console.warn(`[VEO] invalidatePageForMode(${mode}): dropping stale handle`);
+    }
+    this._pages[mode] = undefined;
+    this._pageInitPromises[mode] = undefined;
+  }
+
+  /**
+   * Wipe every cached bit of the current origin (localStorage, IndexedDB,
+   * service workers, trust tokens, HTTP cache) and reload the tab. Called
+   * as step 2 of the 403-recovery ladder: when retrying with a fresh
+   * recaptcha token isn't enough, Google is usually remembering something
+   * it dislikes (device token, abuse cookie, stale session cookie). A
+   * clean slate + reload forces the UI to re-bootstrap from scratch, after
+   * which the next recaptcha token is almost always accepted.
+   *
+   * Port of `_clear_site_storage` in A_workflow_get_token.py (lines
+   * 1029-1071). We also flush `_pages[mode]` mode-ready caches so the
+   * next request re-runs `_ensureMode` / `_selectLowerPriorityModel`.
+   */
+  async clearSiteStorage(mode: "video" | "image"): Promise<void> {
+    if (!this.context) return;
+    const page = this._pages[mode];
+    if (!page || page.isClosed()) {
+      console.warn(`[VEO] clearSiteStorage: no live tab for mode=${mode}, skipping`);
+      return;
+    }
+    const currentUrl = page.url() || "";
+    let origin: string | null = null;
+    try {
+      const parsed = new URL(currentUrl);
+      if (parsed.protocol && parsed.host) {
+        origin = `${parsed.protocol}//${parsed.host}`;
+      }
+    } catch {
+      // ignore malformed URL
+    }
+    if (!origin) {
+      console.warn(`[VEO] clearSiteStorage: cannot derive origin from "${currentUrl}"`);
+      return;
+    }
+    try {
+      console.log(`[VEO] Clear site storage for ${origin} (mode=${mode})`);
+      const cdp = await this.context.newCDPSession(page);
+      await cdp.send("Storage.clearDataForOrigin", {
+        origin,
+        storageTypes: [
+          "local_storage",
+          "session_storage",
+          "indexeddb",
+          "cache_storage",
+          "service_workers",
+          "websql",
+          "file_systems",
+          "shared_storage",
+          "cookies",
+        ].join(","),
+      });
+      try {
+        await cdp.send("Storage.clearTrustTokens");
+      } catch {
+        // older Chromes reject this method — not fatal
+      }
+      try {
+        await cdp.send("Network.clearBrowserCache");
+      } catch {
+        // ignore
+      }
+      try {
+        await cdp.detach();
+      } catch {
+        // ignore
+      }
+      console.log(`[VEO] Reload tab after clear storage (mode=${mode})`);
+      await page.reload({ waitUntil: "domcontentloaded", timeout: 20_000 });
+      // After a reload the Flow UI comes up on whatever mode was last
+      // selected — drop the per-tab "mode-ready" marker so the next
+      // recaptcha capture re-verifies the mode and re-applies route
+      // blocking (the page.route handlers survive the reload but the
+      // CDP-level Network.setBlockedURLs needs to be re-armed).
+      this._routeBlockedPages.delete(page);
+    } catch (err) {
+      console.warn("[VEO] clearSiteStorage failed:", err);
+    }
+  }
+
+  /**
+   * Hard restart of the whole Chrome session: close the current CDP
+   * connection, relaunch Chrome via `openVeoChrome()`, then re-init the
+   * collector. Used as the last step of the 403-recovery ladder (after
+   * retry + clearStorage have failed). This is the only move that
+   * recycles the TLS client hello + HTTP/2 connection pool, which is
+   * what Google ultimately keys abuse signals on.
+   *
+   * Port of `restart_browser` in A_workflow_get_token.py (lines 929-962).
+   *
+   * After this returns, callers must re-acquire `getPageForMode(mode)` —
+   * the old Page objects are dead and the _pages map is cleared.
+   */
+  async restartBrowser(): Promise<void> {
+    console.warn("[VEO] restartBrowser: closing old Chrome connection and reopening");
+    try {
+      await this.browser?.close();
+    } catch {
+      // ignore — the browser might already be gone
+    }
+    this.browser = null;
+    this.context = null;
+    this.page = null;
+    this._pages = {};
+    this._routeBlockedPages = new Set();
+    this._pageInitPromises = {};
+    this.captureState = {};
+
+    // Re-connect via the same CDP manager — openVeoChrome will relaunch
+    // the Chrome executable if the process already died, or reuse it if
+    // it's still running on the debug port.
+    await this.init();
+
+    // Re-hydrate auth from cache if still valid so we don't block on a
+    // fresh login flow; collectAuth with force=false is the cheap path.
+    try {
+      await this.collectAuth({ force: false, timeoutMs: 30_000 });
+    } catch (err) {
+      console.warn("[VEO] restartBrowser: post-restart collectAuth failed:", err);
+    }
+    console.log("[VEO] restartBrowser: ready");
   }
 
   /**

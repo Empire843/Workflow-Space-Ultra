@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 
+import type { Page } from "playwright";
+
 import {
   clampSeed,
   CREATE_IMAGE_MODEL_TO_KEY,
@@ -7,7 +9,7 @@ import {
   SEED_MAX,
   URL_GENERATE_IMAGES_TEMPLATE,
 } from "./constants";
-import { postJsonWithToken, type HttpResult } from "./http";
+import { postJsonViaBrowser, postJsonWithToken, type HttpResult } from "./http";
 
 /**
  * Port of API_Create_image.py - calls flowMedia:batchGenerateImages for Nano Banana / Imagen.
@@ -156,6 +158,20 @@ export async function requestCreateImage(opts: CreateImageOptions): Promise<Http
   const url = URL_GENERATE_IMAGES_TEMPLATE.replace("{projectId}", opts.projectId);
   const payload = buildCreateImagePayload(opts);
   return postJsonWithToken(url, payload, opts.accessToken, opts.cookie);
+}
+
+/**
+ * Browser-routed create-image call. Must be invoked with the Page from
+ * `VeoTokenCollector.getPageForMode("image")` so the request fingerprint
+ * matches the token embedded in `opts.recaptchaToken`.
+ */
+export async function requestCreateImageViaBrowser(
+  page: Page,
+  opts: CreateImageOptions,
+): Promise<HttpResult> {
+  const url = URL_GENERATE_IMAGES_TEMPLATE.replace("{projectId}", opts.projectId);
+  const payload = buildCreateImagePayload(opts);
+  return postJsonViaBrowser(page, url, payload, opts.accessToken);
 }
 
 export interface GeneratedImage {
