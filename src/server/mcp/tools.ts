@@ -3,7 +3,7 @@ import path from "node:path";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
-import type { NodeDataBase } from "@/lib/nodes";
+import type { NodeDataBase, NodeKind } from "@/lib/nodes";
 import { uid } from "@/lib/utils";
 import { openGrokChrome } from "@/server/chrome/grokChromeManager";
 import { openVeoChrome } from "@/server/chrome/veoChromeManager";
@@ -21,6 +21,7 @@ import {
 } from "@/server/queue";
 
 import {
+  BuildWorkflowShape,
   ImageInputShape,
   JobIdShape,
   OpenLoginShape,
@@ -34,6 +35,8 @@ import {
   appendMcpNodeToSnapshot,
   buildMcpImageNode,
   buildMcpVideoNode,
+  writeFullSnapshot,
+  type SnapshotEdge,
 } from "./snapshotWriter";
 
 /**
@@ -108,10 +111,92 @@ function appendNodeBestEffort(
     });
 }
 
+/**
+ * Auto-create a workflow (dir + empty snapshot) and return its id. Used when
+ * MCP gen tools are called without an explicit workflowId — every generation
+ * now surfaces on the canvas instead of silently landing in downloads/.
+ */
+async function autoCreateWorkflow(name: string): Promise<string> {
+  const id = uid("wf");
+  await writeFullSnapshot(id, name, [], []);
+  console.info(`[mcp] auto-created workflow ${id} ("${name}")`);
+  return id;
+}
+
+// ─── build_workflow tool ────────────────────────────────────────────────────
+
+function registerBuildWorkflowTool(server: McpServer): void {
+  server.registerTool(
+    "build_workflow",
+    {
+      title: "Build a complete workflow",
+      description:
+        "Create a new workflow with connected nodes on the canvas. " +
+        "Provide node kinds (content.text, gen.image, gen.video, etc.) and edges to connect them. " +
+        "The workflow will appear in the browser UI with all nodes auto-laid out left-to-right. " +
+        "Returns the workflowId — use it in subsequent gen_image / gen_video calls to add results to this workflow.",
+      inputSchema: BuildWorkflowShape,
+    },
+    async (args) => {
+      try {
+        const workflowId = uid("wf");
+        const now = Date.now();
+
+        // Convert input nodes → SnapshotNodes
+        const snapshotNodes = args.nodes.map((n) => ({
+          id: n.id,
+          type: "wsNode" as const,
+          position: { x: 0, y: 0 }, // auto-layout will reposition
+          data: {
+            kind: n.kind as NodeKind,
+            status: "idle" as const,
+            origin: "mcp" as const,
+            mcpCreatedAt: now,
+            ...(n.data ?? {}),
+          } as NodeDataBase,
+        }));
+
+        // Convert input edges → SnapshotEdges
+        const snapshotEdges: SnapshotEdge[] = (args.edges ?? []).map((e, i) => ({
+          id: `edge_${i}_${e.source}_${e.target}`,
+          source: e.source,
+          target: e.target,
+          animated: true,
+          style: { stroke: "#ff3c8e" },
+        }));
+
+        const ok = await writeFullSnapshot(
+          workflowId,
+          args.name,
+          snapshotNodes,
+          snapshotEdges,
+        );
+
+        if (!ok) return errorText("Failed to write workflow snapshot.");
+
+        const nodeIds = snapshotNodes.map((n) => n.id);
+        console.info(
+          `[mcp] built workflow ${workflowId} ("${args.name}") with ${nodeIds.length} node(s), ${snapshotEdges.length} edge(s)`,
+        );
+
+        return okText(
+          `Created workflow "${args.name}" (${workflowId}) with ${nodeIds.length} node(s) and ${snapshotEdges.length} edge(s).\n` +
+            `Open in browser → Dashboard → select "${args.name}" to view the canvas.\n` +
+            `Use workflowId="${workflowId}" in gen_image/gen_video calls to add generated outputs to this workflow.`,
+          { workflowId, nodeIds, edgeCount: snapshotEdges.length },
+        );
+      } catch (err) {
+        return errorText(err);
+      }
+    },
+  );
+}
+
 // ─── registrations ─────────────────────────────────────────────────────────
 
 export function registerTools(server: McpServer): void {
   registerGenerationTools(server);
+  registerBuildWorkflowTool(server);
   registerJobTools(server);
   registerWorkflowTools(server);
   registerAuthTools(server);
@@ -128,6 +213,8 @@ function registerGenerationTools(server: McpServer): void {
     },
     async (args) => {
       try {
+        // Auto-create workflow if none specified
+        const workflowId = args.workflowId || await autoCreateWorkflow("MCP Image Generation");
         const data: NodeDataBase = {
           kind: "gen.image",
           prompt: args.prompt,
@@ -143,14 +230,14 @@ function registerGenerationTools(server: McpServer): void {
           kind: "gen.image",
           data,
           inputs,
-          workflowId: args.workflowId,
+          workflowId,
         });
         const urls = (output.outputs ?? [])
           .map((o) => o.imageUrl)
           .filter((u): u is string => Boolean(u));
         if (urls.length) {
           appendNodeBestEffort(
-            args.workflowId,
+            workflowId,
             buildMcpImageNode({
               jobId: job.id,
               prompt: args.prompt,
@@ -165,7 +252,7 @@ function registerGenerationTools(server: McpServer): void {
           urls.length
             ? `Generated ${urls.length} image(s):\n${urls.map((u) => `- ${u}`).join("\n")}`
             : "Job finished but returned no imageUrl.",
-          { jobId: job.id, outputs: output.outputs ?? [], imageUrls: urls },
+          { jobId: job.id, outputs: output.outputs ?? [], imageUrls: urls, workflowId },
         );
       } catch (err) {
         return errorText(err);
@@ -183,6 +270,7 @@ function registerGenerationTools(server: McpServer): void {
     },
     async (args) => {
       try {
+        const workflowId = args.workflowId || await autoCreateWorkflow("MCP Video Generation");
         const genMode = pickVideoGenMode(args.provider, "t2v");
         const data: NodeDataBase = {
           kind: "gen.video",
@@ -200,14 +288,14 @@ function registerGenerationTools(server: McpServer): void {
           nodeId: mcpNodeId(),
           kind: "gen.video",
           data,
-          workflowId: args.workflowId,
+          workflowId,
         });
         const urls = (output.outputs ?? [])
           .map((o) => o.videoUrl)
           .filter((u): u is string => Boolean(u));
         if (urls.length) {
           appendNodeBestEffort(
-            args.workflowId,
+            workflowId,
             buildMcpVideoNode({
               jobId: job.id,
               prompt: args.prompt,
@@ -225,7 +313,7 @@ function registerGenerationTools(server: McpServer): void {
         }
         return okText(
           urls.length ? `Generated video: ${urls.join(", ")}` : "Job finished but returned no videoUrl.",
-          { jobId: job.id, outputs: output.outputs ?? [], videoUrls: urls },
+          { jobId: job.id, outputs: output.outputs ?? [], videoUrls: urls, workflowId },
         );
       } catch (err) {
         return errorText(err);
@@ -243,6 +331,7 @@ function registerGenerationTools(server: McpServer): void {
     },
     async (args) => {
       try {
+        const workflowId = args.workflowId || await autoCreateWorkflow("MCP I2V Generation");
         const genMode = pickVideoGenMode(args.provider, "i2v");
         const data: NodeDataBase = {
           kind: "gen.video",
@@ -262,14 +351,14 @@ function registerGenerationTools(server: McpServer): void {
           kind: "gen.video",
           data,
           inputs,
-          workflowId: args.workflowId,
+          workflowId,
         });
         const urls = (output.outputs ?? [])
           .map((o) => o.videoUrl)
           .filter((u): u is string => Boolean(u));
         if (urls.length) {
           appendNodeBestEffort(
-            args.workflowId,
+            workflowId,
             buildMcpVideoNode({
               jobId: job.id,
               prompt: args.prompt,
@@ -287,7 +376,7 @@ function registerGenerationTools(server: McpServer): void {
         }
         return okText(
           urls.length ? `Generated video: ${urls.join(", ")}` : "Job finished but returned no videoUrl.",
-          { jobId: job.id, outputs: output.outputs ?? [], videoUrls: urls },
+          { jobId: job.id, outputs: output.outputs ?? [], videoUrls: urls, workflowId },
         );
       } catch (err) {
         return errorText(err);

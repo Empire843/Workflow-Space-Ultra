@@ -80,7 +80,41 @@ export const WorkflowIdShape = {
   workflowId: z.string().min(1),
 };
 
+export const BuildWorkflowShape = {
+  name: z.string().min(1).describe("Workflow name"),
+  nodes: z
+    .array(
+      z.object({
+        id: z.string().min(1).describe("Unique node id (e.g. 'text_1', 'img_1', 'vid_1')"),
+        kind: z
+          .string()
+          .min(1)
+          .describe(
+            "Node kind: 'content.text', 'content.upload', 'gen.image', 'gen.video', 'gen.start-end', 'xform.upscale.grok', 'frame'",
+          ),
+        data: z
+          .record(z.string(), z.unknown())
+          .optional()
+          .describe(
+            "Node data fields: prompt, text, aspectRatio, genMode ('t2v.veo'|'t2v.grok'|'t2i.veo'), modelLabel, outputCount, etc.",
+          ),
+      }),
+    )
+    .min(1)
+    .describe("Array of nodes to place on the canvas"),
+  edges: z
+    .array(
+      z.object({
+        source: z.string().min(1).describe("Source node id"),
+        target: z.string().min(1).describe("Target node id"),
+      }),
+    )
+    .optional()
+    .describe("Edges connecting nodes (source → target)"),
+};
+
 export type ImageInput = z.infer<z.ZodObject<typeof ImageInputShape>>;
 export type VideoT2VInput = z.infer<z.ZodObject<typeof VideoT2VShape>>;
 export type VideoI2VInput = z.infer<z.ZodObject<typeof VideoI2VShape>>;
 export type VideoStartEndInput = z.infer<z.ZodObject<typeof VideoStartEndShape>>;
+export type BuildWorkflowInput = z.infer<ReturnType<typeof z.object<typeof BuildWorkflowShape>>>;

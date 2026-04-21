@@ -45,6 +45,9 @@ const transport = new StdioServerTransport();
 // MUST go to stderr or it corrupts the protocol.
 const origLog = console.log;
 console.log = (...args) => console.error("[wsu-mcp]", ...args);
+console.info = (...args) => console.error("[wsu-mcp]", ...args);
+console.warn = (...args) => console.error("[wsu-mcp:warn]", ...args);
+console.debug = (...args) => console.error("[wsu-mcp:debug]", ...args);
 
 await server.connect(transport);
 

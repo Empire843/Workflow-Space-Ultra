@@ -250,3 +250,117 @@ export function appendMcpNodeToSnapshot(
     return true;
   });
 }
+
+// ─── full snapshot writer (build_workflow) ───────────────────────────────────
+
+export interface SnapshotEdge {
+  id: string;
+  source: string;
+  target: string;
+  animated?: boolean;
+  style?: Record<string, unknown>;
+}
+
+/**
+ * Auto-layout nodes in a left-to-right flow. Topologically sorts based on
+ * edges and spaces nodes evenly.
+ */
+function autoLayoutNodes(
+  nodes: SnapshotNode[],
+  edges: SnapshotEdge[],
+): SnapshotNode[] {
+  const COL_WIDTH = 320;
+  const ROW_HEIGHT = 220;
+  const START_X = 100;
+  const START_Y = 100;
+
+  // Build adjacency: target → set of sources
+  const inDegree = new Map<string, number>();
+  const children = new Map<string, string[]>();
+  for (const n of nodes) {
+    inDegree.set(n.id, 0);
+    children.set(n.id, []);
+  }
+  for (const e of edges) {
+    inDegree.set(e.target, (inDegree.get(e.target) ?? 0) + 1);
+    children.get(e.source)?.push(e.target);
+  }
+
+  // Topological sort (Kahn's algorithm) → columns
+  const columns: string[][] = [];
+  let queue = nodes.filter((n) => (inDegree.get(n.id) ?? 0) === 0).map((n) => n.id);
+  const placed = new Set<string>();
+
+  while (queue.length > 0) {
+    columns.push([...queue]);
+    const next: string[] = [];
+    for (const id of queue) {
+      placed.add(id);
+      for (const child of children.get(id) ?? []) {
+        const deg = (inDegree.get(child) ?? 1) - 1;
+        inDegree.set(child, deg);
+        if (deg <= 0 && !placed.has(child)) next.push(child);
+      }
+    }
+    queue = next;
+  }
+  // Any nodes not placed (cycles or disconnected) go in last column
+  for (const n of nodes) {
+    if (!placed.has(n.id)) {
+      if (!columns.length) columns.push([]);
+      columns[columns.length - 1].push(n.id);
+    }
+  }
+
+  // Assign positions
+  const posMap = new Map<string, { x: number; y: number }>();
+  for (let col = 0; col < columns.length; col++) {
+    const ids = columns[col];
+    for (let row = 0; row < ids.length; row++) {
+      posMap.set(ids[row], {
+        x: START_X + col * COL_WIDTH,
+        y: START_Y + row * ROW_HEIGHT,
+      });
+    }
+  }
+
+  return nodes.map((n) => ({
+    ...n,
+    position: posMap.get(n.id) ?? n.position,
+  }));
+}
+
+/**
+ * Write a complete snapshot.json for a new workflow. Creates the directory if
+ * needed. All nodes are marked with `origin: "mcp"`.
+ */
+export function writeFullSnapshot(
+  workflowId: string,
+  name: string,
+  nodes: SnapshotNode[],
+  edges: SnapshotEdge[],
+): Promise<boolean> {
+  const safe = sanitizeWorkflowId(workflowId);
+  if (!safe) return Promise.resolve(false);
+  return withLock(safe, async () => {
+    const dir = workflowDir(safe);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, "snapshot.json");
+
+    const layouted = autoLayoutNodes(nodes, edges);
+
+    const snapshot: SnapshotFile = {
+      id: safe,
+      name,
+      nodes: layouted,
+      edges,
+      updatedAt: Date.now(),
+      syncedAt: Date.now(),
+      fromMcp: true,
+    };
+
+    await writeFile(file, JSON.stringify(snapshot), "utf-8");
+    return true;
+  });
+}
+
