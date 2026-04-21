@@ -239,6 +239,63 @@ the `wsu://…/assets/…` resource — no separate download step needed.
 - The MCP server reuses the canvas's queue + lanes — firing a generation tool
   while the UI is busy will queue up behind UI jobs (and vice versa).
 
+## ChatGPT GPT Action (OAuth)
+
+> **Deep dive**: [`wiki/features/chatgpt-action.md`](wiki/features/chatgpt-action.md) — architecture, token lifecycle, threat model, troubleshooting. The section below is the 5-step quickstart only.
+
+WSU can be registered as a **Custom GPT Action** on `chatgpt.com`: ChatGPT
+calls your local WSU through REST, with OAuth 2.0 authentication, to trigger
+VEO / Grok generation and build workflow graphs on the canvas — same set of
+capabilities as the MCP server but reachable from ChatGPT itself.
+
+Because ChatGPT's servers can't dial `localhost`, you need a public tunnel.
+
+1. **Start a tunnel** pointing at `http://localhost:3000`, e.g.
+
+   ```powershell
+   ngrok http 3000
+   # → forwarding https://aXXX-XXX-XXX-XXX.ngrok-free.app -> http://localhost:3000
+   ```
+
+2. **Tell WSU its public URL** before starting `npm run dev`:
+
+   ```powershell
+   $env:WSU_PUBLIC_BASE_URL="https://aXXX-XXX-XXX-XXX.ngrok-free.app"
+   npm run dev
+   ```
+
+3. **Create a WSU OAuth client**: open `http://localhost:3000` → Settings →
+   **ChatGPT GPT Action (OAuth)**. A default "ChatGPT" client is pre-created.
+   Click **Rotate secret** to reveal a one-shot plaintext secret (the server
+   only keeps the sha-256 hash after you close the reveal block).
+
+4. **Create the Custom GPT** on `chatgpt.com` → Explore GPTs → Create:
+   - In "Actions", click **Import from URL** and paste the value from
+     **OpenAPI schema URL** in WSU Settings (`<public>/api/actions/openapi`).
+   - Under "Authentication", pick **OAuth**:
+     - Client ID: copy from WSU Settings.
+     - Client Secret: the one-shot secret from step 3.
+     - Authorization URL + Token URL: copy from WSU Settings.
+     - Scope: `wsu:all`.
+     - Token Exchange Method: **POST (Default)**.
+   - Save. ChatGPT generates a redirect URI that looks like
+     `https://chat.openai.com/aip/g-XXXXXXXXX/oauth/callback` (and a second
+     one under `chatgpt.com/aip/...`). Copy both, paste them into the client's
+     **Redirect URIs** list in WSU Settings.
+
+5. **Test-drive**: back in ChatGPT, open the GPT and invoke any action. The
+   first call redirects you through WSU's consent page; click **Allow** and
+   the flow completes. From here on, `gen_image` / `gen_video_*` /
+   `build_workflow` can be invoked by your GPT like native tools, and every
+   generation shows up on the canvas in real time.
+
+Threat model note: the tunnel exposes every `/api/*` route, but
+admin-only endpoints (`/api/oauth/clients/*`, `/api/config`) are restricted
+to the `Host: localhost:*` header, so ChatGPT's cloud traffic can only reach
+the OAuth + Actions surface. Tokens are stored hashed. Even so, treat the
+tunnel URL as sensitive — anyone who learns it can attempt a brute-force
+OAuth login against your client secret.
+
 ## Documentation
 
 > The detailed documentation lives in a **private git submodule** mounted at [`wiki/`](wiki/). It is not included in this public repository. Contributors with access can initialise it with `git submodule update --init --recursive`; without access the links below will be empty locally.

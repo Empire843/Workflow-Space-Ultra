@@ -4,6 +4,7 @@ import { ExternalLink, Loader2, X } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import { cn } from "@/lib/utils";
+import OAuthClientsSection from "./OAuthClientsSection";
 
 type TestState = "idle" | "loading" | "ok" | "error";
 
@@ -257,6 +258,18 @@ export default function SettingsDialog({
                 className="bg-[color:var(--color-bg-elev-2)] border border-[color:var(--color-border)] rounded-md px-2 py-1 text-sm outline-none w-24"
               />
             </Row>
+          </Section>
+
+          <Section title="ChatGPT GPT Action (OAuth)">
+            <div className="rounded-md bg-[color:var(--color-bg-elev-2)] border border-[color:var(--color-border)] p-2.5 space-y-1 text-[11px] text-[color:var(--color-fg-muted)]">
+              <p>
+                Expose WSU as a ChatGPT Custom GPT Action. WSU must be reachable from the internet
+                (set <code>WSU_PUBLIC_BASE_URL</code> to a tunnel — ngrok / cloudflared /
+                Tailscale Funnel). Paste the 4 URLs below into the Custom GPT editor + your client
+                id + the one-shot secret.
+              </p>
+            </div>
+            <OAuthClientsSection />
           </Section>
 
           <Section title="Seed">

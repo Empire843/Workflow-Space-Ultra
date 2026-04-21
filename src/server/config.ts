@@ -37,6 +37,45 @@ export const CHROME_EXE_PATH_ENV = process.env.CHROME_EXE_PATH || "";
 
 export const RECAPTCHA_SITE_KEY = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV";
 
+/**
+ * Public base URL the WSU server is reachable at from the outside world.
+ * Required when exposing WSU as a ChatGPT Custom GPT Action — ChatGPT's
+ * servers must be able to hit `/api/oauth/*` and `/api/actions/*`, so the
+ * user runs a tunnel (ngrok / cloudflared / tailscale) and points this env
+ * at the public hostname.
+ *
+ * Falls back to localhost for development. When localhost is used, the
+ * Settings UI shows a warning so the user knows the ChatGPT flow will not
+ * actually work end-to-end until a tunnel is set up.
+ */
+export const PUBLIC_BASE_URL = (
+  process.env.WSU_PUBLIC_BASE_URL || "http://localhost:3000"
+).replace(/\/+$/, "");
+
+export function isPublicBaseUrlLocal(): boolean {
+  try {
+    const u = new URL(PUBLIC_BASE_URL);
+    return (
+      u.hostname === "localhost" ||
+      u.hostname === "127.0.0.1" ||
+      u.hostname === "::1" ||
+      u.hostname.endsWith(".local")
+    );
+  } catch {
+    return true;
+  }
+}
+
+/** The 4 URLs a user needs to paste into ChatGPT Actions config. */
+export function oauthPublicUrls() {
+  return {
+    authorizationUrl: `${PUBLIC_BASE_URL}/api/oauth/authorize`,
+    tokenUrl: `${PUBLIC_BASE_URL}/api/oauth/token`,
+    revokeUrl: `${PUBLIC_BASE_URL}/api/oauth/revoke`,
+    openapiUrl: `${PUBLIC_BASE_URL}/api/actions/openapi`,
+  };
+}
+
 export const CONFIG_FILE = path.join(DATA_GENERAL_DIR, "config.json");
 
 export function ensureDirs() {
