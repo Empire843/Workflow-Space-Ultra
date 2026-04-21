@@ -1,5 +1,6 @@
 "use client";
 
+import React from "react";
 import {
   NodeResizer,
   type NodeProps,
@@ -33,7 +34,7 @@ import { useWorkflowStore } from "@/state/workflowStore";
  *  - Corner brackets reinforce the "frame" metaphor.
  *  - Live progress badge during runFrame ("Running 3/7 — gen.image").
  */
-export default function FrameNode(props: NodeProps) {
+function FrameNodeInner(props: NodeProps) {
   const { id, data, selected } = props;
   const d = data as NodeDataBase;
   const removeNode = useWorkflowStore((s) => s.removeNode);
@@ -275,6 +276,8 @@ export default function FrameNode(props: NodeProps) {
     </div>
   );
 }
+
+export default React.memo(FrameNodeInner);
 
 /**
  * Subtle bracket marker in each corner — purely cosmetic, drawn with two

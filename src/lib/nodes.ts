@@ -121,6 +121,11 @@ export const NODE_CATALOG: NodeCatalogEntry[] = [
   },
 ];
 
+/** Pre-computed Map for O(1) lookup — avoids `.find()` on every node render. */
+export const NODE_CATALOG_MAP = new Map<NodeKind, NodeCatalogEntry>(
+  NODE_CATALOG.map((e) => [e.kind, e] as const),
+);
+
 export interface OutputItem {
   imageUrl?: string;
   imageMediaId?: string;

@@ -1,6 +1,7 @@
 "use client";
 
 import { Handle, Position, type NodeProps } from "@xyflow/react";
+import React from "react";
 import {
   AlertTriangle,
   CheckCircle2,
@@ -18,10 +19,10 @@ import {
   Video,
   Workflow as WorkflowIcon,
 } from "lucide-react";
-import { type ReactNode } from "react";
+import { type ReactNode, useCallback } from "react";
 
 import {
-  NODE_CATALOG,
+  NODE_CATALOG_MAP,
   type NodeCatalogEntry,
   type NodeDataBase,
   type OutputItem,
@@ -58,12 +59,21 @@ function resolveFrameDims(data: NodeDataBase): { w: number; h: number } {
   return FRAME_DIMS[ar] || FRAME_DIMS["16:9"];
 }
 
-export default function WSNode(props: NodeProps) {
+function WSNodeInner(props: NodeProps) {
   const { id, data, selected } = props;
   const d = data as NodeDataBase;
-  const meta = NODE_CATALOG.find((c) => c.kind === d.kind);
-  const removeNode = useWorkflowStore((s) => s.removeNode);
-  const cloneNode = useWorkflowStore((s) => s.cloneNode);
+  const meta = NODE_CATALOG_MAP.get(d.kind);
+
+  const handleDelete = useCallback((e: React.MouseEvent) => {
+    e.stopPropagation();
+    useWorkflowStore.getState().removeNode(id);
+  }, [id]);
+
+  const handleClone = useCallback((e: React.MouseEvent) => {
+    e.stopPropagation();
+    const idx = Date.now() % 10;
+    useWorkflowStore.getState().cloneNode(id, (idx % 3) + 1);
+  }, [id]);
 
   const isContent = d.kind.startsWith("content.");
   const isText = d.kind === "content.text";
@@ -141,16 +151,8 @@ export default function WSNode(props: NodeProps) {
     await runSingleNode(id, { cascade: true });
   };
 
-  const handleDelete = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    removeNode(id);
-  };
-
-  const handleClone = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    const idx = Date.now() % 10; // small lateral offset
-    cloneNode(id, (idx % 3) + 1);
-  };
+  // handleDelete and handleClone are defined above with useCallback + getState()
+  // to avoid subscribing to the store for action-only references.
 
   const headerLabel = () => {
     if (d.kind === "gen.video" && genMode && VIDEO_MODE_LABELS[genMode]) {
@@ -309,6 +311,8 @@ export default function WSNode(props: NodeProps) {
     </div>
   );
 }
+
+export default React.memo(WSNodeInner);
 
 function NodeLabel({
   meta,

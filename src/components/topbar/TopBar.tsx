@@ -7,7 +7,6 @@ import {
   ListOrdered,
   Loader2,
   LogOut,
-  Play,
   RefreshCw,
   Save,
   Settings,
@@ -19,7 +18,7 @@ import {
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { cn } from "@/lib/utils";
-import { runWorkflow } from "@/state/runWorkflow";
+
 import { useWorkflowStore } from "@/state/workflowStore";
 
 import QueuePanel from "../queue/QueuePanel";
@@ -50,7 +49,7 @@ export default function TopBar() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [queueOpen, setQueueOpen] = useState(false);
   const [queueBadge, setQueueBadge] = useState<{ running: number; queued: number } | null>(null);
-  const [running, setRunning] = useState(false);
+
   const [auth, setAuth] = useState<AuthStatus | null>(null);
   const [prewarming, setPrewarming] = useState<{ veo: boolean; grok: boolean }>({
     veo: false,
@@ -184,17 +183,7 @@ export default function TopBar() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [auth?.veo.status, auth?.grok.status, auth?.veo.chromeConnected, auth?.grok.chromeConnected]);
 
-  const handleRun = async () => {
-    if (running) return;
-    setRunning(true);
-    try {
-      await runWorkflow();
-    } catch {
-      // nodes show their own errors
-    } finally {
-      setRunning(false);
-    }
-  };
+
 
   const handleSave = useCallback(async () => {
     await saveCurrent();
@@ -323,19 +312,6 @@ export default function TopBar() {
         className="h-8 px-3 rounded-md bg-[color:var(--color-bg-elev-2)] border border-[color:var(--color-border)] hover:bg-[color:var(--color-bg-elev-1)] text-[color:var(--color-fg-muted)] text-xs flex items-center gap-1.5"
       >
         <Settings className="h-3.5 w-3.5" /> Settings
-      </button>
-
-      <button
-        type="button"
-        onClick={handleRun}
-        disabled={running}
-        className={cn(
-          "h-8 px-4 rounded-md text-xs font-semibold text-white flex items-center gap-1.5",
-          "bg-gradient-to-r from-pink-500 to-rose-500 hover:opacity-95 shadow-lg shadow-pink-500/20 disabled:opacity-60"
-        )}
-      >
-        {running ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
-        {running ? "Running..." : "Run Workflow"}
       </button>
 
       <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
