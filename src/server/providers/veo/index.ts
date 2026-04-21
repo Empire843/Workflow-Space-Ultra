@@ -2,6 +2,7 @@ import type { Page } from "playwright";
 
 import { loadConfig, type AccountType } from "../../config";
 import { timedSpan } from "../../telemetry/timing";
+import { sessionTelemetry } from "../../tokens/sessionTelemetry";
 import { getVeoCollector, type VeoTokenCollector } from "../../tokens/veoTokenCollector";
 import {
   cancelableSleep,
@@ -62,11 +63,88 @@ interface AuthCtx {
   accountType: AccountType;
 }
 
+/**
+ * Peek at the VEO auth tab's current URL and raise a VEO-classified error
+ * BEFORE we try to extract tokens. Previously, if Chrome had been logged
+ * out of Google (or the user closed the Flow project tab), `collectAuth`
+ * would wait the full timeout for listeners that never fire, then throw a
+ * generic "Timeout chờ session/projectId/accessToken". This version trips
+ * early with a message the session-error classifier picks up as `veo`,
+ * so the dialog appears immediately and the user knows exactly which
+ * Chrome needs attention.
+ *
+ * Only warns when we have a concrete signal — navigation is deferred to
+ * the token collector itself. The 5s ceiling keeps this step
+ * imperceptible when things are fine.
+ */
+async function verifyVeoPageAccessible(
+  collector: VeoTokenCollector,
+  onLog?: LogFn,
+): Promise<void> {
+  const page = collector.getPage?.();
+  if (!page) return; // nothing to check yet; collector will bootstrap it
+  let url = "";
+  try {
+    url = page.url() || "";
+  } catch {
+    return;
+  }
+  // Google's "signed out" landing page — plain `accounts.google.com` or
+  // `/ServiceLogin` shows up here when the profile's cookie got revoked.
+  if (/accounts\.google\.com\/ServiceLogin|\/logout|signin/i.test(url)) {
+    sessionTelemetry.record({
+      target: "veo",
+      kind: "preflight_fail",
+      detail: `redirected to ${url.slice(0, 120)}`,
+    });
+    onLog?.("Chrome VEO đã bị đăng xuất — cần login lại.");
+    throw new Error(
+      `VEO session: Chrome đã bị đăng xuất khỏi Google Flow (URL hiện tại: ${url.slice(0, 80)}…). Hãy mở lại Chrome VEO và đăng nhập trước khi chạy.`,
+    );
+  }
+  // If we've been redirected outside labs.google entirely (e.g. the user
+  // navigated away and nothing we control is still open), trip early.
+  if (url && !/about:|chrome:|labs\.google/i.test(url)) {
+    sessionTelemetry.record({
+      target: "veo",
+      kind: "preflight_fail",
+      detail: `off-site url ${url.slice(0, 120)}`,
+    });
+    onLog?.("Tab VEO không còn ở Google Flow — session có thể đã hết hạn.");
+    throw new Error(
+      `VEO session: Tab Chrome không ở labs.google nữa (URL: ${url.slice(0, 80)}…). Mở lại Chrome VEO rồi thử lại.`,
+    );
+  }
+}
+
 async function buildBaseAuth(onLog?: LogFn) {
   return timedSpan("veo.buildAuth", async () => {
     onLog?.("Kết nối VEO session…");
     const collector = await getVeoCollector();
-    const auth = await collector.collectAuth();
+    // Race the pre-flight check against a 5s budget so we don't add
+    // perceptible latency when things are fine.
+    await Promise.race([
+      verifyVeoPageAccessible(collector, onLog),
+      new Promise<void>((resolve) => setTimeout(resolve, 5_000)),
+    ]);
+    const collectStarted = Date.now();
+    let auth;
+    try {
+      auth = await collector.collectAuth();
+      sessionTelemetry.record({
+        target: "veo",
+        kind: "collect_ok",
+        durationMs: Date.now() - collectStarted,
+      });
+    } catch (err) {
+      sessionTelemetry.record({
+        target: "veo",
+        kind: "collect_fail",
+        durationMs: Date.now() - collectStarted,
+        detail: err instanceof Error ? err.message.slice(0, 180) : String(err).slice(0, 180),
+      });
+      throw err;
+    }
     const config = loadConfig();
     const accountType: AccountType = config.account1.TYPE_ACCOUNT || "ULTRA";
     onLog?.("Session OK. Chuẩn bị reCAPTCHA…");

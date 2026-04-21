@@ -27,12 +27,15 @@ export type NodeKind =
   | "xform.upscale.grok"
   | "xform.enhance"
   | "xform.remove-bg"
-  | "xform.extract-frames";
+  | "xform.extract-frames"
+  // Group container (visual frame) — holds child nodes via parentId/extent.
+  // Rendered by `FrameNode` (not the standard `WSNode`).
+  | "frame";
 
 export interface NodeCatalogEntry {
   kind: NodeKind;
   label: string;
-  group: "content" | "generation" | "transformation";
+  group: "content" | "generation" | "transformation" | "layout";
   provider?: ProviderId;
   description?: string;
   icon?: string;
@@ -107,6 +110,15 @@ export const NODE_CATALOG: NodeCatalogEntry[] = [
     icon: "frame",
     description: "Tách frame từ video",
   },
+
+  // Layout
+  {
+    kind: "frame",
+    label: "Frame",
+    group: "layout",
+    icon: "frame",
+    description: "Nhóm các node và chạy cùng lúc",
+  },
 ];
 
 export interface OutputItem {
@@ -173,6 +185,19 @@ export interface NodeDataBase extends Record<string, unknown> {
    * locked back to a specific mime.
    */
   uploadAccept?: string;
+
+  // ─── Frame (layout group) ───────────────────────────────────────────────
+  // Only meaningful when `kind === "frame"`. Height/width are tracked both in
+  // React Flow's `style` and here so persistence round-trips deterministically.
+  frameLabel?: string;
+  frameWidth?: number;
+  frameHeight?: number;
+  // Live progress fields populated by `runFrame` while the Frame is running.
+  // Stripped from persisted snapshots (see RUNTIME_KEYS in workflowStore).
+  frameRunning?: boolean;
+  frameRunIndex?: number;
+  frameRunTotal?: number;
+  frameRunCurrentLabel?: string;
 
   // ─── MCP provenance ──────────────────────────────────────────────────────
   // Set on nodes synthesised by the MCP server and merged into the canvas

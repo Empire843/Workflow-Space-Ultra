@@ -4,11 +4,11 @@ import {
   ArrowLeftRight,
   FileImage,
   FileVideo,
+  Frame as FrameIcon,
   Hand,
   Image as ImageIcon,
   Layers,
   MousePointer2,
-  Shapes,
   Sparkles,
   Type,
   Video as VideoIcon,
@@ -54,7 +54,7 @@ type ToolItem =
       icon: React.ElementType;
       label: string;
       shortcut?: string;
-      toggleKey: "showPalette" | "showMinimap";
+      toggleKey: "showMinimap";
     }
   | {
       type: "flyout";
@@ -123,10 +123,10 @@ const VIDEO_FLYOUT: FlyoutItem[] = [
 const TOOL_ITEMS: ToolItem[] = [
   { type: "tool", icon: MousePointer2, label: "Select", shortcut: "V", toolMode: "select" },
   { type: "tool", icon: Hand, label: "Pan", shortcut: "H", toolMode: "pan" },
-  { type: "toggle", icon: Shapes, label: "Node Palette", shortcut: "P", toggleKey: "showPalette" },
   { type: "add", icon: Type, label: "Add Text Node", shortcut: "T", nodeKind: "content.text" },
   { type: "flyout", icon: ImageIcon, label: "Image", shortcut: "I", flyout: IMAGE_FLYOUT },
   { type: "flyout", icon: VideoIcon, label: "Video", shortcut: "G", flyout: VIDEO_FLYOUT },
+  { type: "add", icon: FrameIcon, label: "Add Frame", shortcut: "F", nodeKind: "frame" },
   { type: "toggle", icon: Layers, label: "Toggle Minimap", shortcut: "L", toggleKey: "showMinimap" },
 ];
 
@@ -136,10 +136,8 @@ const TOOL_ITEMS: ToolItem[] = [
 
 export default function LeftToolbar() {
   const canvasTool = useWorkflowStore((s) => s.canvasTool);
-  const showPalette = useWorkflowStore((s) => s.showPalette);
   const showMinimap = useWorkflowStore((s) => s.showMinimap);
   const setCanvasTool = useWorkflowStore((s) => s.setCanvasTool);
-  const togglePalette = useWorkflowStore((s) => s.togglePalette);
   const toggleMinimap = useWorkflowStore((s) => s.toggleMinimap);
   const addNode = useWorkflowStore((s) => s.addNode);
 
@@ -160,8 +158,7 @@ export default function LeftToolbar() {
     } else if (item.type === "add") {
       spawnNode(item.nodeKind);
     } else if (item.type === "toggle") {
-      if (item.toggleKey === "showPalette") togglePalette();
-      else toggleMinimap();
+      if (item.toggleKey === "showMinimap") toggleMinimap();
     }
     /* flyout: handled by FlyoutButton hover menu, do nothing when the main icon is clicked */
   }
@@ -169,7 +166,6 @@ export default function LeftToolbar() {
   function isActive(item: ToolItem): boolean {
     if (item.type === "tool") return canvasTool === item.toolMode;
     if (item.type === "toggle") {
-      if (item.toggleKey === "showPalette") return showPalette;
       if (item.toggleKey === "showMinimap") return showMinimap;
     }
     return false;

@@ -142,8 +142,9 @@ async function _executeNode(
     let output: NodeDataBase = { ...nodeData };
 
     // Helper log: emit log event and print to console for server-side monitoring
+    // IMPORTANT: Use console.error so we don't corrupt the MCP stdio JSON-RPC stream.
     const log = (msg: string) => {
-      console.log(`[job:${job.id}] ${msg}`);
+      console.error(`[job:${job.id}] ${msg}`);
       setJobLog(job.id, msg);
     };
 

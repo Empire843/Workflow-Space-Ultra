@@ -5,6 +5,7 @@ import type { Browser, BrowserContext, Page } from "playwright";
 
 import { DATA_GENERAL_DIR, GROK_CDP_HOST, GROK_URL, ensureDirs } from "../config";
 import { openGrokChrome } from "../chrome/grokChromeManager";
+import { sessionTelemetry } from "./sessionTelemetry";
 
 /**
  * Port of grok_api_text_to_video.auto_discover_statsig_headers.
@@ -97,6 +98,11 @@ export class GrokTokenCollector {
 
     this.browser.on("disconnected", () => {
       console.warn("[Grok] Browser disconnected — invalidating singleton");
+      sessionTelemetry.record({
+        target: "grok",
+        kind: "reset_collector",
+        detail: "browser disconnected",
+      });
       const store = getGrokStore();
       if (store.instance === this) {
         store.instance = null;
@@ -181,7 +187,11 @@ export class GrokTokenCollector {
 
     if (!force) {
       const cached = getCachedGrokHeaders(this.profileName);
-      if (cached) return cached;
+      if (cached) {
+        sessionTelemetry.record({ target: "grok", kind: "cache_hit" });
+        return cached;
+      }
+      sessionTelemetry.record({ target: "grok", kind: "cache_stale" });
     }
 
     // Use a live page handle — not `this.page` directly — so we don't

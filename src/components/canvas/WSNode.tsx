@@ -102,17 +102,18 @@ export default function WSNode(props: NodeProps) {
     !!d.imageUrl;
 
   /**
-   * Check whether any upstream gen node is not yet `done`, to decide whether to enable
-   * the "Run upstream + this" button. If every parent is a content node or already
-   * done → the cascade button has no real effect; we still show it but disable it
-   * to avoid confusion.
+   * Check whether this node has ANY upstream generation node. The cascade
+   * button force-re-runs every upstream gen node (in topological order) before
+   * running the target, so even if all upstream are already `done` the button
+   * still does something useful — refreshing the entire chain. It only stays
+   * disabled when there are no upstream gen nodes at all (content-only or
+   * nothing connected).
    */
-  const hasPendingUpstream = useWorkflowStore((s) => {
+  const hasUpstreamGen = useWorkflowStore((s) => {
     const nodesById = getNodesById(s.nodes);
     const edgesByTarget = getEdgesByTarget(s.edges);
     const direct = edgesByTarget.get(id);
     if (!direct?.length) return false;
-    // DFS to detect any upstream gen node that is not done and has no output yet.
     const seen = new Set<string>();
     const stack = direct.map((e) => e.source);
     while (stack.length) {
@@ -121,11 +122,7 @@ export default function WSNode(props: NodeProps) {
       seen.add(pid);
       const p = nodesById.get(pid);
       if (!p) continue;
-      const pd = p.data;
-      const hasOut = !!(pd.imageUrl || pd.videoUrl || pd.imageMediaId || pd.uploadBase64 || (pd.outputs && pd.outputs.length));
-      if (!pd.kind.startsWith("content.") && pd.status !== "done" && !hasOut) {
-        return true;
-      }
+      if (!p.data.kind.startsWith("content.")) return true;
       const up = edgesByTarget.get(pid);
       if (up) for (const e of up) stack.push(e.source);
     }
@@ -262,11 +259,11 @@ export default function WSNode(props: NodeProps) {
                 </ToolIconButton>
                 <ToolIconButton
                   onClick={handleRunCascade}
-                  disabled={busy || !hasPendingUpstream}
+                  disabled={busy || !hasUpstreamGen}
                   title={
-                    !hasPendingUpstream
-                      ? "Tất cả upstream đã sẵn sàng — dùng nút Run bên trái"
-                      : "Run upstream chưa xong rồi chạy node này"
+                    !hasUpstreamGen
+                      ? "Không có upstream gen node nào để re-run"
+                      : "Run lại toàn bộ upstream (tuần tự) + node này"
                   }
                   tone={running ? "accent" : "default"}
                 >

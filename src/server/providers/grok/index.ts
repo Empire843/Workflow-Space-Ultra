@@ -9,7 +9,19 @@ import { request } from "undici";
 import { GROK_PROFILE_NAME, ensureDirs } from "../../config";
 import { resolveDownloadDir } from "../../paths/workflowAssets";
 import { timedSpan } from "../../telemetry/timing";
-import { getGrokCollector, resetGrokCollector } from "../../tokens/grokTokenCollector";
+import {
+  getGrokCollector,
+  resetGrokCollector,
+  type GrokTokenCollector,
+  type GrokHeaders,
+} from "../../tokens/grokTokenCollector";
+import { sessionTelemetry } from "../../tokens/sessionTelemetry";
+
+import {
+  isGrokCdpDeadError,
+  isGrokPageClosedError,
+  isGrokUnauthenticated,
+} from "./errors";
 
 import {
   grokCreateImagePost,
@@ -38,18 +50,96 @@ async function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise
 }
 
 /**
- * Playwright's "target closed" family of errors all share some common
- * substrings. Matching them lets us react to "tab died during the call"
- * without having to pattern-match every exact Playwright version.
+ * Back-compat alias used by a few call-sites below — delegates to the
+ * canonical classifier in `./errors` so the pattern list stays in one
+ * place.
  */
-function isPageClosedError(err: unknown): boolean {
-  if (!(err instanceof Error)) return false;
-  const m = err.message;
-  return (
-    /Target page, context or browser has been closed/i.test(m) ||
-    /Target closed/i.test(m) ||
-    /page\.evaluate: (Target|Protocol|Connection)/i.test(m)
-  );
+const isPageClosedError = isGrokPageClosedError;
+
+/**
+ * Decide whether we should actually tear down the singleton Grok
+ * collector. Previously we reset on any message matching
+ * `timeout|not ready|login|session|disconnect`, which nuked the Chrome
+ * connection on transient network blips — the exact symptom users saw
+ * where Grok would "need re-open" after a flaky 30s window.
+ *
+ * Now: reset only when the CDP connection is demonstrably dead (browser
+ * disconnected, browser/context closed, etc.). Authentication problems
+ * are handled by `withGrokAuthRetry` below without reaching for the
+ * reset hammer.
+ */
+function shouldResetGrokSingleton(err: unknown, collector: GrokTokenCollector | null): boolean {
+  if (!collector) return false;
+  try {
+    const browser = (collector as unknown as { browser?: { isConnected?: () => boolean } }).browser;
+    if (browser && browser.isConnected && !browser.isConnected()) return true;
+  } catch {
+    // ignore — fall through to error-message heuristic
+  }
+  return isGrokCdpDeadError(err);
+}
+
+function resetGrokIfCdpDead(err: unknown, collector: GrokTokenCollector | null): void {
+  if (!shouldResetGrokSingleton(err, collector)) return;
+  sessionTelemetry.record({
+    target: "grok",
+    kind: "reset_collector",
+    detail: err instanceof Error ? err.message.slice(0, 160) : String(err).slice(0, 160),
+  });
+  resetGrokCollector();
+}
+
+/**
+ * 401/403 retry ladder for Grok — mirror of VEO's `withRecaptcha`
+ * behaviour (minus the reCAPTCHA ceremony, which Grok doesn't use).
+ *
+ * Attempt 1: run as-is with whatever headers `ensureGrokReady` returned.
+ * Attempt 2 (only if err is unauthenticated): force a statsig refresh
+ *   (`autoDiscoverStatsig({ force: true })`), reload `/imagine`, retry.
+ * Attempt 3+ give up with the final error so the caller's own
+ *   transient-retry loop (or the session-error dialog) takes over.
+ *
+ * `ensureReady` is passed in so each call site can reuse the page/
+ * statsig handle between attempts instead of re-deriving them every
+ * iteration.
+ */
+async function withGrokAuthRetry<T>(
+  profileName: string | undefined,
+  fn: (ctx: { page: import("playwright").Page; statsig: GrokHeaders }) => Promise<T>,
+  opts?: { maxAttempts?: number; label?: string },
+): Promise<T> {
+  const maxAttempts = opts?.maxAttempts ?? 2;
+  const label = opts?.label || "grok.call";
+  let ctx = await ensureGrokReady(profileName);
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn(ctx);
+    } catch (err) {
+      const isAuth = isGrokUnauthenticated(err);
+      if (!isAuth || attempt >= maxAttempts) throw err;
+      sessionTelemetry.record({
+        target: "grok",
+        kind: "retry_401",
+        detail: `${label} attempt=${attempt} ${err instanceof Error ? err.message.slice(0, 120) : ""}`,
+      });
+      // Force-refresh statsig; the page may already be on /imagine, but we
+      // navigate again to replay the request listener that captures the new
+      // header. Failure here falls through and the next attempt will retry
+      // with the old context.
+      try {
+        const collector = await getGrokCollector(profileName || GROK_PROFILE_NAME);
+        await collector.autoDiscoverStatsig({ force: true });
+        ctx = await ensureGrokReady(profileName);
+      } catch (refreshErr) {
+        // If refresh itself throws auth too, don't loop forever — surface
+        // the ORIGINAL error so the classifier sees "401" not "refresh failed".
+        if (isGrokUnauthenticated(refreshErr)) throw err;
+        throw refreshErr;
+      }
+    }
+  }
+  // unreachable — the loop always returns or throws
+  throw new Error(`${label}: exhausted auth retries`);
 }
 
 /**
@@ -97,6 +187,64 @@ function isGrokTransientBackendError(convoError?: string | null): boolean {
   );
 }
 
+/**
+ * Pre-flight: confirm Chrome still has a login cookie for grok.com.
+ *
+ * Without this, a logged-out profile would silently limp along —
+ * `autoDiscoverStatsig` may still capture a header from the anonymous
+ * landing page, but every subsequent POST returns 401, which looked to
+ * the user like "Grok is broken again". Now we throw a Grok-classified
+ * error BEFORE the HTTP call, so the session-error dialog fires
+ * immediately.
+ *
+ * Tolerant of cookie naming drift: Grok has used `sso`, `sso-rw`, and
+ * more recently split auth across several cookies; any reasonably-sized
+ * cookie on the domain counts as "logged in" for this quick gate.
+ */
+async function verifyGrokSessionCookie(page: import("playwright").Page): Promise<void> {
+  let cookies: Array<{ name: string; value: string }>;
+  try {
+    cookies = await page
+      .context()
+      .cookies(["https://grok.com", "https://www.grok.com"]);
+  } catch {
+    return; // if cookie read itself fails, downstream auth retry will catch it
+  }
+  if (!cookies.length) {
+    sessionTelemetry.record({
+      target: "grok",
+      kind: "preflight_fail",
+      detail: "no cookies for grok.com",
+    });
+    throw new Error(
+      "Grok session: Chrome Grok chưa login (không tìm thấy cookie của grok.com). Hãy mở Chrome Grok và đăng nhập Super Grok Heavy trước khi chạy.",
+    );
+  }
+  const hasAuthish = cookies.some((c) => {
+    const n = c.name.toLowerCase();
+    if (!c.value || c.value.length < 8) return false;
+    return (
+      n === "sso" ||
+      n === "sso-rw" ||
+      n.startsWith("sso") ||
+      n.startsWith("auth") ||
+      n.includes("session") ||
+      n.includes("token")
+    );
+  });
+  if (!hasAuthish) {
+    const names = cookies.map((c) => c.name).join(",");
+    sessionTelemetry.record({
+      target: "grok",
+      kind: "preflight_fail",
+      detail: `no auth-ish cookie (have: ${names.slice(0, 120)})`,
+    });
+    throw new Error(
+      "Grok session: Chrome Grok không có cookie đăng nhập (có thể đã bị logout hoặc cookie hết hạn). Mở lại grok.com và login lại.",
+    );
+  }
+}
+
 async function ensureGrokReady(profileName?: string) {
   return timedSpan("grok.ensureReady", async () => {
     const name = profileName || GROK_PROFILE_NAME;
@@ -121,11 +269,35 @@ async function ensureGrokReady(profileName?: string) {
       throw new Error(`Không thể navigate tới grok.com: ${err instanceof Error ? err.message : err}`);
     }
 
-    const statsig = await withTimeout(
-      collector.autoDiscoverStatsig(),
-      20_000,
-      "Grok statsig discovery",
-    );
+    // Fast-fail if the profile is logged out — surfaces a clear "mở Chrome
+    // Grok và login" message instead of a cryptic 401 downstream.
+    await Promise.race([
+      verifyGrokSessionCookie(page),
+      new Promise<void>((resolve) => setTimeout(resolve, 5_000)),
+    ]);
+
+    const statsigStarted = Date.now();
+    let statsig: GrokHeaders;
+    try {
+      statsig = await withTimeout(
+        collector.autoDiscoverStatsig(),
+        20_000,
+        "Grok statsig discovery",
+      );
+      sessionTelemetry.record({
+        target: "grok",
+        kind: "collect_ok",
+        durationMs: Date.now() - statsigStarted,
+      });
+    } catch (err) {
+      sessionTelemetry.record({
+        target: "grok",
+        kind: "collect_fail",
+        durationMs: Date.now() - statsigStarted,
+        detail: err instanceof Error ? err.message.slice(0, 180) : String(err).slice(0, 180),
+      });
+      throw err;
+    }
     return { page, statsig };
   });
 }
@@ -135,27 +307,21 @@ const GROK_TRANSIENT_MAX_ATTEMPTS = 3;
 export async function grokT2V(
   opts: Omit<GrokT2VOptions, "statsigHeaders"> & { profileName?: string }
 ): Promise<GrokT2VResult> {
-  type ReadyCtx = Awaited<ReturnType<typeof ensureGrokReady>>;
-  let page: ReadyCtx["page"];
-  let statsig: ReadyCtx["statsig"];
-  try {
-    ({ page, statsig } = await ensureGrokReady(opts.profileName));
-  } catch (err) {
-    resetGrokCollector();
-    throw err;
-  }
-
-  const runOnce = (p: ReadyCtx["page"], s: ReadyCtx["statsig"]) =>
-    timedSpan("grok.api.t2v", () => grokTextToVideo(p, { ...opts, statsigHeaders: s }));
+  const runOnceUnderAuth = () =>
+    withGrokAuthRetry(
+      opts.profileName,
+      ({ page, statsig }) =>
+        timedSpan("grok.api.t2v", () => grokTextToVideo(page, { ...opts, statsigHeaders: statsig })),
+      { label: "grok.t2v" },
+    );
 
   let lastResult: GrokT2VResult | null = null;
   for (let attempt = 1; attempt <= GROK_TRANSIENT_MAX_ATTEMPTS; attempt++) {
     try {
-      const result = await runOnce(page, statsig);
+      const result = await runOnceUnderAuth();
       if (result.mediaUrl) return result;
-      // 200 but no mediaUrl: if Grok backend hiccup (upsampler/internal)
-      // retry with a small backoff; otherwise return as-is so the
-      // caller can surface the specific rejection reason.
+      // 200 but no mediaUrl — Grok backend blip; retry a couple of times
+      // with fresh page/statsig. Policy refusals fall through unchanged.
       lastResult = result;
       if (!isGrokTransientBackendError(result.convoError) || attempt === GROK_TRANSIENT_MAX_ATTEMPTS) {
         return result;
@@ -163,35 +329,26 @@ export async function grokT2V(
       const delayMs = 4000 + Math.floor(Math.random() * 3000) * attempt;
       opts.onProgress?.({ progress: 0, videoUrl: null, parentPostId: result.parentPostId });
       await new Promise((r) => setTimeout(r, delayMs));
-      // Refresh the page/statsig before retrying — some upsampler
-      // failures correlate with a stale statsig token.
-      try {
-        ({ page, statsig } = await ensureGrokReady(opts.profileName));
-      } catch {
-        // keep old page/statsig; next attempt will try with what we have
-      }
       continue;
     } catch (err) {
-      // A tab dying mid-call should not require a full Chrome restart —
-      // the browser + login are still good. Swap in a fresh page from the
-      // same context and retry once. Only fall back to resetGrokCollector
-      // if that retry also fails (or if the failure is not page-related).
+      // Page/tab died but Chrome is alive — withGrokAuthRetry already
+      // refreshes the page on auth errors; a plain page-closed from a
+      // crashed renderer just needs another ensureGrokReady.
       if (isPageClosedError(err) && attempt < GROK_TRANSIENT_MAX_ATTEMPTS) {
         try {
-          ({ page, statsig } = await ensureGrokReady(opts.profileName));
+          await ensureGrokReady(opts.profileName);
           continue;
         } catch (retryErr) {
-          resetGrokCollector();
+          resetGrokIfCdpDead(retryErr, null);
           throw retryErr;
         }
       }
-      if (err instanceof Error && /timeout|not ready|login|session|disconnect/i.test(err.message)) {
-        resetGrokCollector();
-      }
+      // Only reset the singleton when CDP is actually dead — transient
+      // 401/timeout no longer nukes the Chrome connection.
+      resetGrokIfCdpDead(err, null);
       throw err;
     }
   }
-  // Shouldn't reach here, but just in case:
   return lastResult as GrokT2VResult;
 }
 
@@ -200,8 +357,7 @@ export async function grokI2V(
     profileName?: string;
   },
 ) {
-  const runPipeline = async (page: import("playwright").Page, statsig: import("../../tokens/grokTokenCollector").GrokHeaders) => {
-    // Pipeline step 2: create the image post from fileUri before calling convo.
+  const runPipeline = async (page: import("playwright").Page, statsig: GrokHeaders) => {
     const rawUri = (opts.fileUri || "").trim();
     const assetUrl = rawUri.startsWith("http")
       ? rawUri
@@ -220,54 +376,37 @@ export async function grokI2V(
     );
   };
 
-  type ReadyCtx = Awaited<ReturnType<typeof ensureGrokReady>>;
-  let page: ReadyCtx["page"];
-  let statsig: ReadyCtx["statsig"];
-  try {
-    ({ page, statsig } = await ensureGrokReady(opts.profileName));
-  } catch (err) {
-    resetGrokCollector();
-    throw err;
-  }
+  const runOnceUnderAuth = () =>
+    withGrokAuthRetry(
+      opts.profileName,
+      ({ page, statsig }) => runPipeline(page, statsig),
+      { label: "grok.i2v" },
+    );
 
   let lastResult: Awaited<ReturnType<typeof runPipeline>> | null = null;
   for (let attempt = 1; attempt <= GROK_TRANSIENT_MAX_ATTEMPTS; attempt++) {
     try {
-      const result = await runPipeline(page, statsig);
+      const result = await runOnceUnderAuth();
       if (result.mediaUrl) return result;
       lastResult = result;
-      // Transient Grok backend (e.g. "I2V Video prompt upsampling
-      // failed: Upsampler returned empty response") — retry with a
-      // fresh page + statsig. Policy rejections are NOT retried; see
-      // isGrokTransientBackendError for the exclusion list.
       if (!isGrokTransientBackendError(result.convoError) || attempt === GROK_TRANSIENT_MAX_ATTEMPTS) {
         return result;
       }
       const delayMs = 4000 + Math.floor(Math.random() * 3000) * attempt;
       opts.onProgress?.({ progress: 0, videoUrl: null, parentPostId: null });
       await new Promise((r) => setTimeout(r, delayMs));
-      try {
-        ({ page, statsig } = await ensureGrokReady(opts.profileName));
-      } catch {
-        // keep old page/statsig; next attempt uses what we have
-      }
       continue;
     } catch (err) {
-      // Same page-stale recovery as grokT2V — preserve the Chrome login,
-      // grab a fresh page, retry once. Matches the symptom "trang Grok
-      // vẫn còn mở nhưng page.evaluate báo Target closed".
       if (isPageClosedError(err) && attempt < GROK_TRANSIENT_MAX_ATTEMPTS) {
         try {
-          ({ page, statsig } = await ensureGrokReady(opts.profileName));
+          await ensureGrokReady(opts.profileName);
           continue;
         } catch (retryErr) {
-          resetGrokCollector();
+          resetGrokIfCdpDead(retryErr, null);
           throw retryErr;
         }
       }
-      if (err instanceof Error && /timeout|not ready|login|session|disconnect/i.test(err.message)) {
-        resetGrokCollector();
-      }
+      resetGrokIfCdpDead(err, null);
       throw err;
     }
   }
@@ -280,24 +419,41 @@ export async function grokUpload(opts: {
   mimeType: string;
   profileName?: string;
 }) {
-  const once = async () => {
-    const { page, statsig } = await ensureGrokReady(opts.profileName);
-    return timedSpan("grok.api.upload", () =>
-      grokUploadImage(page, { ...opts, statsigHeaders: statsig })
-    );
-  };
   try {
-    return await once();
+    return await withGrokAuthRetry(
+      opts.profileName,
+      ({ page, statsig }) =>
+        timedSpan("grok.api.upload", () =>
+          grokUploadImage(page, { ...opts, statsigHeaders: statsig }),
+        ),
+      { label: "grok.upload" },
+    );
   } catch (err) {
-    if (isPageClosedError(err)) return await once();
+    // Transient tab-closed failure — rebuild ready context and retry once.
+    // Auth failures are already handled inside withGrokAuthRetry.
+    if (isPageClosedError(err)) {
+      return await withGrokAuthRetry(
+        opts.profileName,
+        ({ page, statsig }) =>
+          timedSpan("grok.api.upload.retry", () =>
+            grokUploadImage(page, { ...opts, statsigHeaders: statsig }),
+          ),
+        { label: "grok.upload.retry", maxAttempts: 1 },
+      );
+    }
+    resetGrokIfCdpDead(err, null);
     throw err;
   }
 }
 
 export async function grokUpscaleVideo(opts: { videoId: string; profileName?: string }) {
-  const { page, statsig } = await ensureGrokReady(opts.profileName);
-  return timedSpan("grok.api.upscale", () =>
-    grokUpscale(page, { videoId: opts.videoId, statsigHeaders: statsig })
+  return withGrokAuthRetry(
+    opts.profileName,
+    ({ page, statsig }) =>
+      timedSpan("grok.api.upscale", () =>
+        grokUpscale(page, { videoId: opts.videoId, statsigHeaders: statsig }),
+      ),
+    { label: "grok.upscale" },
   );
 }
 

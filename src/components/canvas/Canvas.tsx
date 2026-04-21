@@ -16,10 +16,11 @@ import { useShallow } from "zustand/react/shallow";
 import { useWorkflowStore } from "@/state/workflowStore";
 import type { NodeKind } from "@/lib/nodes";
 
+import FrameNode from "./FrameNode";
 import QuickAddMenu from "./QuickAddMenu";
 import WSNode from "./WSNode";
 
-const nodeTypes: NodeTypes = { wsNode: WSNode };
+const nodeTypes: NodeTypes = { wsNode: WSNode, frame: FrameNode };
 
 export default function Canvas() {
   return (
@@ -37,8 +38,7 @@ function Inner() {
   const edges = useWorkflowStore((s) => s.edges);
   const canvasTool = useWorkflowStore((s) => s.canvasTool);
   const showMinimap = useWorkflowStore((s) => s.showMinimap);
-  const showPalette = useWorkflowStore((s) => s.showPalette);
-  const { onNodesChange, onEdgesChange, onConnect, addNode, selectNode, setCanvasTool, togglePalette, toggleMinimap } =
+  const { onNodesChange, onEdgesChange, onConnect, addNode, selectNode, setCanvasTool, toggleMinimap } =
     useWorkflowStore(
       useShallow((s) => ({
         onNodesChange: s.onNodesChange,
@@ -47,7 +47,6 @@ function Inner() {
         addNode: s.addNode,
         selectNode: s.selectNode,
         setCanvasTool: s.setCanvasTool,
-        togglePalette: s.togglePalette,
         toggleMinimap: s.toggleMinimap,
       })),
     );
@@ -158,9 +157,16 @@ function Inner() {
           addNode("gen.video", pos);
           break;
         }
-        case "p":
-          togglePalette();
+        case "f": {
+          // Drop the Frame centred on the viewport so it's immediately visible
+          // and wraps whatever the user is currently looking at.
+          const centre = screenToFlowPosition({
+            x: window.innerWidth / 2 - 300,
+            y: window.innerHeight / 2 - 200,
+          });
+          addNode("frame", centre);
           break;
+        }
         case "l":
           toggleMinimap();
           break;
@@ -169,7 +175,7 @@ function Inner() {
 
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [addNode, setCanvasTool, togglePalette, toggleMinimap, screenToFlowPosition]);
+  }, [addNode, setCanvasTool, toggleMinimap, screenToFlowPosition]);
 
   // Clear any pending drag-guard timer on unmount to avoid a stale ref write
   // into a detached component.
@@ -230,7 +236,7 @@ function Inner() {
   return (
     <div
       ref={wrapperRef}
-      className={`absolute inset-0 pt-12 transition-all duration-200 ${showPalette ? "pr-80" : "pr-0"} ${isPan ? "cursor-grab active:cursor-grabbing" : ""}`}
+      className={`absolute inset-0 pt-12 ${isPan ? "cursor-grab active:cursor-grabbing" : ""}`}
       onDrop={onDrop}
       onDragOver={onDragOver}
     >
@@ -295,7 +301,7 @@ function Inner() {
         panOnScroll={false}
         zoomOnScroll={true}
       >
-        <Background variant={BackgroundVariant.Dots} gap={24} size={1} color="#26262a" />
+        <Background variant={BackgroundVariant.Dots} gap={22} size={1.6} color="#3a3a44" />
         {showMinimap && (
           <MiniMap
             pannable

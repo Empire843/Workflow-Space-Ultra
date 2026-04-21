@@ -5,6 +5,7 @@ import type { Browser, BrowserContext, Page } from "playwright";
 
 import { DATA_GENERAL_DIR, VEO_CDP_HOST, VEO_FLOW_URL, RECAPTCHA_SITE_KEY, ensureDirs } from "../config";
 import { openVeoChrome } from "../chrome/veoChromeManager";
+import { sessionTelemetry } from "./sessionTelemetry";
 
 /**
  * Port of A_workflow_get_token.py (TokenCollector).
@@ -163,6 +164,11 @@ export class VeoTokenCollector {
     // to getVeoCollector() will spin up a fresh collector + reclaim tabs.
     this.browser.on("disconnected", () => {
       console.warn("[VEO] Browser disconnected — invalidating singleton");
+      sessionTelemetry.record({
+        target: "veo",
+        kind: "reset_collector",
+        detail: "browser disconnected",
+      });
       const store = getStore();
       if (store.instance === this) {
         store.instance = null;
@@ -528,6 +534,7 @@ export class VeoTokenCollector {
     if (!force) {
       const cached = loadCachedVeoAuth();
       if (cached) {
+        sessionTelemetry.record({ target: "veo", kind: "cache_hit" });
         this.captureState = {
           sessionId: cached.sessionId,
           projectId: cached.projectId,
@@ -537,6 +544,10 @@ export class VeoTokenCollector {
         await this.ensureOnFlow(cached.projectId);
         return cached;
       }
+      // Cache miss here usually means the TTL tripped inside
+      // loadCachedVeoAuth — record it so the debug endpoint shows that the
+      // silent refresh happened here and not at a 401 downstream.
+      sessionTelemetry.record({ target: "veo", kind: "cache_stale" });
     }
 
     // Only navigate to the Flow homepage if we aren't already on a Flow page.
@@ -656,6 +667,7 @@ export class VeoTokenCollector {
    * After calling, `collectAuth({ force: true })` will reload the page and capture a fresh token.
    */
   invalidateAuth(): void {
+    sessionTelemetry.record({ target: "veo", kind: "invalidate" });
     try {
       const { unlinkSync } = require("node:fs") as typeof import("node:fs");
       if (existsSync(TOKENS_CACHE_FILE)) unlinkSync(TOKENS_CACHE_FILE);
