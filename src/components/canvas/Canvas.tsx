@@ -298,8 +298,7 @@ function Inner() {
         panOnDrag={isPan ? true : [1, 2]}
         selectionOnDrag={!isPan}
         nodesDraggable={!isPan}
-        panOnScroll={false}
-        zoomOnScroll={true}
+        panOnScroll={true}
       >
         <Background variant={BackgroundVariant.Dots} gap={22} size={1.6} color="#3a3a44" />
         {showMinimap && (
