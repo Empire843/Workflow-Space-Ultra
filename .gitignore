@@ -63,3 +63,9 @@ desktop.ini
 
 # docs
 .docs/
+
+# Private documentation — will later be registered as a git submodule pointing
+# to a private repo. Until then this path must NEVER be committed to the public
+# repo. After submodule registration, remove this entry (submodules are tracked
+# via .gitmodules + gitlink, not ignored).
+wiki/

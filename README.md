@@ -116,7 +116,7 @@ before.
 
 ### Grok content moderation — `hallucinatedSuccess` failure mode
 
-Grok I2V/T2V đôi khi trả `HTTP 200` không kèm video và **không có flag reject rõ ràng** (text model nói "I generated a video…" nhưng không thực sự gọi `videoGen`). Executor phát hiện pattern này qua `sawSvr=false` + template match, dừng retry, và in hint kèm **danh sách trigger cụ thể tìm thấy trong prompt**. Chi tiết + recipe debug + khi nào nên swap sang Veo: [`docs/GROK_MODERATION.md`](docs/GROK_MODERATION.md).
+Grok I2V/T2V đôi khi trả `HTTP 200` không kèm video và **không có flag reject rõ ràng** (text model nói "I generated a video…" nhưng không thực sự gọi `videoGen`). Executor phát hiện pattern này qua `sawSvr=false` + template match, dừng retry, và in hint kèm **danh sách trigger cụ thể tìm thấy trong prompt**. Chi tiết + recipe debug + khi nào nên swap sang Veo: [`wiki/features/grok-moderation.md`](wiki/features/grok-moderation.md).
 
 ### Debugging undocumented VEO endpoints
 
@@ -130,9 +130,10 @@ Then perform the action in the labs.google tab that the tool keeps open (upload 
 
 ## MCP server (Cursor / Claude Desktop / ChatGPT / Antigravity integration)
 
-> **Full reference**: see [`docs/MCP.md`](docs/MCP.md) for the complete
+> **Full reference**: see [`wiki/reference/mcp.md`](wiki/reference/mcp.md) for the complete
 > architecture, tool catalog, resource schema, security model, Antigravity
 > setup, and troubleshooting guide. The section below is the quickstart only.
+> For AI-agent-oriented usage patterns and workflow templates, see [`wiki/agents/`](wiki/agents/).
 
 Workflow Space Ultra ships an optional **MCP (Model Context Protocol)** surface
 so any MCP-aware AI host can trigger VEO / Grok generation, inspect the job
@@ -237,6 +238,29 @@ the `wsu://…/assets/…` resource — no separate download step needed.
   workflow once in the UI, `get_workflow` returns "no snapshot".
 - The MCP server reuses the canvas's queue + lanes — firing a generation tool
   while the UI is busy will queue up behind UI jobs (and vice versa).
+
+## Documentation
+
+> The detailed documentation lives in a **private git submodule** mounted at [`wiki/`](wiki/). It is not included in this public repository. Contributors with access can initialise it with `git submodule update --init --recursive`; without access the links below will be empty locally.
+
+Structure (available after initialising the submodule):
+
+| Section | Contents |
+| --- | --- |
+| [`wiki/architecture/`](wiki/architecture/) | System overview, auth & tokens, providers (VEO, Grok), canvas & state, queue & lanes, MCP architecture |
+| [`wiki/features/`](wiki/features/) | Per-feature deep dives — cascading-run, text-chain, multi-workflow, undo/redo, quick-add-menu, Grok moderation, session-error dialog |
+| [`wiki/reference/`](wiki/reference/) | MCP full reference, env vars, API routes, node catalog, file layout |
+| [`wiki/operations/`](wiki/operations/) | Benchmarks (`npm run bench`), debugging VEO payload capture |
+| [`wiki/plans/`](wiki/plans/) | Active/archived design plans (refactor-parallel, grok-image, text-chain) |
+| [`wiki/agents/`](wiki/agents/) | Primer + workflow templates for AI agents using MCP |
+| [`wiki/history/`](wiki/history/) | Master plan history + original requirements log |
+
+Recommended starting points:
+
+- **New user / just want to run it** — finish this README, then skim [`wiki/features/`](wiki/features/).
+- **Developer** — [`wiki/architecture/overview.md`](wiki/architecture/overview.md) → the specific architecture file for the area you touch.
+- **AI agent via MCP** — [`wiki/agents/README.md`](wiki/agents/README.md) + [`wiki/reference/mcp.md`](wiki/reference/mcp.md).
+- **Debug a failed run** — [`wiki/operations/debugging-veo.md`](wiki/operations/debugging-veo.md) + [`wiki/features/grok-moderation.md`](wiki/features/grok-moderation.md).
 
 ## License
 
