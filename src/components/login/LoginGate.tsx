@@ -7,9 +7,23 @@ import { cn } from "@/lib/utils";
 
 type StepState = "idle" | "loading" | "ok" | "error";
 
+type AuthStatusKind = "fresh" | "stale" | "expired";
+
 interface AuthStatus {
-  veo: { ok: boolean; updatedAt: string | null; projectId: string | null };
-  grok: { ok: boolean; profileName: string; updatedAt: string | null };
+  veo: {
+    ok: boolean;
+    status: AuthStatusKind;
+    updatedAt: string | null;
+    projectId: string | null;
+    chromeConnected: boolean;
+  };
+  grok: {
+    ok: boolean;
+    status: AuthStatusKind;
+    profileName: string;
+    updatedAt: string | null;
+    chromeConnected: boolean;
+  };
 }
 
 function Badge({ ok }: { ok: boolean }) {
@@ -173,6 +187,16 @@ export default function LoginGate({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     refresh();
+  }, [refresh]);
+
+  // Background poll every 60s so the tri-state health flips on its own —
+  // without this the gate happily showed "Đã login" for hours after the
+  // tokens expired, only failing when the user actually clicked Run.
+  useEffect(() => {
+    const id = setInterval(() => {
+      refresh();
+    }, 60_000);
+    return () => clearInterval(id);
   }, [refresh]);
 
   const openChrome = useCallback(

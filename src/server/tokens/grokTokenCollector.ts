@@ -5,6 +5,7 @@ import type { Browser, BrowserContext, Page } from "playwright";
 
 import { DATA_GENERAL_DIR, GROK_CDP_HOST, GROK_URL, ensureDirs } from "../config";
 import { openGrokChrome } from "../chrome/grokChromeManager";
+import { sessionTelemetry } from "./sessionTelemetry";
 
 /**
  * Port of grok_api_text_to_video.auto_discover_statsig_headers.
@@ -71,10 +72,44 @@ export class GrokTokenCollector {
     this.profileName = profileName;
   }
 
+  /**
+   * Lightweight liveness check for the singleton — returns false when the
+   * user has closed the Chrome window (CDP disconnected) so the caller can
+   * reinit instead of blowing up on the next newPage() call.
+   *
+   * Note: this deliberately does NOT inspect `this.page`. A single tab can
+   * die (user closed it, Chrome crashed the renderer, navigation dropped
+   * the target) while the browser + context are still healthy; in that
+   * case we want to swap the page handle in-place instead of tearing down
+   * the whole CDP session. See `getLivePage()` for that path.
+   */
+  isAlive(): boolean {
+    try {
+      return !!(this.browser && this.browser.isConnected() && this.context);
+    } catch {
+      return false;
+    }
+  }
+
   async init() {
     const handle = await openGrokChrome({ profileName: this.profileName });
     const { chromium } = await import("playwright");
     this.browser = await chromium.connectOverCDP(`http://${GROK_CDP_HOST}:${handle.port}`);
+
+    this.browser.on("disconnected", () => {
+      console.warn("[Grok] Browser disconnected — invalidating singleton");
+      sessionTelemetry.record({
+        target: "grok",
+        kind: "reset_collector",
+        detail: "browser disconnected",
+      });
+      const store = getGrokStore();
+      if (store.instance === this) {
+        store.instance = null;
+        store.initPromise = null;
+      }
+    });
+
     const contexts = this.browser.contexts();
     this.context = contexts[0] || (await this.browser.newContext());
     const pages = this.context.pages();
@@ -97,15 +132,71 @@ export class GrokTokenCollector {
     return this.page;
   }
 
+  /**
+   * Return a Page handle that is guaranteed to be `!isClosed()` at the
+   * moment of the call. If the cached `this.page` died (e.g. user closed
+   * that specific tab, a navigation dropped the target, or the renderer
+   * crashed), pick the next best Grok tab from the same browser context,
+   * or open a fresh one. This is the single entry point every external
+   * caller should use before `page.evaluate(...)` or `page.goto(...)`.
+   *
+   * Root cause this fixes: the symptom
+   *   "page.evaluate: Target page, context or browser has been closed"
+   * while the Grok window is still visibly open — the user just happened
+   * to close the tab we cached at `init()`. Without this recovery, every
+   * subsequent i2v / t2v would fail even though Chrome + the login are
+   * fine; the user had to restart the dev server to clear the handle.
+   */
+  async getLivePage(): Promise<Page> {
+    if (!this.browser || !this.context) {
+      throw new Error("Grok collector chưa init");
+    }
+    const page = this.page;
+    if (page && !page.isClosed()) return page;
+
+    // Prefer an existing grok.com tab so we reuse the user's live
+    // session/cookies instead of opening yet another window.
+    const pages = this.context.pages();
+    const grokPage = pages.find((p) => {
+      try {
+        return !p.isClosed() && /grok\.com/i.test(p.url());
+      } catch {
+        return false;
+      }
+    });
+    if (grokPage) {
+      console.warn(
+        "[Grok] Cached page was stale — reclaiming existing Grok tab: " +
+          grokPage.url(),
+      );
+      this.page = grokPage;
+      return grokPage;
+    }
+
+    // No existing Grok tab → open a fresh one. autoDiscoverStatsig() or
+    // the caller's `ensureGrokReady` will navigate it to /imagine as part
+    // of the normal prep step.
+    console.warn("[Grok] Cached page was stale — opening a new tab");
+    const fresh = await this.context.newPage();
+    this.page = fresh;
+    return fresh;
+  }
+
   async autoDiscoverStatsig(opts?: { force?: boolean; persist?: boolean }): Promise<GrokHeaders> {
     const { force = false, persist = true } = opts || {};
 
     if (!force) {
       const cached = getCachedGrokHeaders(this.profileName);
-      if (cached) return cached;
+      if (cached) {
+        sessionTelemetry.record({ target: "grok", kind: "cache_hit" });
+        return cached;
+      }
+      sessionTelemetry.record({ target: "grok", kind: "cache_stale" });
     }
 
-    if (!this.page) throw new Error("Grok page not ready");
+    // Use a live page handle — not `this.page` directly — so we don't
+    // trip over a closed tab when the user killed the one we cached.
+    const page = await this.getLivePage();
 
     const statsigPromise = new Promise<string>((resolve) => {
       const handler = (req: { headers(): Record<string, string> }) => {
@@ -113,18 +204,18 @@ export class GrokTokenCollector {
           const h = req.headers();
           const v = h["x-statsig-id"];
           if (v) {
-            this.page?.off("request", handler);
+            page.off("request", handler);
             resolve(v);
           }
         } catch {
           // ignore
         }
       };
-      this.page?.on("request", handler);
+      page.on("request", handler);
     });
 
     try {
-      await this.page.goto(`${GROK_URL.replace(/\/$/, "")}/imagine`, {
+      await page.goto(`${GROK_URL.replace(/\/$/, "")}/imagine`, {
         waitUntil: "domcontentloaded",
         timeout: 20_000,
       });
@@ -144,7 +235,7 @@ export class GrokTokenCollector {
 
     if (!statsig) {
       try {
-        statsig = await this.page.evaluate(() => {
+        statsig = await page.evaluate(() => {
           try {
             return localStorage.getItem("x-statsig-id");
           } catch {
@@ -174,30 +265,98 @@ export class GrokTokenCollector {
   }
 }
 
-let _singleton: GrokTokenCollector | null = null;
-let _initPromise: Promise<GrokTokenCollector> | null = null;
+// Stash on globalThis so the instance survives Next.js dev-mode HMR reloads
+// (otherwise every code change would drop the reference and the next call
+// would reconnect + spawn a duplicate Grok tab).
+type GrokSingletonStore = {
+  instance: GrokTokenCollector | null;
+  initPromise: Promise<GrokTokenCollector> | null;
+};
+const GROK_GLOBAL_KEY = "__grokTokenCollectorSingleton__";
+function getGrokStore(): GrokSingletonStore {
+  const g = globalThis as unknown as Record<string, GrokSingletonStore | undefined>;
+  if (!g[GROK_GLOBAL_KEY]) g[GROK_GLOBAL_KEY] = { instance: null, initPromise: null };
+  return g[GROK_GLOBAL_KEY]!;
+}
+
+/**
+ * Same rationale as VEO's dropStaleInstance — see that file for the full
+ * explanation. Summary: an `instanceof` check against the *current* class
+ * catches stale HMR prototypes in one principled step, while `isAlive()`
+ * catches the legitimate "user closed Chrome while idle" case. Either
+ * failure triggers a full reinit, not a per-method workaround.
+ */
+async function dropStaleGrokInstance(store: GrokSingletonStore): Promise<void> {
+  const inst = store.instance;
+  if (!inst) return;
+  const isCurrentClass = inst instanceof GrokTokenCollector;
+  const alive = isCurrentClass ? safeGrokIsAlive(inst) : false;
+  if (isCurrentClass && alive) return;
+  console.warn(
+    `[Grok] Dropping cached collector (currentClass=${isCurrentClass}, alive=${alive}) — reinitialising`,
+  );
+  try {
+    const closer = (inst as { close?: () => Promise<void> }).close;
+    if (typeof closer === "function") await closer.call(inst);
+  } catch {
+    // ignore
+  }
+  store.instance = null;
+  store.initPromise = null;
+}
+
+function safeGrokIsAlive(inst: GrokTokenCollector): boolean {
+  try {
+    return inst.isAlive();
+  } catch {
+    return false;
+  }
+}
 
 export async function getGrokCollector(profileName: string): Promise<GrokTokenCollector> {
-  if (_singleton && _singleton.profileName === profileName) return _singleton;
-  if (_initPromise) return _initPromise;
-  _initPromise = (async () => {
-    if (_singleton) await _singleton.close().catch(() => undefined);
+  const store = getGrokStore();
+  await dropStaleGrokInstance(store);
+  if (store.instance && store.instance.profileName === profileName) return store.instance;
+  // Profile changed — close the previous instance cleanly before starting
+  // a new one so we don't leak the CDP connection.
+  if (store.instance && store.instance.profileName !== profileName) {
+    try { await store.instance.close(); } catch { /* ignore */ }
+    store.instance = null;
+    store.initPromise = null;
+  }
+  if (store.initPromise) {
+    try {
+      const pending = await store.initPromise;
+      if (
+        pending instanceof GrokTokenCollector &&
+        pending.profileName === profileName &&
+        safeGrokIsAlive(pending)
+      ) {
+        return pending;
+      }
+    } catch {
+      // fall through
+    }
+    await dropStaleGrokInstance(store);
+  }
+  store.initPromise = (async () => {
     const inst = new GrokTokenCollector(profileName);
     try {
       await inst.init();
-      _singleton = inst;
+      store.instance = inst;
       return inst;
     } finally {
-      _initPromise = null;
+      store.initPromise = null;
     }
   })();
-  return _initPromise;
+  return store.initPromise;
 }
 
 export function resetGrokCollector() {
-  if (_singleton) {
-    _singleton.close().catch(() => undefined);
-    _singleton = null;
+  const store = getGrokStore();
+  if (store.instance) {
+    store.instance.close().catch(() => undefined);
+    store.instance = null;
   }
-  _initPromise = null;
+  store.initPromise = null;
 }

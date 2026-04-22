@@ -2,6 +2,8 @@ import { EventEmitter } from "node:events";
 
 import type { NodeDataBase, NodeKind } from "@/lib/nodes";
 
+import { logError } from "./telemetry/errorLog";
+
 /**
  * In-memory job queue + event bus for SSE.
  * Scope: the Next.js dev/prod server process. For Next dev, keep a singleton via globalThis.
@@ -104,8 +106,24 @@ export function setJobOutput(id: string, output: NodeDataBase) {
 }
 
 export function setJobError(id: string, error: string) {
+  const job = getState().jobs.get(id);
   updateJob(id, { status: "error", error, finishedAt: Date.now() });
   emit({ type: "error", jobId: id, error, timestamp: Date.now() });
+  // Dedicated error log: every job-level error flows through here, so this
+  // is the single hook that guarantees nothing slips through. Extra fields
+  // tie the error back to the specific node + run on disk.
+  logError({
+    context: "job.error",
+    error,
+    extra: {
+      jobId: id,
+      nodeId: job?.nodeId,
+      kind: job?.kind,
+      workflowRunId: job?.workflowRunId,
+      startedAt: job?.startedAt,
+      durationMs: job?.startedAt ? Date.now() - job.startedAt : undefined,
+    },
+  });
 }
 
 export function requestCancel(id: string) {
@@ -117,9 +135,84 @@ export function getJob(id: string): JobRecord | null {
   return getState().jobs.get(id) || null;
 }
 
+/**
+ * Return every job currently tracked by the queue, newest first.
+ * Used by `GET /api/queue` to power the client-side Queue panel.
+ */
+export function listJobs(): JobRecord[] {
+  const state = getState();
+  return Array.from(state.jobs.values()).sort((a, b) => b.createdAt - a.createdAt);
+}
+
+/**
+ * Drop jobs that are in a terminal state (done / error / cancelled).
+ * Emits a "log" event so any open SSE stream sees a clean shutdown.
+ */
+export function clearFinishedJobs(): number {
+  const state = getState();
+  let removed = 0;
+  for (const [id, rec] of state.jobs) {
+    if (rec.status === "done" || rec.status === "error" || rec.status === "cancelled") {
+      state.jobs.delete(id);
+      removed++;
+    }
+  }
+  return removed;
+}
+
+/**
+ * Mark every non-terminal job as cancel-requested. The executor checks this
+ * flag at key points and aborts. Also emits a "cancelled" status for jobs that
+ * are still "queued" (never entered a lane) so the client can clean up.
+ */
+export function cancelAllActiveJobs(): number {
+  const state = getState();
+  let cancelled = 0;
+  for (const rec of state.jobs.values()) {
+    if (rec.status === "queued" || rec.status === "running") {
+      rec.cancelRequested = true;
+      if (rec.status === "queued") {
+        setJobStatus(rec.id, "cancelled", { error: "Cancelled by user" });
+      } else {
+        emit({ type: "log", jobId: rec.id, log: "Cancel requested", timestamp: Date.now() });
+      }
+      cancelled++;
+    }
+  }
+  return cancelled;
+}
+
+/**
+ * emit() forwards an event to both the global stream and the per-job
+ * subscribers. A single buggy listener must NOT break the others, so every
+ * handler runs inside its own try/catch. Previously a closed SSE controller
+ * threw synchronously here, skipping later listeners and bubbling up to the
+ * caller — which then crashed the lane's `.finally` cleanup and left `active`
+ * stuck. Now listener failures are swallowed (logged once to aid debugging).
+ */
 export function emit(ev: JobEvent) {
-  getState().emitter.emit("event", ev);
-  getState().emitter.emit(`job:${ev.jobId}`, ev);
+  const state = getState();
+  const broadcast = (event: string) => {
+    const listeners = state.emitter.listeners(event);
+    for (const listener of listeners) {
+      try {
+        (listener as (e: JobEvent) => void)(ev);
+      } catch (err) {
+        if (typeof process !== "undefined" && process.env.NODE_ENV !== "production") {
+          console.error("[queue] listener error on", event, err);
+        }
+        // Record listener failures too — otherwise a broken subscriber can
+        // silently drop events forever and only show up as ghost jobs.
+        logError({
+          context: "queue.listener",
+          error: err,
+          extra: { event, jobId: ev.jobId, type: ev.type },
+        });
+      }
+    }
+  };
+  broadcast("event");
+  broadcast(`job:${ev.jobId}`);
 }
 
 export function subscribe(handler: (ev: JobEvent) => void): () => void {

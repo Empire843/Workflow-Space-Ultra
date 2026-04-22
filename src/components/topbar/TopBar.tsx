@@ -4,9 +4,10 @@ import {
   ArrowLeft,
   CheckCircle2,
   Download,
+  ListOrdered,
   Loader2,
   LogOut,
-  Play,
+  RefreshCw,
   Save,
   Settings,
   Undo2,
@@ -17,20 +18,43 @@ import {
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { cn } from "@/lib/utils";
-import { runWorkflow } from "@/state/runWorkflow";
+
 import { useWorkflowStore } from "@/state/workflowStore";
 
+import QueuePanel from "../queue/QueuePanel";
 import SettingsDialog from "../settings/SettingsDialog";
 
+interface LaneStats {
+  concurrency: number;
+  active: number;
+  queued: number;
+}
+
+type AuthStatusKind = "fresh" | "stale" | "expired";
+
+interface AuthSlice {
+  ok: boolean;
+  status: AuthStatusKind;
+  ageMs: number | null;
+  updatedAt: string | null;
+  chromeConnected: boolean;
+}
+
 interface AuthStatus {
-  veo: { ok: boolean };
-  grok: { ok: boolean };
+  veo: AuthSlice & { projectId: string | null };
+  grok: AuthSlice & { profileName: string };
 }
 
 export default function TopBar() {
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [running, setRunning] = useState(false);
+  const [queueOpen, setQueueOpen] = useState(false);
+  const [queueBadge, setQueueBadge] = useState<{ running: number; queued: number } | null>(null);
+
   const [auth, setAuth] = useState<AuthStatus | null>(null);
+  const [prewarming, setPrewarming] = useState<{ veo: boolean; grok: boolean }>({
+    veo: false,
+    grok: false,
+  });
 
   const activeWorkflowName = useWorkflowStore((s) => s.activeWorkflowName);
   const goToDashboard = useWorkflowStore((s) => s.goToDashboard);
@@ -42,37 +66,124 @@ export default function TopBar() {
   const canUndo = useWorkflowStore((s) => s.canUndo);
   const canRedo = useWorkflowStore((s) => s.canRedo);
 
-  const refreshAuth = () =>
-    fetch("/api/auth/status", { cache: "no-store" })
-      .then((r) => r.json())
-      .then((d: AuthStatus) => setAuth(d))
-      .catch(() => setAuth(null));
+  const refreshAuth = useCallback(
+    () =>
+      fetch("/api/auth/status", { cache: "no-store" })
+        .then((r) => r.json())
+        .then((d: AuthStatus) => setAuth(d))
+        .catch(() => setAuth(null)),
+    [],
+  );
 
   useEffect(() => {
     refreshAuth();
-  }, []);
+  }, [refreshAuth]);
 
-  const handleLogoutAll = async () => {
-    if (!confirm("Xoá cache đăng nhập VEO + Grok? App sẽ yêu cầu login lại.")) return;
+  // Background poll every 60s so the amber "stale" state surfaces without
+  // requiring the user to reload. The previous one-shot fetch meant the
+  // badge stayed green for hours even after the token actually expired.
+  useEffect(() => {
+    const id = setInterval(() => {
+      refreshAuth();
+    }, 60_000);
+    return () => clearInterval(id);
+  }, [refreshAuth]);
+
+  /**
+   * Light-weight poller for the queue badge. Only runs while the panel is closed
+   * (open = the panel owns its own 2s poll). 5s cadence is plenty to surface a
+   * "jobs are piling up" indicator without hammering the API.
+   */
+  useEffect(() => {
+    if (queueOpen) return;
+    let alive = true;
+    const tick = async () => {
+      try {
+        const r = await fetch("/api/queue", { cache: "no-store" });
+        const body = (await r.json()) as {
+          ok: boolean;
+          jobs: { status: string }[];
+          lanes: Record<string, LaneStats>;
+        };
+        if (!alive || !body.ok) return;
+        const running = body.jobs.filter((j) => j.status === "running").length;
+        const queued = body.jobs.filter((j) => j.status === "queued").length;
+        setQueueBadge(running + queued > 0 ? { running, queued } : null);
+      } catch {
+        // ignore
+      }
+    };
+    void tick();
+    const id = setInterval(tick, 5000);
+    return () => {
+      alive = false;
+      clearInterval(id);
+    };
+  }, [queueOpen]);
+
+  const handleLogout = async (target: "veo" | "grok") => {
+    const label = target.toUpperCase();
+    const proceed = confirm(
+      `Đăng xuất ${label} sẽ XOÁ TOÀN BỘ cookies / cache / profile của ${label}.\n\n` +
+        `Chrome ${label} sẽ bị tắt và lần sau bạn phải đăng nhập lại từ đầu.\n\nTiếp tục?`,
+    );
+    if (!proceed) return;
     await fetch("/api/auth/logout", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ target: "all" }),
+      body: JSON.stringify({ target }),
     });
-    window.location.reload();
+    await refreshAuth();
   };
 
-  const handleRun = async () => {
-    if (running) return;
-    setRunning(true);
-    try {
-      await runWorkflow();
-    } catch {
-      // nodes show their own errors
-    } finally {
-      setRunning(false);
+  const triggerPrewarm = useCallback(
+    async (targets: Array<"veo" | "grok">) => {
+      if (targets.length === 0) return;
+      setPrewarming((prev) => {
+        const next = { ...prev };
+        for (const t of targets) next[t] = true;
+        return next;
+      });
+      try {
+        await fetch("/api/auth/prewarm", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ targets }),
+        }).catch(() => null);
+      } finally {
+        // Give the server a couple seconds to write the new cache before
+        // we poll — otherwise the badge flaps amber→amber even though the
+        // background refresh already succeeded.
+        setTimeout(() => {
+          setPrewarming((prev) => {
+            const next = { ...prev };
+            for (const t of targets) next[t] = false;
+            return next;
+          });
+          void refreshAuth();
+        }, 2500);
+      }
+    },
+    [refreshAuth],
+  );
+
+  // Auto pre-warm stale providers: runs whenever the polled status flips
+  // to "stale" (and Chrome is still connected — otherwise the user just
+  // needs to click Login). One fire per status change.
+  useEffect(() => {
+    if (!auth) return;
+    const targets: Array<"veo" | "grok"> = [];
+    if (auth.veo.status === "stale" && auth.veo.chromeConnected && !prewarming.veo) {
+      targets.push("veo");
     }
-  };
+    if (auth.grok.status === "stale" && auth.grok.chromeConnected && !prewarming.grok) {
+      targets.push("grok");
+    }
+    if (targets.length > 0) void triggerPrewarm(targets);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [auth?.veo.status, auth?.grok.status, auth?.veo.chromeConnected, auth?.grok.chromeConnected]);
+
+
 
   const handleSave = useCallback(async () => {
     await saveCurrent();
@@ -138,22 +249,22 @@ export default function TopBar() {
         <div className="flex items-center gap-1.5">
           <ProviderBadge
             label="VEO"
-            ok={auth.veo.ok}
+            target="veo"
+            status={auth.veo.status}
+            ageMs={auth.veo.ageMs}
+            prewarming={prewarming.veo}
             onLogin={() => openAndVerify("veo", refreshAuth)}
+            onLogout={() => handleLogout("veo")}
           />
           <ProviderBadge
             label="Grok"
-            ok={auth.grok.ok}
+            target="grok"
+            status={auth.grok.status}
+            ageMs={auth.grok.ageMs}
+            prewarming={prewarming.grok}
             onLogin={() => openAndVerify("grok", refreshAuth)}
+            onLogout={() => handleLogout("grok")}
           />
-          <button
-            type="button"
-            onClick={handleLogoutAll}
-            title="Logout tất cả & login lại"
-            className="h-7 w-7 grid place-items-center rounded-md text-zinc-500 hover:text-zinc-200 hover:bg-[color:var(--color-bg-elev-2)] transition"
-          >
-            <LogOut className="h-3.5 w-3.5" />
-          </button>
         </div>
       ) : null}
 
@@ -173,26 +284,38 @@ export default function TopBar() {
       </button>
       <button
         type="button"
+        onClick={() => setQueueOpen(true)}
+        title="Xem queue, cancel job, reset lanes"
+        className={cn(
+          "relative h-8 px-3 rounded-md bg-[color:var(--color-bg-elev-2)] border hover:bg-[color:var(--color-bg-elev-1)] text-xs flex items-center gap-1.5",
+          queueBadge
+            ? "border-amber-500/40 text-amber-300"
+            : "border-[color:var(--color-border)] text-[color:var(--color-fg-muted)]",
+        )}
+      >
+        <ListOrdered className="h-3.5 w-3.5" /> Queue
+        {queueBadge && (
+          <span className="ml-0.5 inline-flex items-center gap-0.5 text-[10px] font-semibold">
+            {queueBadge.running > 0 && <span className="text-blue-300">{queueBadge.running}</span>}
+            {queueBadge.queued > 0 && (
+              <span className="text-amber-300">
+                {queueBadge.running > 0 ? "+" : ""}
+                {queueBadge.queued}
+              </span>
+            )}
+          </span>
+        )}
+      </button>
+      <button
+        type="button"
         onClick={() => setSettingsOpen(true)}
         className="h-8 px-3 rounded-md bg-[color:var(--color-bg-elev-2)] border border-[color:var(--color-border)] hover:bg-[color:var(--color-bg-elev-1)] text-[color:var(--color-fg-muted)] text-xs flex items-center gap-1.5"
       >
         <Settings className="h-3.5 w-3.5" /> Settings
       </button>
 
-      <button
-        type="button"
-        onClick={handleRun}
-        disabled={running}
-        className={cn(
-          "h-8 px-4 rounded-md text-xs font-semibold text-white flex items-center gap-1.5",
-          "bg-gradient-to-r from-pink-500 to-rose-500 hover:opacity-95 shadow-lg shadow-pink-500/20 disabled:opacity-60"
-        )}
-      >
-        {running ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
-        {running ? "Running..." : "Run Workflow"}
-      </button>
-
       <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
+      <QueuePanel open={queueOpen} onClose={() => setQueueOpen(false)} />
     </div>
   );
 }
@@ -223,19 +346,41 @@ async function openAndVerify(target: "veo" | "grok", onDone: () => void) {
   onDone();
 }
 
+function formatAgeShort(ageMs: number | null): string {
+  if (ageMs == null || !Number.isFinite(ageMs) || ageMs < 0) return "";
+  const sec = Math.floor(ageMs / 1000);
+  if (sec < 60) return `${sec}s`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m`;
+  const hr = Math.floor(min / 60);
+  const rem = min % 60;
+  return rem ? `${hr}h${rem}m` : `${hr}h`;
+}
+
 function ProviderBadge({
   label,
-  ok,
+  target,
+  status,
+  ageMs,
+  prewarming,
   onLogin,
+  onLogout,
 }: {
   label: string;
-  ok: boolean;
+  target: "veo" | "grok";
+  status: AuthStatusKind;
+  ageMs: number | null;
+  prewarming?: boolean;
   onLogin?: () => void;
+  onLogout?: () => Promise<void> | void;
 }) {
   const [busy, setBusy] = useState(false);
+  const [loggingOut, setLoggingOut] = useState(false);
 
-  const handleClick = async () => {
-    if (ok || !onLogin) return;
+  const ok = status !== "expired";
+
+  const handleBadgeClick = async () => {
+    if (ok || !onLogin || busy) return;
     setBusy(true);
     try {
       await onLogin();
@@ -244,28 +389,115 @@ function ProviderBadge({
     }
   };
 
+  const handleLogoutClick = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!onLogout || loggingOut) return;
+    setLoggingOut(true);
+    try {
+      await onLogout();
+    } finally {
+      setLoggingOut(false);
+    }
+  };
+
+  const ageLabel = formatAgeShort(ageMs);
+  const title = (() => {
+    switch (status) {
+      case "fresh":
+        return `${label}: Sẵn sàng tạo${ageLabel ? ` (cache ${ageLabel})` : ""} — hover để logout`;
+      case "stale":
+        return `${label}: Cache sắp hết hạn${ageLabel ? ` (${ageLabel})` : ""} — đang tự làm mới…`;
+      default:
+        return `${label}: Chưa đăng nhập — click để login`;
+    }
+  })();
+
+  const palette = (() => {
+    if (status === "fresh") {
+      return {
+        wrap: "border-emerald-500/30 bg-emerald-500/10 text-emerald-400",
+        iconColor: "text-emerald-400",
+        logoutIdle: "text-emerald-400/70",
+      } as const;
+    }
+    if (status === "stale") {
+      return {
+        wrap: "border-amber-500/40 bg-amber-500/10 text-amber-300",
+        iconColor: "text-amber-300",
+        logoutIdle: "text-amber-300/80",
+      } as const;
+    }
+    return {
+      wrap: "border-zinc-700 bg-zinc-800/50 text-zinc-500 hover:border-[color:var(--color-accent)]/50 hover:text-zinc-300",
+      iconColor: "text-zinc-500",
+      logoutIdle: "text-zinc-400",
+    } as const;
+  })();
+
   return (
-    <button
-      type="button"
-      onClick={handleClick}
-      disabled={busy}
+    <div
       className={cn(
-        "flex items-center gap-1 h-7 px-2 rounded-md border text-[11px] font-medium transition",
-        ok
-          ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
-          : "border-zinc-700 bg-zinc-800/50 text-zinc-500 hover:border-[color:var(--color-accent)]/50 hover:text-zinc-300 cursor-pointer",
+        "group/badge relative flex items-center gap-1 h-7 pl-2 rounded-md border text-[11px] font-medium transition",
+        palette.wrap,
+        ok ? "pr-1" : "pr-2",
       )}
-      title={ok ? `${label}: Sẵn sàng tạo` : `${label}: Chưa đăng nhập — click để login`}
+      title={title}
     >
-      {busy ? (
-        <Loader2 className="h-3 w-3 animate-spin" />
-      ) : ok ? (
-        <CheckCircle2 className="h-3 w-3" />
-      ) : (
-        <XCircle className="h-3 w-3" />
+      <button
+        type="button"
+        onClick={handleBadgeClick}
+        disabled={busy}
+        aria-label={
+          status === "fresh"
+            ? `${label} logged in`
+            : status === "stale"
+              ? `${label} session refreshing`
+              : `Login ${label}`
+        }
+        className={cn(
+          "flex items-center gap-1 h-full focus:outline-none",
+          !ok && "cursor-pointer",
+        )}
+      >
+        {busy || prewarming ? (
+          <Loader2 className={cn("h-3 w-3 animate-spin", palette.iconColor)} />
+        ) : status === "fresh" ? (
+          <CheckCircle2 className="h-3 w-3" />
+        ) : status === "stale" ? (
+          <RefreshCw className="h-3 w-3" />
+        ) : (
+          <XCircle className="h-3 w-3" />
+        )}
+        <span>{label}</span>
+        {status === "stale" && (
+          <span className="text-[9px] uppercase tracking-wide opacity-75">
+            {prewarming ? "refreshing" : "refresh soon"}
+          </span>
+        )}
+      </button>
+      {ok && onLogout && (
+        <button
+          type="button"
+          data-target={target}
+          onClick={handleLogoutClick}
+          disabled={loggingOut}
+          title={`Logout ${label}`}
+          aria-label={`Logout ${label}`}
+          className={cn(
+            "ml-0.5 h-5 w-5 grid place-items-center rounded transition",
+            palette.logoutIdle,
+            "opacity-0 group-hover/badge:opacity-100 focus-visible:opacity-100",
+            "hover:bg-white/10 hover:text-white",
+          )}
+        >
+          {loggingOut ? (
+            <Loader2 className="h-3 w-3 animate-spin" />
+          ) : (
+            <LogOut className="h-3 w-3" />
+          )}
+        </button>
       )}
-      {label}
-    </button>
+    </div>
   );
 }
 

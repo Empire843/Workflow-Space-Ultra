@@ -5,6 +5,7 @@ import type { Browser, BrowserContext, Page } from "playwright";
 
 import { DATA_GENERAL_DIR, VEO_CDP_HOST, VEO_FLOW_URL, RECAPTCHA_SITE_KEY, ensureDirs } from "../config";
 import { openVeoChrome } from "../chrome/veoChromeManager";
+import { sessionTelemetry } from "./sessionTelemetry";
 
 /**
  * Port of A_workflow_get_token.py (TokenCollector).
@@ -30,14 +31,31 @@ export interface VeoAuth {
   updatedAt: string;
 }
 
+/**
+ * Google OAuth access tokens are valid for ~1h. We treat anything older
+ * than this as stale so the first request after a long idle period
+ * doesn't have to eat a 401 before refreshing. A safe margin below the
+ * real TTL keeps us from racing the token's actual expiry.
+ */
+const VEO_AUTH_CACHE_TTL_MS = 45 * 60_000;
+
 export function loadCachedVeoAuth(): VeoAuth | null {
   try {
     ensureDirs();
     if (!existsSync(TOKENS_CACHE_FILE)) return null;
     const raw = readFileSync(TOKENS_CACHE_FILE, "utf-8");
     const parsed = JSON.parse(raw) as VeoAuth;
-    if (parsed.sessionId && parsed.projectId && parsed.accessToken) return parsed;
-    return null;
+    if (!parsed.sessionId || !parsed.projectId || !parsed.accessToken) return null;
+    // Drop tokens older than the TTL. Without this check the server
+    // would happily hand out a 2-hour-old accessToken and let every
+    // caller eat a 401 before the batcher / withRecaptcha ladder force
+    // a refresh — exactly the "VEO đã sẵn sàng nhưng bấm tạo vẫn 401"
+    // symptom the user saw.
+    if (parsed.updatedAt) {
+      const age = Date.now() - new Date(parsed.updatedAt).getTime();
+      if (Number.isFinite(age) && age > VEO_AUTH_CACHE_TTL_MS) return null;
+    }
+    return parsed;
   } catch {
     return null;
   }
@@ -62,6 +80,46 @@ function isRecaptchaReload(url: string): boolean {
   return url.includes("/recaptcha/enterprise/reload") && url.includes(RECAPTCHA_SITE_KEY);
 }
 
+/**
+ * Walk an arbitrary JSON-like value looking for any string property whose key
+ * looks like "sessionId" / "session_id" / "sid" and whose value looks like a
+ * usable session token (non-empty, not an obvious noise value). Returns the
+ * first hit, which is enough for our purposes because Flow stamps the same
+ * sessionId on every event in a given batch.
+ *
+ * We intentionally don't match on structure (e.g. `appEvents[].eventMetadata`)
+ * because that shape has drifted across Flow releases — this scan continues
+ * to work as long as the field name is stable.
+ */
+function findSessionIdDeep(value: unknown, depth = 0): string | null {
+  if (depth > 8 || value == null) return null;
+  if (typeof value !== "object") return null;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const hit = findSessionIdDeep(item, depth + 1);
+      if (hit) return hit;
+    }
+    return null;
+  }
+  const obj = value as Record<string, unknown>;
+  for (const [k, v] of Object.entries(obj)) {
+    const lower = k.toLowerCase();
+    const isSessionKey =
+      lower === "sessionid" ||
+      lower === "session_id" ||
+      lower === "session-id" ||
+      (lower === "sid" && typeof v === "string");
+    if (isSessionKey && typeof v === "string" && v.length >= 8) {
+      return v;
+    }
+  }
+  for (const v of Object.values(obj)) {
+    const hit = findSessionIdDeep(v, depth + 1);
+    if (hit) return hit;
+  }
+  return null;
+}
+
 interface CaptureState {
   sessionId?: string;
   projectId?: string;
@@ -82,15 +140,74 @@ export class VeoTokenCollector {
   private page: Page | null = null;
   private captureState: CaptureState = {};
 
+  /**
+   * Lightweight liveness check — singleton callers use this to decide whether
+   * the cached instance can still serve a request or needs to be thrown away
+   * and re-initialised. The CDP connection drops when the user closes the
+   * Chrome window (or when Chrome crashes / the user logs out of the OS).
+   */
+  isAlive(): boolean {
+    try {
+      return !!(this.browser && this.browser.isConnected() && this.context);
+    } catch {
+      return false;
+    }
+  }
+
   async init() {
     const handle = await openVeoChrome();
     const { chromium } = await import("playwright");
     this.playwright = { chromium } as unknown as typeof import("playwright");
     this.browser = await chromium.connectOverCDP(`http://${VEO_CDP_HOST}:${handle.port}`);
+
+    // Auto-invalidate the singleton when the browser disconnects. Next call
+    // to getVeoCollector() will spin up a fresh collector + reclaim tabs.
+    this.browser.on("disconnected", () => {
+      console.warn("[VEO] Browser disconnected — invalidating singleton");
+      sessionTelemetry.record({
+        target: "veo",
+        kind: "reset_collector",
+        detail: "browser disconnected",
+      });
+      const store = getStore();
+      if (store.instance === this) {
+        store.instance = null;
+        store.initPromise = null;
+      }
+      this._pages = {};
+      this._routeBlockedPages = new Set();
+      this._pageInitPromises = {};
+    });
+
     const contexts = this.browser.contexts();
     this.context = contexts[0] || (await this.browser.newContext());
-    const pages = this.context.pages();
-    this.page = pages[0] || (await this.context.newPage());
+
+    // Reclaim any tabs left behind by a previous session (Next.js HMR / server
+    // restart). Without this, every dev reload spawned two fresh image+video
+    // tabs on top of the ones already open → the user watched Chrome fill up
+    // with identical Flow tabs.
+    const existing = this.context.pages();
+    const claimed: Page[] = [];
+    for (const p of existing) {
+      const url = (p.url() || "").toLowerCase();
+      if (!url.includes("labs.google/fx") && !url.startsWith("about:") && !url.startsWith("chrome://")) {
+        continue;
+      }
+      const mode = await this._detectCurrentMode(p, 600).catch(() => null);
+      if (mode && !this._pages[mode]) {
+        this._pages[mode] = p;
+        claimed.push(p);
+        console.log(`[VEO] Reclaimed existing tab as mode=${mode}: ${p.url()}`);
+      }
+    }
+
+    // The "auth" page is the one we read access_token / session from. Prefer a
+    // page already on Flow that we didn't claim for a mode; otherwise fall
+    // back to pages[0], or open a fresh tab if the context is empty.
+    const authCandidate = existing.find(
+      (p) => !claimed.includes(p) && (p.url() || "").toLowerCase().includes("labs.google/fx"),
+    );
+    this.page = authCandidate || existing[0] || (await this.context.newPage());
 
     // Force the window onto the primary screen (prevent Chrome from remembering an off-screen position)
     try {
@@ -144,18 +261,19 @@ export class VeoTokenCollector {
         url.includes("https://labs.google/fx/api/trpc/general.submitBatchLog") &&
         !this.captureState.sessionId
       ) {
+        // Accept sessionId from ANY field anywhere in the payload. Flow has
+        // changed the event schema before (the Python port only looked at
+        // `eventMetadata.sessionId` inside `appEvents` for a specific event
+        // name), and users who opened existing projects never hit that narrow
+        // path. A recursive scan is resilient to every schema we've observed.
         try {
-          const data = req.postDataJSON() as {
-            json?: { appEvents?: Array<{ event?: string; eventMetadata?: { sessionId?: string } }> };
-          } | null;
-          if (data) {
-            const events = data.json?.appEvents || [];
-            for (const ev of events) {
-              if (ev.event === "PINHOLE_CREATE_NEW_PROJECT") {
-                const sid = ev.eventMetadata?.sessionId;
-                if (sid) this.captureState.sessionId = sid;
-              }
-            }
+          const body = req.postDataJSON();
+          const sid = findSessionIdDeep(body);
+          if (sid) {
+            this.captureState.sessionId = sid;
+            console.log(`[VEO] captured sessionId from submitBatchLog (deep scan)`);
+          } else {
+            console.log("[VEO] submitBatchLog seen but no sessionId in payload (schema drift?)");
           }
         } catch {
           // ignore
@@ -241,6 +359,7 @@ export class VeoTokenCollector {
    * - projectId: from URL /project/<id>
    * - accessToken: from window.__NEXT_DATA__.props.pageProps.session.access_token (SSR payload)
    * - cookie: from document.cookie
+   * - sessionId: scraped from common storage locations / window globals
    */
   async extractFromPage(): Promise<void> {
     if (!this.page) return;
@@ -257,9 +376,86 @@ export class VeoTokenCollector {
           props?: { pageProps?: { session?: { access_token?: string; user?: { id?: string } } } };
         };
         const nd = (window as unknown as { __NEXT_DATA__?: NextData }).__NEXT_DATA__;
+
+        // Scan the whole __NEXT_DATA__ tree + every storage key for anything
+        // that looks like a sessionId. We can't hard-code the key name because
+        // Flow has changed it between releases; a targeted lookup was the
+        // reason the Python port bit-rotted in the first place.
+        const scan = (val: unknown, depth = 0): string | null => {
+          if (depth > 8 || val == null) return null;
+          if (typeof val !== "object") return null;
+          if (Array.isArray(val)) {
+            for (const it of val) {
+              const h = scan(it, depth + 1);
+              if (h) return h;
+            }
+            return null;
+          }
+          const obj = val as Record<string, unknown>;
+          for (const [k, v] of Object.entries(obj)) {
+            const low = k.toLowerCase();
+            const isKey =
+              low === "sessionid" ||
+              low === "session_id" ||
+              low === "session-id" ||
+              (low === "sid" && typeof v === "string");
+            if (isKey && typeof v === "string" && v.length >= 8) return v;
+          }
+          for (const v of Object.values(obj)) {
+            const h = scan(v, depth + 1);
+            if (h) return h;
+          }
+          return null;
+        };
+
+        const sweepStorage = (store: Storage | null | undefined): string | null => {
+          if (!store) return null;
+          try {
+            for (let i = 0; i < store.length; i++) {
+              const key = store.key(i);
+              if (!key) continue;
+              const low = key.toLowerCase();
+              const raw = store.getItem(key);
+              if (!raw) continue;
+              // Fast path: the key itself names a sessionId.
+              if (
+                low.includes("sessionid") ||
+                low.includes("session_id") ||
+                low.includes("session-id") ||
+                low === "sid"
+              ) {
+                if (raw.length >= 8) return raw;
+              }
+              // Slow path: the value is a JSON blob that *contains* sessionId.
+              if (raw.startsWith("{") || raw.startsWith("[")) {
+                try {
+                  const parsed = JSON.parse(raw);
+                  const h = scan(parsed);
+                  if (h) return h;
+                } catch {
+                  // not JSON, skip
+                }
+              }
+            }
+          } catch {
+            // cross-origin or disabled storage
+          }
+          return null;
+        };
+
+        let sessionId: string | null = null;
+        try { sessionId = sweepStorage(window.sessionStorage); } catch { /* ignore */ }
+        if (!sessionId) {
+          try { sessionId = sweepStorage(window.localStorage); } catch { /* ignore */ }
+        }
+        if (!sessionId) {
+          try { sessionId = scan(nd); } catch { /* ignore */ }
+        }
+
         return {
           accessToken: nd?.props?.pageProps?.session?.access_token || null,
           cookie: typeof document !== "undefined" ? document.cookie || "" : "",
+          sessionId,
         };
       });
       if (data?.accessToken && !this.captureState.accessToken) {
@@ -268,6 +464,61 @@ export class VeoTokenCollector {
       if (data?.cookie && !this.captureState.cookie) {
         this.captureState.cookie = data.cookie;
       }
+      if (data?.sessionId && !this.captureState.sessionId) {
+        this.captureState.sessionId = data.sessionId;
+        console.log("[VEO] captured sessionId from DOM scan");
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  /**
+   * Nudge the Flow UI into emitting a telemetry event that carries sessionId.
+   * Flow batches analytics and only flushes them for *foreground* tabs with
+   * real user interaction, so a pure synthetic dispatch isn't enough —
+   * we actually bring the tab to front, move the mouse, wheel-scroll a
+   * pixel, and press a no-op key. We do NOT navigate, so the user stays
+   * on whichever project they opened.
+   */
+  private async nudgeForTelemetry(): Promise<void> {
+    const page = this.page;
+    if (!page) return;
+    try {
+      await page.bringToFront();
+    } catch {
+      // ignore
+    }
+    try {
+      await page.mouse.move(120 + Math.random() * 60, 140 + Math.random() * 60);
+      await page.mouse.move(200 + Math.random() * 60, 260 + Math.random() * 60, { steps: 3 });
+    } catch {
+      // ignore
+    }
+    try {
+      await page.mouse.wheel(0, 40);
+      await page.mouse.wheel(0, -40);
+    } catch {
+      // ignore
+    }
+    try {
+      // Shift is a safe no-op for the app but still registers as user input.
+      await page.keyboard.press("Shift");
+    } catch {
+      // ignore
+    }
+    try {
+      await page.evaluate(() => {
+        try {
+          window.dispatchEvent(new Event("focus"));
+          document.dispatchEvent(new Event("visibilitychange"));
+          // Some analytics wait for a user-gesture flag — synthesize one.
+          window.dispatchEvent(new Event("pointerdown"));
+          window.dispatchEvent(new Event("pointerup"));
+        } catch {
+          // ignore
+        }
+      });
     } catch {
       // ignore
     }
@@ -283,6 +534,7 @@ export class VeoTokenCollector {
     if (!force) {
       const cached = loadCachedVeoAuth();
       if (cached) {
+        sessionTelemetry.record({ target: "veo", kind: "cache_hit" });
         this.captureState = {
           sessionId: cached.sessionId,
           projectId: cached.projectId,
@@ -292,14 +544,31 @@ export class VeoTokenCollector {
         await this.ensureOnFlow(cached.projectId);
         return cached;
       }
+      // Cache miss here usually means the TTL tripped inside
+      // loadCachedVeoAuth — record it so the debug endpoint shows that the
+      // silent refresh happened here and not at a 401 downstream.
+      sessionTelemetry.record({ target: "veo", kind: "cache_stale" });
     }
 
-    await this.ensureOnFlow();
+    // Only navigate to the Flow homepage if we aren't already on a Flow page.
+    // If the user is inside a project (URL: .../flow/project/<id>), leave them
+    // there — that page has everything we need and kicking them out would
+    // create the "verify → bounce to /flow → user re-clicks project → verify
+    // → bounce again" loop we previously had.
+    const currentUrl = this.page?.url() || "";
+    if (!currentUrl.includes("labs.google/fx/")) {
+      await this.ensureOnFlow();
+    }
 
     // Read directly from the page (no need to wait for a new request)
     await this.extractFromPage();
 
-    // If something is still missing, reload to re-trigger _next/data + other requests
+    // Reload whenever something is still missing — including on a project
+    // page. The URL stays the same (same project), but a reload guarantees a
+    // fresh batch of _next/data + submitBatchLog requests, which our listener
+    // (attached in init()) can now observe. Without this, a user who opened
+    // the project tab BEFORE we attached listeners would have all telemetry
+    // already fired and the listener would sit idle forever.
     const missingAfterDom =
       !this.captureState.sessionId || !this.captureState.projectId || !this.captureState.accessToken;
     if (missingAfterDom) {
@@ -312,7 +581,8 @@ export class VeoTokenCollector {
     }
 
     const deadline = Date.now() + timeoutMs;
-    let triedCreateProject = false;
+    let lastNudge = 0;
+    let reloadAttempted = false;
     while (Date.now() < deadline) {
       const s = this.captureState;
       if (s.sessionId && s.projectId && s.accessToken) {
@@ -327,16 +597,26 @@ export class VeoTokenCollector {
         return auth;
       }
 
-      // sessionId still missing → need to trigger submitBatchLog event PINHOLE_CREATE_NEW_PROJECT.
-      // That event fires when the "new project" button is clicked. Wait for the first half of the budget,
-      // then try navigating to the Flow homepage (which on some sessions triggers creating a default project).
-      if (!triedCreateProject && Date.now() - (deadline - timeoutMs) > timeoutMs * 0.4) {
-        triedCreateProject = true;
+      await this.extractFromPage();
+
+      if (Date.now() - lastNudge > 3_000) {
+        lastNudge = Date.now();
+        await this.nudgeForTelemetry();
+      }
+
+      // Last-ditch recovery: around 40% of the budget, if sessionId is the
+      // only thing still missing AND we haven't reloaded yet inside this
+      // loop, reload the *current* page (no goto → URL preserved) to force
+      // a fresh submitBatchLog batch. This is safe on a project page: the
+      // reload keeps the user exactly where they were.
+      if (
+        !reloadAttempted &&
+        !this.captureState.sessionId &&
+        Date.now() - (deadline - timeoutMs) > timeoutMs * 0.4
+      ) {
+        reloadAttempted = true;
         try {
-          // Re-extract from DOM once more (access_token may now be present from _next/data)
-          await this.extractFromPage();
-          // Navigate back to root so we can trigger the create-project flow
-          await this.page?.goto(VEO_FLOW_URL, { waitUntil: "domcontentloaded", timeout: 15_000 });
+          await this.page?.reload({ waitUntil: "domcontentloaded", timeout: 15_000 });
           await this.extractFromPage();
         } catch {
           // ignore
@@ -352,8 +632,9 @@ export class VeoTokenCollector {
     if (!this.captureState.accessToken) missing.push("access_token");
     throw new Error(
       `Không bắt được VEO auth sau ${timeoutMs}ms (thiếu: ${missing.join(", ")}). ` +
-        `Hãy vào cửa sổ Chrome VEO, login xong thì BẤM NÚT 'New Project' hoặc mở/tạo 1 project bất kỳ trong Flow, ` +
-        `rồi quay lại bấm Test VEO session.`
+        `Hãy mở cửa sổ Chrome VEO, đảm bảo đã login, ở trong 1 project bất kỳ ` +
+        `(labs.google/fx/vi/tools/flow/project/<id>) và thử di chuột/click quanh ` +
+        `UI để kích hoạt telemetry, rồi bấm Verify Now.`
     );
   }
 
@@ -386,6 +667,7 @@ export class VeoTokenCollector {
    * After calling, `collectAuth({ force: true })` will reload the page and capture a fresh token.
    */
   invalidateAuth(): void {
+    sessionTelemetry.record({ target: "veo", kind: "invalidate" });
     try {
       const { unlinkSync } = require("node:fs") as typeof import("node:fs");
       if (existsSync(TOKENS_CACHE_FILE)) unlinkSync(TOKENS_CACHE_FILE);
@@ -476,21 +758,55 @@ export class VeoTokenCollector {
   /**
    * Get (or lazy-init) the dedicated tab for `mode`. The tab is mode-locked
    * exactly once to avoid any runtime UI mode switching.
+   *
+   * Before opening a new tab, we re-scan the Chrome context for any live
+   * tab whose UI already sits on the requested mode (e.g. left over from a
+   * previous dev session). Reusing it saves a full tab boot (goto + 3.5s
+   * settle + route-block install + model selection) and keeps Chrome from
+   * filling up with duplicate Flow tabs every time Next restarts.
    */
   private async _getPageForMode(mode: "video" | "image"): Promise<Page> {
-    if (this._pages[mode]) return this._pages[mode]!;
+    if (this._pages[mode] && !this._pages[mode]!.isClosed()) return this._pages[mode]!;
+    if (this._pages[mode]?.isClosed()) this._pages[mode] = undefined;
     if (this._pageInitPromises[mode]) return this._pageInitPromises[mode]!;
     if (!this.context) throw new Error("Context not ready");
 
     const init = (async (): Promise<Page> => {
-      const page = await this.context!.newPage();
+      // Pass 1: scan existing context tabs for one already in the target mode.
+      let page: Page | null = null;
+      for (const p of this.context!.pages()) {
+        if (p.isClosed()) continue;
+        if (p === this.page) continue; // leave the auth page alone
+        if (Object.values(this._pages).includes(p)) continue;
+        const url = (p.url() || "").toLowerCase();
+        if (!url.includes("labs.google/fx")) continue;
+        const detected = await this._detectCurrentMode(p, 800).catch(() => null);
+        if (detected === mode) {
+          console.log(`[VEO] Reusing existing tab for mode=${mode}: ${p.url()}`);
+          page = p;
+          break;
+        }
+      }
+
+      // Pass 2: no exact match — fall back to opening a new tab as before.
+      if (!page) {
+        page = await this.context!.newPage();
+        console.log(`[VEO] Opened new tab for mode=${mode}`);
+      }
+
       const projectId = this.captureState.projectId;
       const targetUrl = projectId
         ? `https://labs.google/fx/vi/tools/flow/project/${projectId}`
         : VEO_FLOW_URL;
       try {
-        await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 20_000 });
-        await page.waitForTimeout(3500);
+        // Only navigate if the tab isn't already on a Flow page (reused tab
+        // usually is, so we avoid a needless reload that would drop cached UI).
+        const current = (page.url() || "").toLowerCase();
+        const onFlow = current.includes("labs.google/fx");
+        if (!onFlow) {
+          await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 20_000 });
+          await page.waitForTimeout(3500);
+        }
       } catch {
         // ignore
       }
@@ -531,6 +847,162 @@ export class VeoTokenCollector {
     } finally {
       this._pageInitPromises[mode] = undefined;
     }
+  }
+
+  /**
+   * Public wrapper around the internal `_getPageForMode` so the provider
+   * layer (withRecaptcha, batcher) can grab the SAME tab that minted the
+   * reCAPTCHA token and route the API POST through its browser context.
+   *
+   * This is the core of the "Option 2" fingerprint-binding fix: the
+   * request.post goes out with the tab's UA, Sec-CH-UA, Origin, Referer
+   * and cookie jar, matching what grecaptcha.enterprise.execute saw.
+   */
+  async getPageForMode(mode: "video" | "image"): Promise<Page> {
+    return this._getPageForMode(mode);
+  }
+
+  /**
+   * Drop the cached page handle for `mode` without touching auth or the
+   * rest of the Chrome session. Called by the provider layer when a
+   * request throws a transient page-level error (e.g. "Target closed",
+   * "socket hang up", status=0) — the tab may still be alive in Chrome
+   * but the Playwright handle is no longer usable, so we want the next
+   * `getPageForMode(mode)` call to re-scan and attach to a fresh tab.
+   *
+   * Cheaper than `restartBrowser()` and preserves OAuth cache.
+   */
+  invalidatePageForMode(mode: "video" | "image"): void {
+    const p = this._pages[mode];
+    if (p && !p.isClosed()) {
+      // Don't try to close — the error that triggered this may have
+      // already killed the underlying target, and .close() would throw.
+      console.warn(`[VEO] invalidatePageForMode(${mode}): dropping stale handle`);
+    }
+    this._pages[mode] = undefined;
+    this._pageInitPromises[mode] = undefined;
+  }
+
+  /**
+   * Wipe every cached bit of the current origin (localStorage, IndexedDB,
+   * service workers, trust tokens, HTTP cache) and reload the tab. Called
+   * as step 2 of the 403-recovery ladder: when retrying with a fresh
+   * recaptcha token isn't enough, Google is usually remembering something
+   * it dislikes (device token, abuse cookie, stale session cookie). A
+   * clean slate + reload forces the UI to re-bootstrap from scratch, after
+   * which the next recaptcha token is almost always accepted.
+   *
+   * Port of `_clear_site_storage` in A_workflow_get_token.py (lines
+   * 1029-1071). We also flush `_pages[mode]` mode-ready caches so the
+   * next request re-runs `_ensureMode` / `_selectLowerPriorityModel`.
+   */
+  async clearSiteStorage(mode: "video" | "image"): Promise<void> {
+    if (!this.context) return;
+    const page = this._pages[mode];
+    if (!page || page.isClosed()) {
+      console.warn(`[VEO] clearSiteStorage: no live tab for mode=${mode}, skipping`);
+      return;
+    }
+    const currentUrl = page.url() || "";
+    let origin: string | null = null;
+    try {
+      const parsed = new URL(currentUrl);
+      if (parsed.protocol && parsed.host) {
+        origin = `${parsed.protocol}//${parsed.host}`;
+      }
+    } catch {
+      // ignore malformed URL
+    }
+    if (!origin) {
+      console.warn(`[VEO] clearSiteStorage: cannot derive origin from "${currentUrl}"`);
+      return;
+    }
+    try {
+      console.log(`[VEO] Clear site storage for ${origin} (mode=${mode})`);
+      const cdp = await this.context.newCDPSession(page);
+      await cdp.send("Storage.clearDataForOrigin", {
+        origin,
+        storageTypes: [
+          "local_storage",
+          "session_storage",
+          "indexeddb",
+          "cache_storage",
+          "service_workers",
+          "websql",
+          "file_systems",
+          "shared_storage",
+          "cookies",
+        ].join(","),
+      });
+      try {
+        await cdp.send("Storage.clearTrustTokens");
+      } catch {
+        // older Chromes reject this method — not fatal
+      }
+      try {
+        await cdp.send("Network.clearBrowserCache");
+      } catch {
+        // ignore
+      }
+      try {
+        await cdp.detach();
+      } catch {
+        // ignore
+      }
+      console.log(`[VEO] Reload tab after clear storage (mode=${mode})`);
+      await page.reload({ waitUntil: "domcontentloaded", timeout: 20_000 });
+      // After a reload the Flow UI comes up on whatever mode was last
+      // selected — drop the per-tab "mode-ready" marker so the next
+      // recaptcha capture re-verifies the mode and re-applies route
+      // blocking (the page.route handlers survive the reload but the
+      // CDP-level Network.setBlockedURLs needs to be re-armed).
+      this._routeBlockedPages.delete(page);
+    } catch (err) {
+      console.warn("[VEO] clearSiteStorage failed:", err);
+    }
+  }
+
+  /**
+   * Hard restart of the whole Chrome session: close the current CDP
+   * connection, relaunch Chrome via `openVeoChrome()`, then re-init the
+   * collector. Used as the last step of the 403-recovery ladder (after
+   * retry + clearStorage have failed). This is the only move that
+   * recycles the TLS client hello + HTTP/2 connection pool, which is
+   * what Google ultimately keys abuse signals on.
+   *
+   * Port of `restart_browser` in A_workflow_get_token.py (lines 929-962).
+   *
+   * After this returns, callers must re-acquire `getPageForMode(mode)` —
+   * the old Page objects are dead and the _pages map is cleared.
+   */
+  async restartBrowser(): Promise<void> {
+    console.warn("[VEO] restartBrowser: closing old Chrome connection and reopening");
+    try {
+      await this.browser?.close();
+    } catch {
+      // ignore — the browser might already be gone
+    }
+    this.browser = null;
+    this.context = null;
+    this.page = null;
+    this._pages = {};
+    this._routeBlockedPages = new Set();
+    this._pageInitPromises = {};
+    this.captureState = {};
+
+    // Re-connect via the same CDP manager — openVeoChrome will relaunch
+    // the Chrome executable if the process already died, or reuse it if
+    // it's still running on the debug port.
+    await this.init();
+
+    // Re-hydrate auth from cache if still valid so we don't block on a
+    // fresh login flow; collectAuth with force=false is the cheap path.
+    try {
+      await this.collectAuth({ force: false, timeoutMs: 30_000 });
+    } catch (err) {
+      console.warn("[VEO] restartBrowser: post-restart collectAuth failed:", err);
+    }
+    console.log("[VEO] restartBrowser: ready");
   }
 
   /**
@@ -884,22 +1356,96 @@ export class VeoTokenCollector {
 
 /**
  * Singleton pattern: keep just one instance to reuse the Chrome context.
+ *
+ * IMPORTANT: we stash the instance on `globalThis` so it survives Next.js
+ * development-mode HMR reloads. Otherwise every code change wiped the
+ * module-level var, the next VEO request built a fresh collector and it
+ * opened brand-new image + video tabs on top of the old ones.
  */
-let _singleton: VeoTokenCollector | null = null;
-let _initPromise: Promise<VeoTokenCollector> | null = null;
+type VeoSingletonStore = {
+  instance: VeoTokenCollector | null;
+  initPromise: Promise<VeoTokenCollector> | null;
+};
+const GLOBAL_KEY = "__veoTokenCollectorSingleton__";
+function getStore(): VeoSingletonStore {
+  const g = globalThis as unknown as Record<string, VeoSingletonStore | undefined>;
+  if (!g[GLOBAL_KEY]) g[GLOBAL_KEY] = { instance: null, initPromise: null };
+  return g[GLOBAL_KEY]!;
+}
+
+/**
+ * Drop any cached instance that can't serve the current code path. Two
+ * independent failure modes are handled here:
+ *
+ *  1. **Dead browser** — the user closed the Chrome window while the app
+ *     sat idle. `isAlive()` returns false and we must reconnect.
+ *
+ *  2. **Stale prototype (HMR)** — Next.js dev-mode reloaded this module
+ *     after a code edit, which gives us a brand-new `VeoTokenCollector`
+ *     class object (new function identity, new prototype chain). The
+ *     instance still parked on `globalThis` was constructed by the OLD
+ *     class, so it lacks any methods we've added since. `instanceof` is
+ *     the principled way to detect this: the old instance is NOT an
+ *     instance of the *current* class, even though they share a name.
+ *     Trying to duck-type individual methods would only paper over each
+ *     symptom until the next method gets added.
+ *
+ * When either check fails we close the old instance's resources (via
+ * optional chaining because the old prototype may even lack `.close`)
+ * and start fresh.
+ */
+async function dropStaleInstance(store: VeoSingletonStore): Promise<void> {
+  const inst = store.instance;
+  if (!inst) return;
+  const isCurrentClass = inst instanceof VeoTokenCollector;
+  const alive = isCurrentClass ? safeIsAlive(inst) : false;
+  if (isCurrentClass && alive) return;
+  console.warn(
+    `[VEO] Dropping cached collector (currentClass=${isCurrentClass}, alive=${alive}) — reinitialising`,
+  );
+  try {
+    const closer = (inst as { close?: () => Promise<void> }).close;
+    if (typeof closer === "function") await closer.call(inst);
+  } catch {
+    // ignore: the stale instance may already be in a broken state
+  }
+  store.instance = null;
+  store.initPromise = null;
+}
+
+function safeIsAlive(inst: VeoTokenCollector): boolean {
+  try {
+    return inst.isAlive();
+  } catch {
+    return false;
+  }
+}
 
 export async function getVeoCollector(): Promise<VeoTokenCollector> {
-  if (_singleton) return _singleton;
-  if (_initPromise) return _initPromise;
-  _initPromise = (async () => {
+  const store = getStore();
+  await dropStaleInstance(store);
+  if (store.instance) return store.instance;
+  if (store.initPromise) {
+    // There's an in-flight init. Await it, then re-validate: if HMR raced
+    // and the resolved value belongs to an older class, dropStaleInstance
+    // will clean it up on the next pass and we'll retry.
+    try {
+      const pending = await store.initPromise;
+      if (pending instanceof VeoTokenCollector && safeIsAlive(pending)) return pending;
+    } catch {
+      // fall through and start fresh
+    }
+    await dropStaleInstance(store);
+  }
+  store.initPromise = (async () => {
     const inst = new VeoTokenCollector();
     try {
       await inst.init();
-      _singleton = inst;
+      store.instance = inst;
       return inst;
     } finally {
-      _initPromise = null;
+      store.initPromise = null;
     }
   })();
-  return _initPromise;
+  return store.initPromise;
 }

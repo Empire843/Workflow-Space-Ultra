@@ -1,5 +1,7 @@
 "use client";
 
+import { useEffect, useRef } from "react";
+
 import { useWorkflowStore } from "@/state/workflowStore";
 
 import CanvasShell from "./canvas/CanvasShell";
@@ -7,12 +9,30 @@ import WorkflowDashboard from "./dashboard/WorkflowDashboard";
 import NodeInspector from "./inspector/NodeInspector";
 import SessionErrorDialog from "./session/SessionErrorDialog";
 import LeftToolbar from "./toolbar/LeftToolbar";
-import NodePalette from "./sidebar/NodePalette";
 import TopBar from "./topbar/TopBar";
 
 export default function WorkflowRouter() {
   const activeId = useWorkflowStore((s) => s.activeWorkflowId);
-  const showPalette = useWorkflowStore((s) => s.showPalette);
+  const lastPrewarmId = useRef<string | null>(null);
+
+  // Fire a best-effort pre-warm as soon as a workflow opens. Server-side
+  // dedupe means this is safe to call even if the user rapidly toggles
+  // between workflows — only the first POST kicks off real work. The
+  // collector is primed before the user clicks Run, so the first job no
+  // longer eats the 20-30s cold start.
+  useEffect(() => {
+    if (!activeId) return;
+    if (lastPrewarmId.current === activeId) return;
+    lastPrewarmId.current = activeId;
+    fetch("/api/auth/prewarm", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ targets: ["veo", "grok"] }),
+    }).catch(() => {
+      // ignore — prewarm is best-effort, the 401 retry loop is the real
+      // safety net for expired tokens.
+    });
+  }, [activeId]);
 
   if (!activeId) {
     return (
@@ -28,7 +48,6 @@ export default function WorkflowRouter() {
       <TopBar />
       <LeftToolbar />
       <CanvasShell />
-      {showPalette && <NodePalette />}
       <NodeInspector />
       <SessionErrorDialog />
     </main>

@@ -118,6 +118,89 @@ describe("lanes.runInLane", () => {
     await expect(t2).resolves.toBe("ok");
   });
 
+  it("decrements lane.active even when the settle handler throws", async () => {
+    // Regression: the old drain() called task.resolve(v) outside try/catch.
+    // If a downstream listener (e.g. SSE send) threw synchronously, the
+    // `.finally` still fired BUT the `.then(resolve)` callback's error
+    // propagated to unhandledRejection. Here we simulate a resolve handler
+    // that throws synchronously and verify the lane still accepts more work.
+    const { runInLane, setLaneConcurrency, getLaneStats } = await freshLanes();
+    setLaneConcurrency("grok", 1);
+
+    // First task resolves; we attach a .then that throws to mimic a broken
+    // listener. The lane must still drain the next task.
+    const p1 = runInLane("grok", async () => "first");
+    p1.then(() => {
+      throw new Error("listener exploded");
+    }).catch(() => { /* swallow for test */ });
+
+    await expect(p1).resolves.toBe("first");
+
+    // active must be back to 0 so the next task runs immediately.
+    const p2 = runInLane("grok", async () => "second");
+    await expect(p2).resolves.toBe("second");
+
+    expect(getLaneStats().grok.active).toBe(0);
+  });
+
+  it("cancelQueuedTasks rejects waiting tasks without running them", async () => {
+    const { runInLane, cancelQueuedTasks, setLaneConcurrency, getLaneStats } = await freshLanes();
+    setLaneConcurrency("veo", 1);
+
+    const gate = deferred();
+    const running = runInLane("veo", async () => {
+      await gate.p;
+      return "running";
+    });
+
+    let ranB = false;
+    const p2 = runInLane("veo", async () => {
+      ranB = true;
+      return "b";
+    });
+    let ranC = false;
+    const p3 = runInLane("veo", async () => {
+      ranC = true;
+      return "c";
+    });
+
+    await new Promise((r) => setTimeout(r, 0));
+    expect(getLaneStats().veo.queued).toBe(2);
+
+    const dropped = cancelQueuedTasks();
+    expect(dropped).toBeGreaterThanOrEqual(2);
+    await expect(p2).rejects.toThrow("Cancelled");
+    await expect(p3).rejects.toThrow("Cancelled");
+    expect(ranB).toBe(false);
+    expect(ranC).toBe(false);
+
+    gate.resolve();
+    await expect(running).resolves.toBe("running");
+  });
+
+  it("resetAllLanes zeroes active counter (emergency escape hatch)", async () => {
+    const { runInLane, setLaneConcurrency, resetAllLanes, getLaneStats } = await freshLanes();
+    setLaneConcurrency("grok", 1);
+
+    const gate = deferred();
+    const p = runInLane("grok", async () => {
+      await gate.p;
+      return "done";
+    });
+
+    await new Promise((r) => setTimeout(r, 0));
+    expect(getLaneStats().grok.active).toBe(1);
+
+    const result = resetAllLanes();
+    expect(result.activeReset.grok).toBe(1);
+    expect(getLaneStats().grok.active).toBe(0);
+
+    // The still-pending promise resolves when we open the gate — it's now
+    // detached from lane bookkeeping but doesn't throw.
+    gate.resolve();
+    await expect(p).resolves.toBe("done");
+  });
+
   it("setLaneConcurrency drains queued tasks when raised", async () => {
     const { runInLane, setLaneConcurrency } = await freshLanes();
     setLaneConcurrency("local", 1);

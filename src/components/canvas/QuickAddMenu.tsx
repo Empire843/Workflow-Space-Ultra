@@ -40,9 +40,15 @@ const GROUP_LABEL: Record<NodeCatalogEntry["group"], string> = {
   content: "Content",
   generation: "Generation",
   transformation: "Transformation",
+  layout: "Layout",
 };
 
-const GROUP_ORDER: NodeCatalogEntry["group"][] = ["generation", "content", "transformation"];
+const GROUP_ORDER: NodeCatalogEntry["group"][] = [
+  "generation",
+  "content",
+  "transformation",
+  "layout",
+];
 
 export interface QuickAddMenuProps {
   /** Viewport-relative pixel coordinates of the click. */

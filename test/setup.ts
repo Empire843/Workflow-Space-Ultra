@@ -3,7 +3,17 @@
  * EventSource polyfill that can be driven by the fake job server helper.
  */
 
+import os from "node:os";
+import path from "node:path";
+
 import { afterEach, vi } from "vitest";
+
+// Point the OAuth file store at a tmpdir so tests never touch the real
+// `data_general/oauth/` folder. Modules read `WSU_OAUTH_DIR` via the
+// `oauthDir()` getter, so setting this at setup time is enough.
+if (!process.env.WSU_OAUTH_DIR) {
+  process.env.WSU_OAUTH_DIR = path.join(os.tmpdir(), `wsu-oauth-test-${process.pid}`);
+}
 
 declare global {
   interface Window {

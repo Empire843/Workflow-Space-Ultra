@@ -296,6 +296,44 @@ export default function WorkflowDashboard() {
   }, []);
   useEffect(() => { refreshAuth(); }, [refreshAuth]);
 
+  // Sync MCP-created workflows from filesystem into IndexedDB so they appear
+  // on the dashboard. The server returns only workflows with `fromMcp: true`
+  // that were created via the MCP build_workflow / gen tools.
+  useEffect(() => {
+    let alive = true;
+    const sync = async () => {
+      try {
+        const res = await fetch("/api/workflows/list", { cache: "no-store" });
+        const body = await res.json() as {
+          ok: boolean;
+          workflows: Array<{
+            id: string;
+            name: string;
+            nodes: unknown[];
+            edges: unknown[];
+            updatedAt: number;
+          }>;
+        };
+        if (!alive || !body.ok || !body.workflows?.length) return;
+        const d = db();
+        for (const wf of body.workflows) {
+          const exists = await d.workflows.get(wf.id);
+          if (!exists) {
+            await d.workflows.put({
+              id: wf.id,
+              name: wf.name,
+              createdAt: wf.updatedAt,
+              updatedAt: wf.updatedAt,
+              data: { nodes: wf.nodes, edges: wf.edges },
+            });
+          }
+        }
+      } catch { /* ignore */ }
+    };
+    void sync();
+    return () => { alive = false; };
+  }, []);
+
   return (
     <div className="h-screen w-screen overflow-auto bg-[color:var(--color-bg)]">
       {/* Header */}

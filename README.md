@@ -31,9 +31,9 @@ A node-based AI workflow canvas (Picsart Flow / Freepik AI Suite–style) for **
 ## What it does
 
 - Compose AI image/video pipelines visually on an infinite canvas: drop nodes, wire them up, hit run.
-- Generate with **VEO 3.1 Ultra** (text→image, text→video, image→video, start+end frame).
-- Generate with **Grok Imagine** (text→video, image→video, auto-upscale to HD).
-- Manage many separate workflows from a dashboard, all auto-saved locally.
+- Generate with **VEO 3.1 Ultra** (text→image, video, start+end frame — text or image input is auto-detected from the upstream graph).
+- Generate with **Grok Imagine** (video with auto-upscale to HD — image input is auto-detected from the upstream graph).
+- Manage many separate workflows from a dashboard, all auto-saved locally. Generated media and uploads live under `Workflows/<id>/assets/` so previews keep working even after you switch Google / xAI accounts.
 
 ## Highlights
 
@@ -74,6 +74,50 @@ That's it. Sessions are cached locally; you only need to re-login when they expi
 
 Defaults work out of the box. To override, copy `.env.example` → `.env.local` or use the in-app **Settings** dialog.
 
+### Parallel speed: VEO image batcher (R2)
+
+When the workflow has several `gen.image` nodes firing at once, setting
+`VEO_IMAGE_BATCH=1` merges them into a single `batchGenerateImages` API call
+using **one reCAPTCHA token** instead of N. Expected win scales with parallel
+image nodes (1 reCAPTCHA ≈ 8–25s, so 4 merged → save 3 × reCAPTCHA).
+
+```powershell
+$env:VEO_IMAGE_BATCH="1"
+$env:VEO_IMAGE_BATCH_MAX="4"      # max prompts per batch (default 4, cap 8)
+$env:VEO_IMAGE_BATCH_WINDOW_MS="300"  # coalesce window (default 300ms)
+npm run dev
+```
+
+Guarantees: same result as the non-batched path. Different `modelLabel`s are
+never merged (API rejects mixed-model requests). On any demux/API failure,
+the batcher transparently falls back to per-caller individual calls — zero
+data loss, only no speedup for that round. Measure via `npm run bench`:
+look for a new `veo.batch.createImage` span and a drop in `veo.recaptcha.image`
+count relative to `executor.gen.image`.
+
+### Workflow assets on disk
+
+Every generated image / video and every file the user drags into an Upload
+node is copied to `Workflows/<workflowId>/assets/`:
+
+```
+Workflows/
+  wf_<ts>_<rand>/
+    assets/
+      outputs/   ← generated VEO/Grok results (≥ 2K images, ≥ 720p video)
+      uploads/   ← files uploaded via Upload nodes
+```
+
+Preview URLs on the canvas point at `/api/workflows/<id>/assets/<path>` so
+they stay valid after an account switch or restart, and the whole workflow
+can be archived by zipping its folder. Runs initiated outside of any open
+workflow still work — they fall back to the flat `downloads/` directory as
+before.
+
+### Grok content moderation — `hallucinatedSuccess` failure mode
+
+Grok I2V/T2V đôi khi trả `HTTP 200` không kèm video và **không có flag reject rõ ràng** (text model nói "I generated a video…" nhưng không thực sự gọi `videoGen`). Executor phát hiện pattern này qua `sawSvr=false` + template match, dừng retry, và in hint kèm **danh sách trigger cụ thể tìm thấy trong prompt**. Chi tiết + recipe debug + khi nào nên swap sang Veo: [`wiki/features/grok-moderation.md`](wiki/features/grok-moderation.md).
+
 ### Debugging undocumented VEO endpoints
 
 If VEO/Flow changes its payload schema and calls start returning `400 Unknown name "…" at "…"`, enable **capture mode** to record the real payload that labs.google's UI sends and compare it against what the tool sends:
@@ -83,6 +127,197 @@ $env:VEO_CAPTURE_PAYLOADS="1"; npm run dev
 ```
 
 Then perform the action in the labs.google tab that the tool keeps open (upload a reference image, hit Generate, …). Every intercepted `batchGenerateImages` / `batchAsync*` request is logged as a `[VEO CAPTURE]` block in the terminal — URL, full request body, no truncation. The requests are still short-circuited with `403` so nothing actually fires against your quota. Unset the env var to return to normal run mode.
+
+## MCP server (Cursor / Claude Desktop / ChatGPT / Antigravity integration)
+
+> **Full reference**: see [`wiki/reference/mcp.md`](wiki/reference/mcp.md) for the complete
+> architecture, tool catalog, resource schema, security model, Antigravity
+> setup, and troubleshooting guide. The section below is the quickstart only.
+> For AI-agent-oriented usage patterns and workflow templates, see [`wiki/agents/`](wiki/agents/).
+
+Workflow Space Ultra ships an optional **MCP (Model Context Protocol)** surface
+so any MCP-aware AI host can trigger VEO / Grok generation, inspect the job
+queue, list/read workflow assets, and check login status — all through the
+same executor, queue, and concurrency lanes the canvas UI uses.
+
+Two transports are supported; pick one based on how your host connects:
+
+### Option A — stdio (recommended for local Cursor / Claude Desktop)
+
+1. Build the bundle once (and re-run whenever `src/server/mcp/**` changes):
+
+   ```powershell
+   npm run mcp:build
+   ```
+
+2. Point your MCP client at `bin/wsu-mcp.mjs`. **`cwd` matters** — the server
+   resolves `data_general/`, `Workflows/`, and the Chrome user-data dirs
+   relative to it.
+
+   **Cursor** (`.cursor/mcp.json` in any workspace or `%USERPROFILE%\.cursor\mcp.json` globally):
+
+   ```json
+   {
+     "mcpServers": {
+       "workflow-space-ultra": {
+         "command": "node",
+         "args": ["D:/tool/master_video/workflow-space-ultra/bin/wsu-mcp.mjs"],
+         "cwd": "D:/tool/master_video/workflow-space-ultra"
+       }
+     }
+   }
+   ```
+
+   **Claude Desktop** (`%APPDATA%\Claude\claude_desktop_config.json`): same
+   shape as above, nested under the top-level `mcpServers` object.
+
+3. Restart the host. The stdio MCP server spawns on first tool invocation;
+   no need to have `npm run dev` running.
+
+### Option B — HTTP (remote clients, ChatGPT, shared team server)
+
+1. Start Next.js as usual: `npm run dev`.
+2. Grab the bearer token. On first start, a new random token is written to
+   `data_general/mcp_token.txt`; the terminal prints its location. To use a
+   fixed token instead, set `MCP_TOKEN=...` in the environment before
+   `npm run dev`.
+3. Configure the client to hit `POST http://localhost:3000/api/mcp` with the
+   `Authorization: Bearer <token>` header. Example Cursor config:
+
+   ```json
+   {
+     "mcpServers": {
+       "workflow-space-ultra": {
+         "url": "http://localhost:3000/api/mcp",
+         "headers": { "Authorization": "Bearer <paste-token-here>" }
+       }
+     }
+   }
+   ```
+
+Never expose the HTTP endpoint to the public internet without a tunnel (SSH,
+Cloudflare Tunnel, Tailscale …) — the VEO / Grok sessions bound to your
+Chrome profile are full-strength credentials.
+
+### What's exposed
+
+**Tools**
+
+| Name                   | Purpose                                                                   |
+| ---------------------- | ------------------------------------------------------------------------- |
+| `gen_image`            | VEO Nano Banana / Imagen text-to-image (+ optional reference images)      |
+| `gen_video_t2v`        | Text-to-video on VEO or Grok                                              |
+| `gen_video_i2v`        | Image-to-video (image = start frame) on VEO or Grok                       |
+| `gen_video_start_end`  | VEO frame-first-last: morph from start image to end image                 |
+| `upscale_grok`         | Placeholder — not wired up yet, use the UI's Upscale node                 |
+| `get_job`              | Poll a single queue job by id                                             |
+| `cancel_job`           | Cancel a running job (pass `"*"` to cancel every non-terminal job)        |
+| `list_jobs`            | Snapshot of the in-memory queue                                           |
+| `list_workflows`       | Scan `Workflows/` on disk; returns id + asset count + `hasSnapshot` flag  |
+| `get_workflow`         | Returns the latest `snapshot.json` (nodes + edges + name)                 |
+| `auth_status`          | Read the cached VEO + Grok session tokens                                 |
+| `open_login`           | Open Chrome and navigate to the VEO / Grok login URL                      |
+
+**Resources**
+
+- `wsu://workflow/<id>/snapshot` — JSON graph (nodes + edges), synced from the
+  browser. Only populated after the user opens the workflow once.
+- `wsu://workflow/<id>/assets/<path>` — binary / text asset living under
+  `Workflows/<id>/assets`. Path traversal is rejected.
+
+Generation tools **block** until the underlying job finishes, then return the
+local file URL. The MCP host can immediately turn around and read that URL via
+the `wsu://…/assets/…` resource — no separate download step needed.
+
+### Constraints to know
+
+- VEO / Grok rely on a **logged-in Chrome on the same machine**. MCP clients
+  running on another machine must tunnel back; there is no cloud path.
+- Workflow graphs live in the browser's IndexedDB. The client mirrors them to
+  `Workflows/<id>/snapshot.json` on every save, but until the user opens a
+  workflow once in the UI, `get_workflow` returns "no snapshot".
+- The MCP server reuses the canvas's queue + lanes — firing a generation tool
+  while the UI is busy will queue up behind UI jobs (and vice versa).
+
+## ChatGPT GPT Action (OAuth)
+
+> **Deep dive**: [`wiki/features/chatgpt-action.md`](wiki/features/chatgpt-action.md) — architecture, token lifecycle, threat model, troubleshooting. The section below is the 5-step quickstart only.
+
+WSU can be registered as a **Custom GPT Action** on `chatgpt.com`: ChatGPT
+calls your local WSU through REST, with OAuth 2.0 authentication, to trigger
+VEO / Grok generation and build workflow graphs on the canvas — same set of
+capabilities as the MCP server but reachable from ChatGPT itself.
+
+Because ChatGPT's servers can't dial `localhost`, you need a public tunnel.
+
+1. **Start a tunnel** pointing at `http://localhost:3000`, e.g.
+
+   ```powershell
+   ngrok http 3000
+   # → forwarding https://aXXX-XXX-XXX-XXX.ngrok-free.app -> http://localhost:3000
+   ```
+
+2. **Tell WSU its public URL** before starting `npm run dev`:
+
+   ```powershell
+   $env:WSU_PUBLIC_BASE_URL="https://aXXX-XXX-XXX-XXX.ngrok-free.app"
+   npm run dev
+   ```
+
+3. **Create a WSU OAuth client**: open `http://localhost:3000` → Settings →
+   **ChatGPT GPT Action (OAuth)**. A default "ChatGPT" client is pre-created.
+   Click **Rotate secret** to reveal a one-shot plaintext secret (the server
+   only keeps the sha-256 hash after you close the reveal block).
+
+4. **Create the Custom GPT** on `chatgpt.com` → Explore GPTs → Create:
+   - In "Actions", click **Import from URL** and paste the value from
+     **OpenAPI schema URL** in WSU Settings (`<public>/api/actions/openapi`).
+   - Under "Authentication", pick **OAuth**:
+     - Client ID: copy from WSU Settings.
+     - Client Secret: the one-shot secret from step 3.
+     - Authorization URL + Token URL: copy from WSU Settings.
+     - Scope: `wsu:all`.
+     - Token Exchange Method: **POST (Default)**.
+   - Save. ChatGPT generates a redirect URI that looks like
+     `https://chat.openai.com/aip/g-XXXXXXXXX/oauth/callback` (and a second
+     one under `chatgpt.com/aip/...`). Copy both, paste them into the client's
+     **Redirect URIs** list in WSU Settings.
+
+5. **Test-drive**: back in ChatGPT, open the GPT and invoke any action. The
+   first call redirects you through WSU's consent page; click **Allow** and
+   the flow completes. From here on, `gen_image` / `gen_video_*` /
+   `build_workflow` can be invoked by your GPT like native tools, and every
+   generation shows up on the canvas in real time.
+
+Threat model note: the tunnel exposes every `/api/*` route, but
+admin-only endpoints (`/api/oauth/clients/*`, `/api/config`) are restricted
+to the `Host: localhost:*` header, so ChatGPT's cloud traffic can only reach
+the OAuth + Actions surface. Tokens are stored hashed. Even so, treat the
+tunnel URL as sensitive — anyone who learns it can attempt a brute-force
+OAuth login against your client secret.
+
+## Documentation
+
+> The detailed documentation lives in a **private git submodule** mounted at [`wiki/`](wiki/). It is not included in this public repository. Contributors with access can initialise it with `git submodule update --init --recursive`; without access the links below will be empty locally.
+
+Structure (available after initialising the submodule):
+
+| Section | Contents |
+| --- | --- |
+| [`wiki/architecture/`](wiki/architecture/) | System overview, auth & tokens, providers (VEO, Grok), canvas & state, queue & lanes, MCP architecture |
+| [`wiki/features/`](wiki/features/) | Per-feature deep dives — cascading-run, text-chain, multi-workflow, undo/redo, quick-add-menu, Grok moderation, session-error dialog |
+| [`wiki/reference/`](wiki/reference/) | MCP full reference, env vars, API routes, node catalog, file layout |
+| [`wiki/operations/`](wiki/operations/) | Benchmarks (`npm run bench`), debugging VEO payload capture |
+| [`wiki/plans/`](wiki/plans/) | Active/archived design plans (refactor-parallel, grok-image, text-chain) |
+| [`wiki/agents/`](wiki/agents/) | Primer + workflow templates for AI agents using MCP |
+| [`wiki/history/`](wiki/history/) | Master plan history + original requirements log |
+
+Recommended starting points:
+
+- **New user / just want to run it** — finish this README, then skim [`wiki/features/`](wiki/features/).
+- **Developer** — [`wiki/architecture/overview.md`](wiki/architecture/overview.md) → the specific architecture file for the area you touch.
+- **AI agent via MCP** — [`wiki/agents/README.md`](wiki/agents/README.md) + [`wiki/reference/mcp.md`](wiki/reference/mcp.md).
+- **Debug a failed run** — [`wiki/operations/debugging-veo.md`](wiki/operations/debugging-veo.md) + [`wiki/features/grok-moderation.md`](wiki/features/grok-moderation.md).
 
 ## License
 

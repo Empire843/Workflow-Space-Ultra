@@ -1,10 +1,27 @@
-import { loadConfig, type AccountType } from "../../config";
-import { getVeoCollector } from "../../tokens/veoTokenCollector";
+import type { Page } from "playwright";
 
+import { loadConfig, type AccountType } from "../../config";
+import { timedSpan } from "../../telemetry/timing";
+import { sessionTelemetry } from "../../tokens/sessionTelemetry";
+import { getVeoCollector, type VeoTokenCollector } from "../../tokens/veoTokenCollector";
+import {
+  cancelableSleep,
+  ensureNotCancelled,
+  raceCancel,
+  type ShouldCancel,
+} from "../cancellation";
+
+import { getCreateImageBatcher, readBatcherConfig } from "./batcher";
+import { cooldownRemainingMs, waitForCooldown } from "./cooldown";
+import {
+  isRecaptchaError,
+  isTransientPageError,
+  isUnauthenticated,
+} from "./errors";
 import {
   buildCreateImagePayload,
   parseGeneratedImages,
-  requestCreateImage,
+  requestCreateImageViaBrowser,
   type CreateImageOptions,
   type GeneratedImage,
 } from "./createImage";
@@ -12,15 +29,15 @@ import { downloadToDisk } from "./download";
 import {
   buildI2VPayload,
   parseUploadMediaId,
-  requestCreateI2V,
-  requestUploadUserImage,
+  requestCreateI2VViaBrowser,
+  requestUploadUserImageViaBrowser,
   type I2VCreateOptions,
   type UploadImageOptions,
 } from "./imageToVideo";
 import {
   parseOperationsFromCreateResponse,
   requestCheckStatus,
-  requestCreateT2V,
+  requestCreateT2VViaBrowser,
   type OperationRef,
   type StatusEntry,
   type T2VCreateOptions,
@@ -46,50 +63,178 @@ interface AuthCtx {
   accountType: AccountType;
 }
 
+/**
+ * Peek at the VEO auth tab's current URL and raise a VEO-classified error
+ * BEFORE we try to extract tokens. Previously, if Chrome had been logged
+ * out of Google (or the user closed the Flow project tab), `collectAuth`
+ * would wait the full timeout for listeners that never fire, then throw a
+ * generic "Timeout chờ session/projectId/accessToken". This version trips
+ * early with a message the session-error classifier picks up as `veo`,
+ * so the dialog appears immediately and the user knows exactly which
+ * Chrome needs attention.
+ *
+ * Only warns when we have a concrete signal — navigation is deferred to
+ * the token collector itself. The 5s ceiling keeps this step
+ * imperceptible when things are fine.
+ */
+async function verifyVeoPageAccessible(
+  collector: VeoTokenCollector,
+  onLog?: LogFn,
+): Promise<void> {
+  const page = collector.getPage?.();
+  if (!page) return; // nothing to check yet; collector will bootstrap it
+  let url = "";
+  try {
+    url = page.url() || "";
+  } catch {
+    return;
+  }
+  // Google's "signed out" landing page — plain `accounts.google.com` or
+  // `/ServiceLogin` shows up here when the profile's cookie got revoked.
+  if (/accounts\.google\.com\/ServiceLogin|\/logout|signin/i.test(url)) {
+    sessionTelemetry.record({
+      target: "veo",
+      kind: "preflight_fail",
+      detail: `redirected to ${url.slice(0, 120)}`,
+    });
+    onLog?.("Chrome VEO đã bị đăng xuất — cần login lại.");
+    throw new Error(
+      `VEO session: Chrome đã bị đăng xuất khỏi Google Flow (URL hiện tại: ${url.slice(0, 80)}…). Hãy mở lại Chrome VEO và đăng nhập trước khi chạy.`,
+    );
+  }
+  // If we've been redirected outside labs.google entirely (e.g. the user
+  // navigated away and nothing we control is still open), trip early.
+  if (url && !/about:|chrome:|labs\.google/i.test(url)) {
+    sessionTelemetry.record({
+      target: "veo",
+      kind: "preflight_fail",
+      detail: `off-site url ${url.slice(0, 120)}`,
+    });
+    onLog?.("Tab VEO không còn ở Google Flow — session có thể đã hết hạn.");
+    throw new Error(
+      `VEO session: Tab Chrome không ở labs.google nữa (URL: ${url.slice(0, 80)}…). Mở lại Chrome VEO rồi thử lại.`,
+    );
+  }
+}
+
 async function buildBaseAuth(onLog?: LogFn) {
-  onLog?.("Kết nối VEO session…");
-  const collector = await getVeoCollector();
-  const auth = await collector.collectAuth();
-  const config = loadConfig();
-  const accountType: AccountType = config.account1.TYPE_ACCOUNT || "ULTRA";
-  onLog?.("Session OK. Chuẩn bị reCAPTCHA…");
-  return { collector, auth, accountType };
+  return timedSpan("veo.buildAuth", async () => {
+    onLog?.("Kết nối VEO session…");
+    const collector = await getVeoCollector();
+    // Race the pre-flight check against a 5s budget so we don't add
+    // perceptible latency when things are fine.
+    await Promise.race([
+      verifyVeoPageAccessible(collector, onLog),
+      new Promise<void>((resolve) => setTimeout(resolve, 5_000)),
+    ]);
+    const collectStarted = Date.now();
+    let auth;
+    try {
+      auth = await collector.collectAuth();
+      sessionTelemetry.record({
+        target: "veo",
+        kind: "collect_ok",
+        durationMs: Date.now() - collectStarted,
+      });
+    } catch (err) {
+      sessionTelemetry.record({
+        target: "veo",
+        kind: "collect_fail",
+        durationMs: Date.now() - collectStarted,
+        detail: err instanceof Error ? err.message.slice(0, 180) : String(err).slice(0, 180),
+      });
+      throw err;
+    }
+    const config = loadConfig();
+    const accountType: AccountType = config.account1.TYPE_ACCOUNT || "ULTRA";
+    onLog?.("Session OK. Chuẩn bị reCAPTCHA…");
+    return { collector, auth, accountType };
+  });
 }
 
 /**
- * Run `fn` with a fresh recaptcha token.
- * Retries once if:
- *   - 401 UNAUTHENTICATED → clear cache, reload page, fetch a new access_token
- *   - reCAPTCHA error     → invalidate the recaptcha cache and fetch a new token
+ * Run `fn` with a fresh recaptcha token **and** the browser tab that
+ * minted it. `fn` should call one of the `*ViaBrowser` wrappers with the
+ * given page so the resulting HTTP request shares the reCAPTCHA token's
+ * fingerprint (UA, TLS, Sec-CH-UA, Origin, Referer, cookies).
  *
- * `fn` receives `(recaptcha, ctx)` so it always uses the latest token (no stale closure).
+ * ## Error ladder
+ *
+ * ```
+ * Attempt 1  →  ok        : return
+ *            →  401       : invalidate auth, rebuild, retry (no escalation)
+ *            →  403/Recap : escalate to Attempt 2 with random 3-8s delay
+ * Attempt 2  →  ok        : return
+ *            →  403/Recap : clearSiteStorage(mode) → Attempt 3
+ * Attempt 3  →  ok        : return
+ *            →  403/Recap : restartBrowser() → Attempt 4
+ * Attempt 4  →  ok        : return
+ *            →  403/Recap : throw (give up; safety-net cooldown kicks in)
+ * ```
+ *
+ * This is the "Option 2" ladder from the Python reference
+ * (`A_workflow_text_to_video.py` lines 481-542). We deliberately do NOT
+ * call `recordRecaptchaStrike` on the happy path any more: once requests
+ * go through the browser, legitimate 403s are rare enough that the
+ * lane-wide cooldown only helps in genuine abuse situations, where the
+ * clearStorage / restartBrowser steps are the real cure. `cooldown.ts`
+ * is kept as a best-effort safety net (`cooldownRemainingMs()` is still
+ * honoured at entry).
  */
-function isRecaptchaError(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : String(err);
-  return (
-    /PUBLIC_ERROR_UNUSUAL_ACTIVITY/i.test(msg) ||
-    /reCAPTCHA evaluation failed/i.test(msg) ||
-    /PERMISSION_DENIED/i.test(msg)
-  );
-}
 
-function isUnauthenticated(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : String(err);
-  return / 401/.test(msg) || /UNAUTHENTICATED/i.test(msg);
+const MAX_RECAPTCHA_ATTEMPTS = 4;
+
+interface RecaptchaCtx {
+  recaptcha: string;
+  auth: AuthCtx;
+  page: Page;
+  collector: VeoTokenCollector;
 }
 
 async function withRecaptcha<T>(
-  fn: (recaptcha: string, ctx: AuthCtx) => Promise<T>,
+  fn: (ctx: RecaptchaCtx) => Promise<T>,
   mode: "video" | "image" = "video",
-  onLog?: LogFn
+  onLog?: LogFn,
+  shouldCancel?: ShouldCancel,
 ): Promise<T> {
+  ensureNotCancelled(shouldCancel);
   let { collector, auth, accountType } = await buildBaseAuth(onLog);
   let attempt = 0;
   while (true) {
     attempt++;
-    onLog?.(attempt > 1 ? "Lấy reCAPTCHA token (retry)… (~15-25s)" : "Lấy reCAPTCHA token… (~15-25s)");
-    const recaptcha = await collector.getFreshRecaptchaToken(25_000, mode);
-    onLog?.("reCAPTCHA OK. Đang gửi request…");
+    ensureNotCancelled(shouldCancel);
+
+    // Safety-net cooldown only. Happy path never writes to it; if it's set,
+    // some other lane hit a genuine abuse flag recently and we wait it out
+    // before spending another recaptcha token.
+    if (cooldownRemainingMs() > 0) {
+      await waitForCooldown(onLog, shouldCancel);
+    }
+
+    // Human-like delay between retries (not the first attempt). Google
+    // reCAPTCHA v3 Enterprise scores timing patterns: mechanical bursts
+    // get lower scores and trigger UNUSUAL_ACTIVITY more often.
+    if (attempt > 1) {
+      const delayMs = 3000 + Math.floor(Math.random() * 5000);
+      onLog?.(`Đợi ${(delayMs / 1000).toFixed(1)}s trước khi thử lại…`);
+      await cancelableSleep(delayMs, shouldCancel);
+    }
+
+    onLog?.(attempt > 1 ? `Lấy reCAPTCHA token (retry ${attempt}/${MAX_RECAPTCHA_ATTEMPTS})… (~15-25s)` : "Lấy reCAPTCHA token… (~15-25s)");
+    // Race the recaptcha capture against cancellation. The capture
+    // itself can't be aborted mid-flight (Playwright is holding a page
+    // lock), but raceCancel lets the caller unwind in ~200ms on cancel;
+    // the dangling capture completes in the background and its token
+    // is simply unused.
+    const recaptcha = await raceCancel(
+      timedSpan(`veo.recaptcha.${mode}`, () =>
+        collector.getFreshRecaptchaToken(25_000, mode),
+      ),
+      shouldCancel,
+    );
+    ensureNotCancelled(shouldCancel);
+    onLog?.("reCAPTCHA OK. Đang gửi request qua Chrome…");
+    const page = await collector.getPageForMode(mode);
     const ctx: AuthCtx = {
       accessToken: auth.accessToken,
       sessionId: auth.sessionId,
@@ -98,24 +243,55 @@ async function withRecaptcha<T>(
       accountType,
     };
     try {
-      return await fn(recaptcha, ctx);
+      return await raceCancel(fn({ recaptcha, auth: ctx, page, collector }), shouldCancel);
     } catch (err) {
-      if (attempt < 2 && isUnauthenticated(err)) {
-        // access_token expired — clear cache and re-collect from page
+      // Cancellation always exits the loop — never retry a cancelled op.
+      if (err instanceof Error && err.name === "JobCancelledError") throw err;
+      // Transient tab/network failure (e.g. status=0, Target closed). The
+      // recaptcha token and auth are still valid — all we need is a fresh
+      // page handle. Do NOT consume a 403-escalation slot on these.
+      if (attempt < MAX_RECAPTCHA_ATTEMPTS && isTransientPageError(err)) {
+        ensureNotCancelled(shouldCancel);
+        const snippet = err instanceof Error ? err.message.slice(0, 160) : String(err).slice(0, 160);
+        onLog?.(`Tab VEO bị ngắt giữa chừng — đang mở lại tab ${mode}… (${snippet})`);
+        collector.invalidatePageForMode(mode);
+        collector.invalidateRecaptchaCache();
+        // Don't burn a full 3-8s retry delay here (it's gated on attempt>1
+        // in the next loop iteration, which is fine).
+        continue;
+      }
+      if (attempt < MAX_RECAPTCHA_ATTEMPTS && isUnauthenticated(err)) {
+        ensureNotCancelled(shouldCancel);
         onLog?.("Token hết hạn (401) — đang refresh session… (~15s)");
         collector.invalidateAuth();
         const refreshed = await buildBaseAuth(onLog);
         collector = refreshed.collector;
-        // force=true to bypass the just-deleted cache file, reload the page to fetch a fresh token
         auth = await collector.collectAuth({ force: true });
         accountType = refreshed.accountType;
         collector.invalidateRecaptchaCache();
         continue;
       }
-      if (attempt < 2 && isRecaptchaError(err)) {
-        onLog?.("Lỗi reCAPTCHA — thử lại…");
+      if (attempt < MAX_RECAPTCHA_ATTEMPTS && isRecaptchaError(err)) {
+        ensureNotCancelled(shouldCancel);
         collector.invalidateRecaptchaCache();
-        await new Promise((r) => setTimeout(r, 1500));
+        // Escalation ladder: retry → clearStorage → restartBrowser.
+        // `attempt` is 1-based and already incremented, so the NEXT
+        // attempt number is what drives the escalation choice here.
+        const nextAttempt = attempt + 1;
+        if (nextAttempt === 3) {
+          onLog?.("Google flag 403 UNUSUAL_ACTIVITY lần 2 — xóa site storage + reload tab…");
+          await collector.clearSiteStorage(mode);
+        } else if (nextAttempt === 4) {
+          onLog?.("Google flag 403 UNUSUAL_ACTIVITY lần 3 — khởi động lại Chrome…");
+          await collector.restartBrowser();
+          // restartBrowser cleared auth; reload it from cache.
+          const refreshed = await buildBaseAuth(onLog);
+          collector = refreshed.collector;
+          auth = refreshed.auth;
+          accountType = refreshed.accountType;
+        } else {
+          onLog?.("Google flag 403 — thử lại với token mới…");
+        }
         continue;
       }
       throw err;
@@ -128,23 +304,31 @@ export async function veoCreateImage(
     CreateImageOptions,
     "recaptchaToken" | "accessToken" | "sessionId" | "projectId" | "cookie" | "accountType"
   >,
-  onLog?: LogFn
+  onLog?: LogFn,
+  shouldCancel?: ShouldCancel,
 ): Promise<{ raw: GeneratedImage[] }> {
-  return withRecaptcha(async (recaptcha, ctx) => {
-    const res = await requestCreateImage({
-      ...opts,
-      recaptchaToken: recaptcha,
-      accessToken: ctx.accessToken,
-      sessionId: ctx.sessionId,
-      projectId: ctx.projectId,
-      cookie: ctx.cookie,
-      accountType: ctx.accountType,
-    });
+  ensureNotCancelled(shouldCancel);
+  // R2 — when VEO_IMAGE_BATCH=1, coalesce concurrent callers into a single
+  // batchGenerateImages API call (one reCAPTCHA for N prompts). The batcher
+  // internally manages auth/reCAPTCHA/demux + falls back to individual calls
+  // when the response can't be safely split.
+  if (readBatcherConfig().enabled) {
+    return getCreateImageBatcher().submit(opts, onLog, shouldCancel);
+  }
+  return withRecaptcha(async ({ recaptcha, auth: ctx, page }) => {
+    const res = await timedSpan("veo.api.createImage", () =>
+      requestCreateImageViaBrowser(page, {
+        ...opts,
+        recaptchaToken: recaptcha,
+        accessToken: ctx.accessToken,
+        sessionId: ctx.sessionId,
+        projectId: ctx.projectId,
+        cookie: ctx.cookie,
+        accountType: ctx.accountType,
+      })
+    );
     if (!res.ok) {
       const refCount = opts.referenceImages?.length ?? 0;
-      // Rebuild payload once for logging so the shape we sent is visible in
-      // the SSE log. Reference mediaGenerationIds are trimmed to 24 chars
-      // each to keep the output readable while still being diff-able.
       let payloadDebug = "";
       try {
         const payload = buildCreateImagePayload({
@@ -175,29 +359,48 @@ export async function veoCreateImage(
       if (payloadDebug) {
         onLog?.(`DEBUG payload gửi: ${payloadDebug}`);
       }
+      // When the POST itself failed (status=0 + empty body), the only
+      // useful piece of context is in `res.error` (e.g. "Target closed",
+      // "timeout 60000ms exceeded", "ECONNRESET"). Without surfacing it
+      // the user just sees "VEO createImage 0:" which is unactionable.
+      const detail = res.body?.slice(0, 800) || res.error || "(no response body)";
       throw new Error(
-        `VEO createImage ${res.status}${refCount ? ` (with ${refCount} reference image${refCount > 1 ? "s" : ""})` : ""}: ${res.body.slice(0, 800)}`
+        `VEO createImage ${res.status}${refCount ? ` (with ${refCount} reference image${refCount > 1 ? "s" : ""})` : ""}: ${detail}`
       );
     }
     onLog?.("Đã nhận kết quả ảnh.");
     return { raw: parseGeneratedImages(res.body) };
-  }, "image", onLog);
+  }, "image", onLog, shouldCancel);
 }
 
 export async function veoUploadImage(
   opts: Omit<UploadImageOptions, "accessToken" | "sessionId" | "cookie">,
-  onLog?: LogFn
+  onLog?: LogFn,
+  shouldCancel?: ShouldCancel,
 ): Promise<string> {
-  const { auth } = await buildBaseAuth(onLog);
-  onLog?.("Đang upload ảnh tham chiếu lên VEO…");
-  const res = await requestUploadUserImage({
-    ...opts,
-    accessToken: auth.accessToken,
-    sessionId: auth.sessionId,
-    cookie: auth.cookie,
-  });
+  ensureNotCancelled(shouldCancel);
+  // Upload is usually a precursor to an I2V request, which will be sent
+  // from the "video" tab. Routing the upload through the same tab keeps
+  // the uploaded mediaId + the subsequent I2V token in a single
+  // fingerprint session, mirroring the Python reference workflow.
+  const { collector, auth } = await buildBaseAuth(onLog);
+  ensureNotCancelled(shouldCancel);
+  const page = await collector.getPageForMode("video");
+  onLog?.("Đang upload ảnh tham chiếu lên VEO qua Chrome…");
+  const res = await raceCancel(
+    timedSpan("veo.api.uploadImage", () =>
+      requestUploadUserImageViaBrowser(page, {
+        ...opts,
+        accessToken: auth.accessToken,
+        sessionId: auth.sessionId,
+        cookie: auth.cookie,
+      }),
+    ),
+    shouldCancel,
+  );
   if (!res.ok) {
-    throw new Error(`VEO uploadImage ${res.status}: ${res.body.slice(0, 400)}`);
+    const detail = res.body?.slice(0, 400) || res.error || "(no response body)";
+    throw new Error(`VEO uploadImage ${res.status}: ${detail}`);
   }
   const mediaId = parseUploadMediaId(res.body);
   if (!mediaId) throw new Error(`Không parse được mediaId từ response: ${res.body.slice(0, 300)}`);
@@ -210,24 +413,28 @@ export async function veoTextToVideo(
     T2VCreateOptions,
     "recaptchaToken" | "accessToken" | "sessionId" | "projectId" | "cookie" | "accountType"
   >,
-  onLog?: LogFn
+  onLog?: LogFn,
+  shouldCancel?: ShouldCancel,
 ): Promise<{ operations: OperationRef[] }> {
-  return withRecaptcha(async (recaptcha, ctx) => {
-    const res = await requestCreateT2V({
-      ...opts,
-      recaptchaToken: recaptcha,
-      accessToken: ctx.accessToken,
-      sessionId: ctx.sessionId,
-      projectId: ctx.projectId,
-      cookie: ctx.cookie,
-      accountType: ctx.accountType,
-    });
+  return withRecaptcha(async ({ recaptcha, auth: ctx, page }) => {
+    const res = await timedSpan("veo.api.t2v", () =>
+      requestCreateT2VViaBrowser(page, {
+        ...opts,
+        recaptchaToken: recaptcha,
+        accessToken: ctx.accessToken,
+        sessionId: ctx.sessionId,
+        projectId: ctx.projectId,
+        cookie: ctx.cookie,
+        accountType: ctx.accountType,
+      })
+    );
     if (!res.ok) {
-      throw new Error(`VEO t2v create ${res.status}: ${res.body.slice(0, 400)}`);
+      const detail = res.body?.slice(0, 400) || res.error || "(no response body)";
+      throw new Error(`VEO t2v create ${res.status}: ${detail}`);
     }
     onLog?.("Request tạo video đã gửi. Đang chờ VEO xử lý…");
     return { operations: parseOperationsFromCreateResponse(res.body) };
-  }, "video", onLog);
+  }, "video", onLog, shouldCancel);
 }
 
 export async function veoImageToVideo(
@@ -235,9 +442,10 @@ export async function veoImageToVideo(
     I2VCreateOptions,
     "recaptchaToken" | "accessToken" | "sessionId" | "projectId" | "cookie" | "accountType"
   >,
-  onLog?: LogFn
+  onLog?: LogFn,
+  shouldCancel?: ShouldCancel,
 ): Promise<{ operations: OperationRef[] }> {
-  return withRecaptcha(async (recaptcha, ctx) => {
+  return withRecaptcha(async ({ recaptcha, auth: ctx, page }) => {
     void buildI2VPayload({
       ...opts,
       recaptchaToken: recaptcha,
@@ -247,21 +455,24 @@ export async function veoImageToVideo(
       cookie: ctx.cookie,
       accountType: ctx.accountType,
     });
-    const res = await requestCreateI2V({
-      ...opts,
-      recaptchaToken: recaptcha,
-      accessToken: ctx.accessToken,
-      sessionId: ctx.sessionId,
-      projectId: ctx.projectId,
-      cookie: ctx.cookie,
-      accountType: ctx.accountType,
-    });
+    const res = await timedSpan("veo.api.i2v", () =>
+      requestCreateI2VViaBrowser(page, {
+        ...opts,
+        recaptchaToken: recaptcha,
+        accessToken: ctx.accessToken,
+        sessionId: ctx.sessionId,
+        projectId: ctx.projectId,
+        cookie: ctx.cookie,
+        accountType: ctx.accountType,
+      })
+    );
     if (!res.ok) {
-      throw new Error(`VEO i2v create ${res.status}: ${res.body.slice(0, 400)}`);
+      const detail = res.body?.slice(0, 400) || res.error || "(no response body)";
+      throw new Error(`VEO i2v create ${res.status}: ${detail}`);
     }
     onLog?.("Request tạo video (I2V) đã gửi. Đang chờ VEO xử lý…");
     return { operations: parseOperationsFromCreateResponse(res.body) };
-  }, "video", onLog);
+  }, "video", onLog, shouldCancel);
 }
 
 export interface PollResult {
@@ -274,11 +485,8 @@ export async function veoPollStatus(operations: OperationRef[]): Promise<PollRes
   let attempt = 0;
   while (true) {
     attempt++;
-    const { http, entries } = await requestCheckStatus(
-      operations,
-      auth.accessToken,
-      auth.sessionId,
-      auth.cookie
+    const { http, entries } = await timedSpan("veo.api.pollStatus", () =>
+      requestCheckStatus(operations, auth.accessToken, auth.sessionId, auth.cookie)
     );
     if (!http.ok) {
       if (attempt < 2 && http.status === 401) {
@@ -303,17 +511,20 @@ export async function veoPollStatus(operations: OperationRef[]): Promise<PollRes
 export async function veoWaitForVideos(
   operations: OperationRef[],
   onProgress?: (entries: StatusEntry[]) => void,
-  opts?: { intervalMs?: number; timeoutMs?: number }
+  opts?: { intervalMs?: number; timeoutMs?: number; shouldCancel?: ShouldCancel }
 ): Promise<StatusEntry[]> {
-  const { intervalMs = 4000, timeoutMs = 15 * 60_000 } = opts || {};
+  const { intervalMs = 4000, timeoutMs = 15 * 60_000, shouldCancel } = opts || {};
   const deadline = Date.now() + timeoutMs;
   let last: StatusEntry[] = [];
   while (Date.now() < deadline) {
+    ensureNotCancelled(shouldCancel);
     const { entries, finishedAll } = await veoPollStatus(operations);
     last = entries;
     onProgress?.(entries);
     if (finishedAll) return entries;
-    await new Promise((r) => setTimeout(r, intervalMs));
+    // Interruptible wait: cancel takes effect in ~200ms instead of
+    // sitting through the full 4s poll interval.
+    await cancelableSleep(intervalMs, shouldCancel);
   }
   throw new Error("VEO poll timeout");
 }

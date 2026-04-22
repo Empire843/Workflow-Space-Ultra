@@ -8,6 +8,7 @@ node_modules/
 out/
 build/
 dist/
+dist-mcp/
 
 # ==================== env / secrets ====================
 .env
@@ -44,6 +45,9 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
+# Runtime error log (logs/error.log + rotations)
+logs/
+
 # ==================== typescript ====================
 *.tsbuildinfo
 next-env.d.ts
@@ -59,3 +63,9 @@ desktop.ini
 
 # docs
 .docs/
+
+# Private documentation — will later be registered as a git submodule pointing
+# to a private repo. Until then this path must NEVER be committed to the public
+# repo. After submodule registration, remove this entry (submodules are tracked
+# via .gitmodules + gitlink, not ignored).
+# wiki/

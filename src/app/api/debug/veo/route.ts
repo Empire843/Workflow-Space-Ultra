@@ -3,6 +3,8 @@ import { NextResponse } from "next/server";
 import { getVeoCollector } from "@/server/tokens/veoTokenCollector";
 import { findRunningCdpPortForUserData } from "@/server/chrome/processManager";
 import { VEO_USER_DATA_DIR } from "@/server/config";
+import { computeVeoHealth } from "@/server/tokens/sessionHealth";
+import { sessionTelemetry } from "@/server/tokens/sessionTelemetry";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -16,6 +18,8 @@ export const dynamic = "force-dynamic";
  */
 export async function GET() {
   const out: Record<string, unknown> = {};
+  out.health = computeVeoHealth();
+  out.telemetry = sessionTelemetry.recent("veo", 50);
 
   try {
     out.userDataDir = VEO_USER_DATA_DIR;

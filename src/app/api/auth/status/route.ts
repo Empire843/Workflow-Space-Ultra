@@ -1,70 +1,41 @@
-import path from "node:path";
-import { existsSync, readFileSync, statSync } from "node:fs";
-
 import { NextResponse } from "next/server";
 
-import { DATA_GENERAL_DIR, GROK_PROFILE_NAME } from "@/server/config";
+import { computeVeoHealth, computeGrokHealth } from "@/server/tokens/sessionHealth";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-interface VeoCache {
-  sessionId?: string;
-  projectId?: string;
-  accessToken?: string;
-  updatedAt?: string;
-}
-
-interface GrokCacheEntry {
-  custom_headers?: { "x-statsig-id"?: string };
-  updated_at?: string;
-}
-
-interface GrokCacheFile {
-  profiles?: Record<string, GrokCacheEntry>;
-}
-
-function safeRead<T>(file: string): T | null {
-  try {
-    if (!existsSync(file)) return null;
-    return JSON.parse(readFileSync(file, "utf-8")) as T;
-  } catch {
-    return null;
-  }
-}
-
-function fileAge(file: string): number | null {
-  try {
-    if (!existsSync(file)) return null;
-    return Date.now() - statSync(file).mtimeMs;
-  } catch {
-    return null;
-  }
-}
-
+/**
+ * Tri-state session health endpoint.
+ *
+ * Response shape (additive):
+ *   veo:  { status, ageMs, updatedAt, chromeConnected, projectId, ok }
+ *   grok: { status, ageMs, updatedAt, chromeConnected, profileName, ok }
+ *
+ * `ok` is kept for backward compat (= status !== "expired"). The client
+ * should prefer `status` directly so it can show the amber "refresh soon"
+ * state.
+ */
 export async function GET() {
-  const veoFile = path.join(DATA_GENERAL_DIR, "veo_tokens_cache.json");
-  const grokFile = path.join(DATA_GENERAL_DIR, "grok_cache.json");
-
-  const veo = safeRead<VeoCache>(veoFile);
-  const veoOk = Boolean(veo?.sessionId && veo?.projectId && veo?.accessToken);
-
-  const grok = safeRead<GrokCacheFile>(grokFile);
-  const grokEntry = grok?.profiles?.[GROK_PROFILE_NAME];
-  const grokOk = Boolean(grokEntry?.custom_headers?.["x-statsig-id"]);
+  const veo = computeVeoHealth();
+  const grok = computeGrokHealth();
 
   return NextResponse.json({
     veo: {
-      ok: veoOk,
-      updatedAt: veo?.updatedAt || null,
-      ageMs: fileAge(veoFile),
-      projectId: veo?.projectId || null,
+      status: veo.status,
+      ageMs: veo.ageMs,
+      updatedAt: veo.updatedAt,
+      chromeConnected: veo.chromeConnected,
+      projectId: veo.projectId ?? null,
+      ok: veo.status !== "expired",
     },
     grok: {
-      ok: grokOk,
-      profileName: GROK_PROFILE_NAME,
-      updatedAt: grokEntry?.updated_at || null,
-      ageMs: fileAge(grokFile),
+      status: grok.status,
+      ageMs: grok.ageMs,
+      updatedAt: grok.updatedAt,
+      chromeConnected: grok.chromeConnected,
+      profileName: grok.profileName,
+      ok: grok.status !== "expired",
     },
   });
 }

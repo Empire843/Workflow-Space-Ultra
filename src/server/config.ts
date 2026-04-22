@@ -1,6 +1,9 @@
 import path from "node:path";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 
+import { initOAuth } from "./oauth/storage";
+import { initOAuthUrls } from "./oauth/urls";
+
 export type AccountType = "NORMAL" | "PRO" | "ULTRA";
 export type WindowMode = "headful" | "offscreen" | "headless";
 
@@ -9,6 +12,7 @@ export const BASE_DIR = process.cwd();
 export const DATA_GENERAL_DIR = path.join(BASE_DIR, "data_general");
 export const DOWNLOADS_DIR = path.join(BASE_DIR, "downloads");
 export const WORKFLOWS_DIR = path.join(BASE_DIR, "Workflows");
+export const LOGS_DIR = path.join(BASE_DIR, "logs");
 
 // Chrome profiles (keep the original Python tool's names so users can share profiles)
 export const VEO_USER_DATA_DIR = process.env.VEO_CHROME_USER_DATA_DIR
@@ -36,12 +40,36 @@ export const CHROME_EXE_PATH_ENV = process.env.CHROME_EXE_PATH || "";
 
 export const RECAPTCHA_SITE_KEY = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV";
 
+/**
+ * Public base URL the WSU server is reachable at from the outside world.
+ * Required when exposing WSU as a ChatGPT Custom GPT Action — ChatGPT's
+ * servers must be able to hit `/api/oauth/*` and `/api/actions/*`, so the
+ * user runs a tunnel (ngrok / cloudflared / tailscale) and points this env
+ * at the public hostname.
+ *
+ * Falls back to localhost for development. When localhost is used, the
+ * Settings UI shows a warning so the user knows the ChatGPT flow will not
+ * actually work end-to-end until a tunnel is set up.
+ */
+export const PUBLIC_BASE_URL = (
+  process.env.WSU_PUBLIC_BASE_URL || "http://localhost:3000"
+).replace(/\/+$/, "");
+
+// ── OAuth URL helpers — re-exported for backward compat ──────────
+// The canonical source is now `@/server/oauth/urls` (self-contained module).
+export { isPublicBaseUrlLocal, oauthPublicUrls } from "./oauth/urls";
+
+
+
 export const CONFIG_FILE = path.join(DATA_GENERAL_DIR, "config.json");
 
 export function ensureDirs() {
-  for (const d of [DATA_GENERAL_DIR, DOWNLOADS_DIR, WORKFLOWS_DIR, VEO_USER_DATA_DIR, GROK_USER_DATA_ROOT]) {
+  for (const d of [DATA_GENERAL_DIR, DOWNLOADS_DIR, WORKFLOWS_DIR, LOGS_DIR, VEO_USER_DATA_DIR, GROK_USER_DATA_ROOT]) {
     if (!existsSync(d)) mkdirSync(d, { recursive: true });
   }
+  // Bootstrap the OAuth module with the app's data dir + public URL.
+  initOAuth({ dataDir: DATA_GENERAL_DIR });
+  initOAuthUrls(PUBLIC_BASE_URL);
 }
 
 export interface AppConfig {

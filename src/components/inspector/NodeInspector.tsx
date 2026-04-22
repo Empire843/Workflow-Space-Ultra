@@ -1,6 +1,6 @@
 "use client";
 
-import { Loader2, Send, Upload as UploadIcon, X } from "lucide-react";
+import { Loader2, Send, Sparkles, Upload as UploadIcon, X } from "lucide-react";
 import { useEffect, useMemo, useRef } from "react";
 import { useShallow } from "zustand/react/shallow";
 
@@ -20,11 +20,12 @@ import TextPromptEditor from "./TextPromptEditor";
 // Constants for dropdowns
 // ---------------------------------------------------------------------------
 
+// Only T2V.* modes are exposed — connecting an image node upstream flips the
+// generation into I2V automatically at run time, so the previously separate
+// `i2v.*` entries would have been redundant.
 const VIDEO_GEN_MODE_OPTIONS: { value: GenMode; label: string }[] = [
-  { value: "t2v.veo", label: "Text → Video (VEO)" },
-  { value: "t2v.grok", label: "Text → Video (Grok)" },
-  { value: "i2v.veo", label: "Image → Video (VEO)" },
-  { value: "i2v.grok", label: "Image → Video (Grok)" },
+  { value: "t2v.veo", label: "Video (VEO)" },
+  { value: "t2v.grok", label: "Video (Grok)" },
 ];
 
 const IMAGE_MODEL_OPTIONS = [
@@ -63,11 +64,19 @@ export default function NodeInspector() {
 
   if (!selectedId || !node) return null;
 
+  // `pointer-events-none` on the wrapper + `pointer-events-auto` on the card
+  // means the empty area around the inspector (same DOM rect as the wrapper)
+  // does not intercept pointer events. Without this, releasing the mouse over
+  // that transparent margin while dragging a node would swallow React Flow's
+  // pointerup and leave the node stuck to the cursor.
   return (
-    <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-20 w-[min(840px,calc(100%-24rem))]">
-      <div className="rounded-2xl bg-[color:var(--color-bg-elev-1)]/95 backdrop-blur border border-[color:var(--color-border-strong)] shadow-2xl shadow-black/60">
+    <div className="pointer-events-none absolute bottom-4 left-1/2 -translate-x-1/2 z-20 w-[min(840px,calc(100%-24rem))]">
+      <div className="pointer-events-auto rounded-2xl bg-[color:var(--color-bg-elev-1)]/95 backdrop-blur border border-[color:var(--color-border-strong)] shadow-2xl shadow-black/60">
         <InspectorHeader node={node} />
         <div className="p-3 space-y-3">
+          {node.data.origin === "mcp" && (
+            <McpProvenanceBanner nodeId={selectedId} data={node.data} />
+          )}
           <InspectorBody nodeId={selectedId} data={node.data} />
         </div>
       </div>
@@ -94,6 +103,86 @@ function InspectorHeader({ node }: { node: { id: string; data: NodeDataBase } })
         className="h-6 w-6 grid place-items-center rounded text-[color:var(--color-fg-muted)] hover:bg-[color:var(--color-bg-elev-2)] hover:text-[color:var(--color-fg)]"
       >
         <X className="h-3.5 w-3.5" />
+      </button>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// MCP provenance banner
+// ---------------------------------------------------------------------------
+//
+// Rendered at the top of the inspector body when a node was synthesised by
+// the MCP server (see src/server/mcp/snapshotWriter.ts). Offers the user a
+// one-click "downgrade" into a content reference node: strip the generation
+// config (prompt/model/etc.) but keep the produced asset. Useful when the
+// user wants the generated image/video on the canvas as a static input to
+// another pipeline step rather than as an editable generation spec.
+//
+function McpProvenanceBanner({
+  nodeId,
+  data,
+}: {
+  nodeId: string;
+  data: NodeDataBase;
+}) {
+  const updateNodeData = useWorkflowStore((s) => s.updateNodeData);
+
+  const firstOutput = data.outputs?.[0];
+  const hasImage = Boolean(firstOutput?.imageUrl ?? data.imageUrl);
+  const hasVideo = Boolean(firstOutput?.videoUrl ?? data.videoUrl);
+  // Only offer the downgrade when there's actually an asset to preserve.
+  const canDowngrade = hasImage || hasVideo;
+
+  const handleDowngrade = () => {
+    if (!canDowngrade) return;
+    // Collapse the node to `content.upload` — the canvas uses that kind as
+    // the generic "static asset reference" node. We explicitly undefine the
+    // generation-only fields so the serializer strips them on next save
+    // (Record<string, unknown> → missing keys ≠ `undefined` keys for JSON).
+    updateNodeData(nodeId, {
+      kind: "content.upload",
+      status: "done",
+      prompt: undefined,
+      modelLabel: undefined,
+      videoModelKey: undefined,
+      aspectRatio: undefined,
+      resolution: undefined,
+      videoLength: undefined,
+      outputCount: undefined,
+      seed: undefined,
+      genMode: undefined,
+      origin: undefined,
+      mcpJobId: undefined,
+      mcpCreatedAt: undefined,
+      // Preserve the asset URL(s) so the upload node renders the media.
+      imageUrl: hasImage ? firstOutput?.imageUrl ?? data.imageUrl : undefined,
+      videoUrl: hasVideo ? firstOutput?.videoUrl ?? data.videoUrl : undefined,
+      uploadAccept: hasImage ? "image/*" : hasVideo ? "video/*" : undefined,
+    });
+  };
+
+  return (
+    <div className="flex items-start gap-2 rounded-lg border border-sky-500/30 bg-sky-500/10 px-2.5 py-2 text-[11px] text-sky-100">
+      <Sparkles className="h-3.5 w-3.5 shrink-0 mt-0.5 text-sky-300" />
+      <div className="flex-1 min-w-0">
+        <div className="font-medium">Tạo bởi MCP</div>
+        <div className="text-sky-200/80 leading-snug">
+          Node này được server tạo qua MCP tool. Bạn có thể giữ nguyên để re-run, hoặc chuyển thành tham chiếu tĩnh để dùng làm input cho node khác.
+        </div>
+      </div>
+      <button
+        type="button"
+        onClick={handleDowngrade}
+        disabled={!canDowngrade}
+        className="shrink-0 h-7 px-2 rounded-md border border-sky-500/40 bg-sky-500/20 text-[10px] font-medium hover:bg-sky-500/30 disabled:opacity-40 disabled:cursor-not-allowed"
+        title={
+          canDowngrade
+            ? "Chuyển sang content reference (giữ media, xoá prompt/model)"
+            : "Chưa có media để giữ lại"
+        }
+      >
+        Convert to reference
       </button>
     </div>
   );
@@ -150,6 +239,7 @@ function TextNodeConfig({ nodeId }: { nodeId: string }) {
 
 function UploadNodeConfig({ nodeId, data }: { nodeId: string; data: NodeDataBase }) {
   const updateNodeData = useWorkflowStore((s) => s.updateNodeData);
+  const activeWorkflowId = useWorkflowStore((s) => s.activeWorkflowId);
   const fileRef = useRef<HTMLInputElement | null>(null);
 
   const handleFile = async (file: File) => {
@@ -158,6 +248,10 @@ function UploadNodeConfig({ nodeId, data }: { nodeId: string; data: NodeDataBase
     const isImage = file.type.startsWith("image/");
     const isVideo = file.type.startsWith("video/");
     const isAudio = file.type.startsWith("audio/");
+
+    // Optimistic update so the preview is instant. The data URI here gets
+    // overwritten by the server URL below if the upload succeeds; it only
+    // survives when there is no open workflow (ad-hoc canvas use).
     updateNodeData(nodeId, {
       uploadBase64: b64,
       uploadMime: file.type,
@@ -167,6 +261,38 @@ function UploadNodeConfig({ nodeId, data }: { nodeId: string; data: NodeDataBase
       audioUrl: isAudio ? dataUri : undefined,
       status: "done",
     });
+
+    // Persist to the workflow folder on disk so the preview still works after
+    // a reload / account switch / workflow re-open. We upload in the
+    // background — if it fails we keep the data URI so the user can still
+    // iterate in this session.
+    if (activeWorkflowId) {
+      try {
+        const form = new FormData();
+        form.append("file", file, file.name);
+        const res = await fetch(
+          `/api/workflows/${encodeURIComponent(activeWorkflowId)}/assets`,
+          { method: "POST", body: form },
+        );
+        const json = (await res.json()) as {
+          ok: boolean;
+          url?: string;
+          fileName?: string;
+          message?: string;
+        };
+        if (json.ok && json.url) {
+          updateNodeData(nodeId, {
+            uploadFilePath: file.name,
+            imageUrl: isImage ? json.url : undefined,
+            videoUrl: isVideo ? json.url : undefined,
+            audioUrl: isAudio ? json.url : undefined,
+          });
+        }
+      } catch {
+        // Silently ignored — the optimistic data URI above keeps the node
+        // usable even if the write fails (e.g. disk full).
+      }
+    }
   };
 
   const hasFile = Boolean(data.uploadBase64 || data.imageUrl);
@@ -352,7 +478,20 @@ function VideoGenConfig({ nodeId, data }: { nodeId: string; data: NodeDataBase }
   const genMode: GenMode = (data.genMode as GenMode) || "t2v.veo";
   const isGrok = genMode.includes(".grok");
   const isVeo = genMode.includes(".veo");
-  const isI2V = genMode.startsWith("i2v.");
+
+  // With the T2V/I2V merge, the generation mode no longer tells us whether
+  // this is an I2V run — the upstream graph does. Peek at the incoming edges
+  // and switch the VEO model list (T2V vs I2V) when any parent carries an
+  // image, so the user sees the actual model set the executor will use.
+  const hasImageUpstream = useWorkflowStore((s) => {
+    const parents = s.edges.filter((e) => e.target === nodeId).map((e) => e.source);
+    for (const pid of parents) {
+      const d = s.nodes.find((n) => n.id === pid)?.data;
+      if (d && (d.imageUrl || d.imageMediaId || d.uploadBase64)) return true;
+    }
+    return false;
+  });
+  const isI2V = hasImageUpstream;
 
   const veoModels = isI2V ? VEO_I2V_MODELS : VEO_T2V_MODELS;
   const veoDefault = veoModels[1]?.label || veoModels[0].label; // Ultra Fast as default
@@ -370,26 +509,17 @@ function VideoGenConfig({ nodeId, data }: { nodeId: string; data: NodeDataBase }
     const wasGrok = genMode.includes(".grok");
     const goingGrok = newMode.includes(".grok");
     const goingVeo = newMode.includes(".veo");
-    const goingI2V = newMode.startsWith("i2v.");
 
     const patch: Partial<NodeDataBase> = { genMode: newMode, videoModelKey: undefined };
 
     if (wasGrok !== goingGrok) {
-      // Switching provider family → reset label to provider's default
       if (goingGrok) {
         patch.modelLabel = GROK_VIDEO_DEFAULT_LABEL;
-        // Ensure Grok-specific fields have sane defaults; clamp length to [1,10]
         if (!data.resolution) patch.resolution = "720p";
         const curLen = Number(data.videoLength) || 6;
         patch.videoLength = curLen >= 1 && curLen <= 10 ? curLen : 6;
       } else if (goingVeo) {
-        const targetModels = goingI2V ? VEO_I2V_MODELS : VEO_T2V_MODELS;
-        patch.modelLabel = targetModels[1]?.label || targetModels[0].label;
-      }
-    } else if (goingVeo) {
-      // Same provider (VEO) but t2v ↔ i2v → remap model label to matching list
-      const targetModels = goingI2V ? VEO_I2V_MODELS : VEO_T2V_MODELS;
-      if (!targetModels.find((m) => m.label === data.modelLabel)) {
+        const targetModels = isI2V ? VEO_I2V_MODELS : VEO_T2V_MODELS;
         patch.modelLabel = targetModels[1]?.label || targetModels[0].label;
       }
     }

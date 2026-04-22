@@ -27,12 +27,15 @@ export type NodeKind =
   | "xform.upscale.grok"
   | "xform.enhance"
   | "xform.remove-bg"
-  | "xform.extract-frames";
+  | "xform.extract-frames"
+  // Group container (visual frame) — holds child nodes via parentId/extent.
+  // Rendered by `FrameNode` (not the standard `WSNode`).
+  | "frame";
 
 export interface NodeCatalogEntry {
   kind: NodeKind;
   label: string;
-  group: "content" | "generation" | "transformation";
+  group: "content" | "generation" | "transformation" | "layout";
   provider?: ProviderId;
   description?: string;
   icon?: string;
@@ -107,7 +110,21 @@ export const NODE_CATALOG: NodeCatalogEntry[] = [
     icon: "frame",
     description: "Tách frame từ video",
   },
+
+  // Layout
+  {
+    kind: "frame",
+    label: "Frame",
+    group: "layout",
+    icon: "frame",
+    description: "Nhóm các node và chạy cùng lúc",
+  },
 ];
+
+/** Pre-computed Map for O(1) lookup — avoids `.find()` on every node render. */
+export const NODE_CATALOG_MAP = new Map<NodeKind, NodeCatalogEntry>(
+  NODE_CATALOG.map((e) => [e.kind, e] as const),
+);
 
 export interface OutputItem {
   imageUrl?: string;
@@ -126,6 +143,13 @@ export interface NodeDataBase extends Record<string, unknown> {
   statusLog?: string;
   progress?: number;
   error?: string;
+  /**
+   * Server-assigned job id (set by the client while a job is in flight). Kept
+   * on the node so the Queue panel can show "which node runs which job" and so
+   * the per-node Cancel button knows which job to DELETE. Cleared when the job
+   * settles or the user starts a new run.
+   */
+  jobId?: string;
   // Primary output (legacy / first item convenience)
   imageUrl?: string;
   imageMediaId?: string;
@@ -166,4 +190,27 @@ export interface NodeDataBase extends Record<string, unknown> {
    * locked back to a specific mime.
    */
   uploadAccept?: string;
+
+  // ─── Frame (layout group) ───────────────────────────────────────────────
+  // Only meaningful when `kind === "frame"`. Height/width are tracked both in
+  // React Flow's `style` and here so persistence round-trips deterministically.
+  frameLabel?: string;
+  frameWidth?: number;
+  frameHeight?: number;
+  // Live progress fields populated by `runFrame` while the Frame is running.
+  // Stripped from persisted snapshots (see RUNTIME_KEYS in workflowStore).
+  frameRunning?: boolean;
+  frameRunIndex?: number;
+  frameRunTotal?: number;
+  frameRunCurrentLabel?: string;
+
+  // ─── MCP provenance ──────────────────────────────────────────────────────
+  // Set on nodes synthesised by the MCP server and merged into the canvas
+  // from `Workflows/<id>/snapshot.json`. `origin === "mcp"` is the flag the
+  // client uses to (a) badge the node visually and (b) offer a "convert to
+  // content reference" downgrade. Once the user edits the node, these fields
+  // stay but the badge remains so the provenance trail is preserved.
+  origin?: "mcp" | "ui";
+  mcpJobId?: string;
+  mcpCreatedAt?: number;
 }

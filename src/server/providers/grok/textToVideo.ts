@@ -19,7 +19,9 @@ import {
 export interface GrokT2VProgress {
   progress: number;
   videoUrl: string | null;
+  videoId?: string | null;
   parentPostId: string | null;
+  resolutionName?: string | null;
 }
 
 export interface GrokT2VResult {
@@ -98,15 +100,121 @@ export async function grokTextToVideo(page: Page, opts: GrokT2VOptions): Promise
           return { objects: out, tail };
         }
 
-        function pickLastProgressEvent(objects) {
-          let last = null;
+        // Carry videoUrl / videoId / parentPostId / resolutionName
+        // forward across events so a final {progress:100, videoUrl:null}
+        // event doesn't discard a URL we already received. Also accept
+        // Grok's alternate URL keys (generatedVideoUrl, mediaUrl).
+        // See grok_api_image_to_video.py pickLastProgressEvent for the
+        // canonical behaviour.
+        function pickLastProgressEvent(objects, prev) {
+          let last = prev || null;
           for (const obj of objects) {
             const svr = obj && obj.result && obj.result.response && obj.result.response.streamingVideoGenerationResponse;
-            if (svr && typeof svr.progress === 'number') {
-              last = { progress: svr.progress, videoUrl: svr.videoUrl || null, parentPostId: svr.parentPostId || null };
-            }
+            if (!svr || typeof svr !== 'object') continue;
+            const hasProgress = (typeof svr.progress === 'number');
+            const hasVideoUrl = !!(svr.videoUrl || svr.generatedVideoUrl || svr.generatedVideoUri || svr.mediaUrl);
+            const hasVideoId = !!(svr.videoId || svr.videoPostId);
+            const hasParent = !!svr.parentPostId;
+            const hasResolution = !!svr.resolutionName;
+            if (!hasProgress && !hasVideoUrl && !hasVideoId && !hasParent && !hasResolution) continue;
+            const prevProgress = (last && typeof last.progress === 'number') ? last.progress : 0;
+            const nextProgress = hasProgress ? svr.progress : prevProgress;
+            const candidateVideoUrl =
+              svr.videoUrl ||
+              svr.generatedVideoUrl ||
+              svr.generatedVideoUri ||
+              svr.mediaUrl ||
+              (last ? last.videoUrl : null) ||
+              null;
+            last = {
+              progress: nextProgress,
+              videoUrl: candidateVideoUrl,
+              videoId: svr.videoId || svr.videoPostId || (last ? last.videoId : null) || null,
+              parentPostId: svr.parentPostId || (last ? last.parentPostId : null) || null,
+              resolutionName: svr.resolutionName || (last ? last.resolutionName : null) || null,
+            };
           }
           return last;
+        }
+
+        // Capture non-videoGen signals from the SSE stream. See
+        // imageToVideo.ts for the full rationale. Key point: filter
+        // out userResponse echo — otherwise "grokSays=" reports the
+        // user's own prompt as if it were Grok's rejection reason.
+        function collectDiagnostics(objects, prev) {
+          const acc = prev || {
+            tokens: '',
+            errors: [],
+            moderation: null,
+            finishReason: null,
+            sawUserEcho: false,
+            sawModelOutput: false,
+            sawSvr: false,
+          };
+          const inputNorm = String(prompt || '').trim();
+          for (const obj of objects) {
+            const result = obj && obj.result;
+            const response = result && result.response;
+            const svr = response && response.streamingVideoGenerationResponse;
+            const modelResp = response && response.modelResponse;
+            const tokenResp = response && response.tokenResponse;
+            const userResp = response && response.userResponse;
+            if (svr) acc.sawSvr = true;
+            if (userResp && (typeof userResp.message === 'string' || userResp.id || userResp.sender)) {
+              acc.sawUserEcho = true;
+            }
+            const rawPieces = [
+              tokenResp && typeof tokenResp.token === 'string' ? tokenResp.token : null,
+              tokenResp && typeof tokenResp.message === 'string' ? tokenResp.message : null,
+              modelResp && typeof modelResp.message === 'string' ? modelResp.message : null,
+              modelResp && typeof modelResp.text === 'string' ? modelResp.text : null,
+              obj && typeof obj.token === 'string' ? obj.token : null,
+            ];
+            for (const rawPiece of rawPieces) {
+              if (!rawPiece) continue;
+              const trimmed = rawPiece.trim();
+              if (!trimmed) continue;
+              if (inputNorm && (trimmed === inputNorm || inputNorm.indexOf(trimmed) >= 0 || trimmed.indexOf(inputNorm) >= 0)) {
+                continue;
+              }
+              if (acc.tokens.length < 800) {
+                acc.tokens += rawPiece;
+                acc.sawModelOutput = true;
+              }
+            }
+            const errShapes = [
+              obj && obj.error,
+              result && result.error,
+              response && response.error,
+              svr && svr.error,
+              modelResp && modelResp.error,
+            ];
+            for (const e of errShapes) {
+              if (!e) continue;
+              let m = null;
+              if (typeof e === 'string') m = e;
+              else if (typeof e === 'object') m = e.message || e.error || e.reason || e.code || null;
+              if (m && acc.errors.indexOf(m) < 0) acc.errors.push(String(m).slice(0, 240));
+            }
+            if (modelResp && modelResp.finishReason && !acc.finishReason) acc.finishReason = String(modelResp.finishReason);
+            if (svr && svr.finishReason && !acc.finishReason) acc.finishReason = String(svr.finishReason);
+            const modFlags = [
+              response && response.moderationResponse,
+              response && response.moderationDecision,
+              svr && svr.moderationReason,
+              svr && svr.rejectionReason,
+              svr && svr.failureReason,
+              modelResp && modelResp.moderation,
+              modelResp && modelResp.softStopReason,
+              modelResp && modelResp.isSoftStop ? 'soft-stop' : null,
+            ];
+            for (const m of modFlags) {
+              if (!m) continue;
+              const v = (typeof m === 'object') ? (m.reason || m.message || JSON.stringify(m)) : String(m);
+              if (v && !acc.moderation) acc.moderation = v.slice(0, 240);
+            }
+          }
+          return acc;
         }
 
         function reportProgress(pct, videoUrl, parentPostId) {
@@ -172,14 +280,24 @@ export async function grokTextToVideo(page: Page, opts: GrokT2VOptions): Promise
             return { status, lastEvent: null, errorBody: errorBody.slice(0, 500) };
           }
 
+          let diagnostics = {
+            tokens: '',
+            errors: [],
+            moderation: null,
+            finishReason: null,
+            sawUserEcho: false,
+            sawModelOutput: false,
+            sawSvr: false,
+          };
           try {
             if (!res.body) {
               const text = await res.text();
               const parsed = parseJsonObjectsFromBuffer(text);
-              lastEvent = pickLastProgressEvent(parsed.objects);
+              diagnostics = collectDiagnostics(parsed.objects, diagnostics);
+              lastEvent = pickLastProgressEvent(parsed.objects, null);
               if (lastEvent) reportProgress(lastEvent.progress, lastEvent.videoUrl, lastEvent.parentPostId);
               clearTimeout(t);
-              return { status, lastEvent };
+              return { status, lastEvent, diagnostics };
             }
             const reader = res.body.getReader();
             const decoder = new TextDecoder('utf-8');
@@ -192,19 +310,28 @@ export async function grokTextToVideo(page: Page, opts: GrokT2VOptions): Promise
               const parsed = parseJsonObjectsFromBuffer(buffer);
               buffer = parsed.tail;
               if (parsed.objects.length) {
-                const ev = pickLastProgressEvent(parsed.objects);
+                diagnostics = collectDiagnostics(parsed.objects, diagnostics);
+                const ev = pickLastProgressEvent(parsed.objects, lastEvent);
                 if (ev) {
                   lastEvent = ev;
                   reportProgress(lastEvent.progress, lastEvent.videoUrl, lastEvent.parentPostId);
-                  if (lastEvent.progress >= 100 && lastEvent.videoUrl) break;
+                  // Relaxed break: progress>=95 with a known URL, OR a
+                  // bare URL without progress field. Grok sometimes skips
+                  // the 100% event entirely once the asset is ready.
+                  if ((lastEvent.progress >= 95 && lastEvent.videoUrl) || (lastEvent.videoUrl && typeof lastEvent.progress !== 'number')) break;
                 }
               }
             }
             clearTimeout(t);
-            return { status, lastEvent };
+            return { status, lastEvent, diagnostics };
           } catch (e) {
+            // Surface stream/reader errors so "status=200 but no
+            // videoUrl" no longer appears to the user as a silent
+            // failure. The outer caller decides whether to retry or
+            // just tag convoError with this hint.
             clearTimeout(t);
-            return { status, lastEvent };
+            const errMsg = (e && (e.message || e.name)) ? String(e.message || e.name) : String(e);
+            return { status, lastEvent, diagnostics, errorBody: 'stream aborted: ' + errMsg };
           }
         }
 
@@ -240,17 +367,77 @@ export async function grokTextToVideo(page: Page, opts: GrokT2VOptions): Promise
         let finalMediaUrl = (convo && convo.lastEvent && convo.lastEvent.videoUrl) ? convo.lastEvent.videoUrl : null;
         const is720p = String(cfg.resolutionName || '').toLowerCase() === '720p';
         let usedUpscale = false;
-        if (convo.status === 200 && convo.lastEvent && convo.lastEvent.progress >= 100) {
-          if (!is720p) {
-            upscale = await upscaleVideo(created.parentPostId);
-            if (upscale && upscale.hdMediaUrl) { finalMediaUrl = upscale.hdMediaUrl; usedUpscale = true; }
+        // Relaxed completion signal — matches Python has_generation_signal.
+        const hasGenerationSignal = !!(
+          convo.lastEvent &&
+          (
+            (typeof convo.lastEvent.progress === 'number' && convo.lastEvent.progress >= 95) ||
+            convo.lastEvent.videoUrl ||
+            convo.lastEvent.videoId
+          )
+        );
+        if (convo.status === 200 && hasGenerationSignal && !is720p) {
+          upscale = await upscaleVideo(created.parentPostId);
+          if (upscale && upscale.hdMediaUrl) { finalMediaUrl = upscale.hdMediaUrl; usedUpscale = true; }
+        }
+        // Build a descriptive convoError when 200 but still no final URL.
+        // See imageToVideo.ts for full priority rationale.
+        let convoError = convo.errorBody || null;
+        if (!finalMediaUrl && convo.status === 200) {
+          const diag = convo.diagnostics || {
+            tokens: '', errors: [], moderation: null, finishReason: null,
+            sawUserEcho: false, sawModelOutput: false, sawSvr: false,
+          };
+          // Strip chunk-by-chunk echoed prompt from tokens.
+          if (diag.tokens && prompt) {
+            const inputNorm = String(prompt).trim();
+            if (inputNorm && diag.tokens.indexOf(inputNorm) >= 0) {
+              diag.tokens = diag.tokens.split(inputNorm).join('<user-prompt-echoed>');
+            }
           }
+          // Hallucinated success — "I generated a video…" without SVR.
+          const tokensLower = (diag.tokens || '').toLowerCase();
+          const hallucinatedSuccess = !finalMediaUrl && !diag.sawSvr && (
+            tokensLower.indexOf('i generated a video') >= 0 ||
+            tokensLower.indexOf('i created a video') >= 0 ||
+            tokensLower.indexOf("i've generated") >= 0 ||
+            tokensLower.indexOf('i have generated') >= 0 ||
+            tokensLower.indexOf("here's a video") >= 0 ||
+            tokensLower.indexOf('here is a video') >= 0 ||
+            tokensLower.indexOf('video has been generated') >= 0 ||
+            tokensLower.indexOf('video is ready') >= 0
+          );
+          const parts = [];
+          if (hallucinatedSuccess) parts.push('hallucinatedSuccess=true');
+          if (diag.moderation) parts.push('moderation=' + diag.moderation);
+          if (diag.finishReason) parts.push('finishReason=' + diag.finishReason);
+          if (diag.errors && diag.errors.length) parts.push('error=' + diag.errors.join(' | '));
+          const trimmedTokens = (diag.tokens || '').trim();
+          if (trimmedTokens) parts.push('grokSays=' + trimmedTokens.slice(0, 400));
+          if (convoError) parts.push(convoError);
+          if (diag.sawUserEcho && !diag.sawModelOutput && !diag.sawSvr &&
+              !diag.moderation && !diag.finishReason &&
+              (!diag.errors || !diag.errors.length)) {
+            parts.push('silentRejection=true');
+          }
+          if (!parts.length) {
+            if (convo.lastEvent) {
+              parts.push(
+                'noMediaUrl progress=' + (convo.lastEvent.progress == null ? '?' : convo.lastEvent.progress) +
+                ' videoId=' + (convo.lastEvent.videoId || '∅') +
+                ' parentPostId=' + (convo.lastEvent.parentPostId || '∅'),
+              );
+            } else {
+              parts.push('no events received from Grok stream');
+            }
+          }
+          convoError = parts.join(' ; ');
         }
         return {
           createStatus: created.status,
           parentPostId: created.parentPostId,
           convoStatus: convo.status,
-          convoError: convo.errorBody || null,
+          convoError,
           lastEvent: convo.lastEvent || null,
           upscaleStatus: upscale ? upscale.status : 0,
           usedUpscale,
@@ -260,6 +447,7 @@ export async function grokTextToVideo(page: Page, opts: GrokT2VOptions): Promise
       })
     `;
 
+    if (page.isClosed()) throw new Error("Grok page đã bị đóng trước khi tạo video");
     const evalPromise = page.evaluate(
       `(${script})(${JSON.stringify(payload)})`
     ) as Promise<GrokT2VResult>;
