@@ -1,6 +1,9 @@
 import path from "node:path";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 
+import { initOAuth } from "./oauth/storage";
+import { initOAuthUrls } from "./oauth/urls";
+
 export type AccountType = "NORMAL" | "PRO" | "ULTRA";
 export type WindowMode = "headful" | "offscreen" | "headless";
 
@@ -52,29 +55,11 @@ export const PUBLIC_BASE_URL = (
   process.env.WSU_PUBLIC_BASE_URL || "http://localhost:3000"
 ).replace(/\/+$/, "");
 
-export function isPublicBaseUrlLocal(): boolean {
-  try {
-    const u = new URL(PUBLIC_BASE_URL);
-    return (
-      u.hostname === "localhost" ||
-      u.hostname === "127.0.0.1" ||
-      u.hostname === "::1" ||
-      u.hostname.endsWith(".local")
-    );
-  } catch {
-    return true;
-  }
-}
+// ── OAuth URL helpers — re-exported for backward compat ──────────
+// The canonical source is now `@/server/oauth/urls` (self-contained module).
+export { isPublicBaseUrlLocal, oauthPublicUrls } from "./oauth/urls";
 
-/** The 4 URLs a user needs to paste into ChatGPT Actions config. */
-export function oauthPublicUrls() {
-  return {
-    authorizationUrl: `${PUBLIC_BASE_URL}/api/oauth/authorize`,
-    tokenUrl: `${PUBLIC_BASE_URL}/api/oauth/token`,
-    revokeUrl: `${PUBLIC_BASE_URL}/api/oauth/revoke`,
-    openapiUrl: `${PUBLIC_BASE_URL}/api/actions/openapi`,
-  };
-}
+
 
 export const CONFIG_FILE = path.join(DATA_GENERAL_DIR, "config.json");
 
@@ -82,6 +67,9 @@ export function ensureDirs() {
   for (const d of [DATA_GENERAL_DIR, DOWNLOADS_DIR, WORKFLOWS_DIR, LOGS_DIR, VEO_USER_DATA_DIR, GROK_USER_DATA_ROOT]) {
     if (!existsSync(d)) mkdirSync(d, { recursive: true });
   }
+  // Bootstrap the OAuth module with the app's data dir + public URL.
+  initOAuth({ dataDir: DATA_GENERAL_DIR });
+  initOAuthUrls(PUBLIC_BASE_URL);
 }
 
 export interface AppConfig {

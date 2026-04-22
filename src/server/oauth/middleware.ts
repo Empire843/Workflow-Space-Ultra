@@ -1,5 +1,3 @@
-import { NextResponse } from "next/server";
-
 import { validateAccessToken, type ValidatedAccess } from "./tokens";
 
 /**
@@ -23,11 +21,14 @@ export function extractBearerToken(headerValue: string | null | undefined): stri
 function unauthorized(error: string, description?: string): Response {
   const challengeParts = [`Bearer realm="wsu-actions"`, `error="${error}"`];
   if (description) challengeParts.push(`error_description="${description.replace(/"/g, "'")}"`);
-  return NextResponse.json(
-    { error, error_description: description },
+  return new Response(
+    JSON.stringify({ error, error_description: description }),
     {
       status: 401,
-      headers: { "WWW-Authenticate": challengeParts.join(", ") },
+      headers: {
+        "content-type": "application/json",
+        "WWW-Authenticate": challengeParts.join(", "),
+      },
     },
   );
 }
@@ -49,3 +50,4 @@ export function requireOAuth(req: Request): ValidatedAccess | Response {
   }
   return result;
 }
+

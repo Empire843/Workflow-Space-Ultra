@@ -1,5 +1,3 @@
-import { NextResponse } from "next/server";
-
 /**
  * Gate that only lets requests originating from the local machine through.
  *
@@ -38,12 +36,16 @@ export function isLocalhostRequest(req: Request): boolean {
 
 export function requireLocalhost(req: Request): Response | null {
   if (isLocalhostRequest(req)) return null;
-  return NextResponse.json(
-    {
+  return new Response(
+    JSON.stringify({
       error: "forbidden",
       error_description:
         "This endpoint is only accessible from localhost. Use the WSU Settings UI on the host machine.",
+    }),
+    {
+      status: 403,
+      headers: { "content-type": "application/json" },
     },
-    { status: 403 },
   );
 }
+

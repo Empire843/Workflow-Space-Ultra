@@ -1,7 +1,25 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
-import { DATA_GENERAL_DIR } from "@/server/config";
+/* ------------------------------------------------------------------ */
+/*  Module-level config — set once via initOAuth() at app bootstrap.   */
+/* ------------------------------------------------------------------ */
+
+let _dataDir: string | undefined;
+
+/**
+ * Bootstrap the OAuth module. Call once at app startup before any
+ * other OAuth function.  The `dataDir` is the root the module will
+ * store its JSON files under (a `oauth/` subdirectory is appended
+ * automatically).
+ *
+ * Can be called more than once (idempotent) — only the first call
+ * with a non-empty `dataDir` wins, unless `force` is true.
+ */
+export function initOAuth(opts: { dataDir: string; force?: boolean }): void {
+  if (_dataDir && !opts.force) return;
+  _dataDir = opts.dataDir;
+}
 
 /**
  * Shared on-disk JSON store helpers for the OAuth module.
@@ -21,11 +39,20 @@ import { DATA_GENERAL_DIR } from "@/server/config";
 export function oauthDir(): string {
   const override = process.env.WSU_OAUTH_DIR;
   if (override && override.length > 0) return override;
-  return path.join(DATA_GENERAL_DIR, "oauth");
+  if (_dataDir) return path.join(_dataDir, "oauth");
+  throw new Error(
+    "OAuth module not initialised. Call initOAuth({ dataDir }) at app startup " +
+    "or set the WSU_OAUTH_DIR environment variable.",
+  );
 }
 
-/** @deprecated kept for backwards-compat of early drafts; prefer `oauthDir()`. */
-export const OAUTH_DIR = oauthDir();
+/**
+ * @deprecated kept for backwards-compat of early drafts; prefer `oauthDir()`.
+ * Evaluated lazily so the module can be imported before `initOAuth()`.
+ */
+export function OAUTH_DIR(): string {
+  return oauthDir();
+}
 
 export function ensureOAuthDir(): void {
   const dir = oauthDir();
