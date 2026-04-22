@@ -1,3 +1,6 @@
 [submodule "wiki"]
 	path = wiki
 	url = git@github.com:Empire843/Workflow-Space-Ultra-Wiki.git
+[submodule "server-license"]
+	path = server-license
+	url = git@github.com:Empire843/wsu-license-server.git
