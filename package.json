@@ -2,6 +2,7 @@
   "name": "workflow-space-ultra",
   "version": "0.1.0",
   "private": true,
+  "main": "electron/main.js",
   "scripts": {
     "dev": "next dev -p 3000",
     "build": "next build",
@@ -13,11 +14,19 @@
     "screenshots": "node scripts/screenshot.mjs",
     "bench": "node scripts/bench.mjs",
     "mcp": "node bin/wsu-mcp.mjs",
-    "mcp:build": "node scripts/build-mcp.mjs"
+    "mcp:build": "node scripts/build-mcp.mjs",
+    "electron:dev": "NODE_ENV=development electron . --no-sandbox",
+    "electron:build": "next build && electron-builder --win",
+    "electron:build:linux": "next build && electron-builder --linux",
+    "electron:build:mac": "next build && electron-builder --mac",
+    "electron:build:protected:linux": "electron scripts/compile-bytecode.mjs --no-sandbox && electron-builder --linux",
+    "electron:build:protected:win": "electron scripts/compile-bytecode.mjs --no-sandbox && electron-builder --win",
+    "license:create": "npx tsx server-license/scripts/create-key.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@xyflow/react": "^12.3.5",
+    "bytenode": "^1.5.7",
     "clsx": "^2.1.1",
     "dexie": "^4.0.10",
     "dexie-react-hooks": "^1.1.7",
@@ -39,15 +48,58 @@
     "@types/react-dom": "^19.0.2",
     "@vitest/ui": "^2.1.9",
     "autoprefixer": "^10.4.20",
+    "electron": "^41.2.2",
+    "electron-builder": "^26.8.1",
     "esbuild": "^0.28.0",
     "eslint": "^9.17.0",
     "eslint-config-next": "^15.1.3",
     "happy-dom": "^20.9.0",
+    "javascript-obfuscator": "^5.4.1",
     "postcss": "^8.4.49",
     "tailwindcss": "^4.0.0-beta.8",
     "tsx": "^4.21.0",
     "typescript": "^5.7.2",
     "vitest": "^2.1.9",
     "zod": "^4.3.6"
+  },
+  "build": {
+    "appId": "com.wsu.workflow-space-ultra",
+    "productName": "Workflow Space Ultra",
+    "directories": {
+      "output": "dist-electron"
+    },
+    "files": [
+      "electron/**/*",
+      "!electron/**/*.js",
+      "electron/main.js",
+      "electron/preload.js",
+      ".next/**/*",
+      "node_modules/**/*",
+      "public/**/*",
+      "package.json",
+      "next.config.ts"
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "electron/icon.png"
+    },
+    "linux": {
+      "target": "AppImage",
+      "icon": "electron/icon.png"
+    },
+    "mac": {
+      "target": "dmg",
+      "icon": "electron/icon.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "extraResources": [
+      {
+        "from": ".next",
+        "to": ".next"
+      }
+    ]
   }
 }

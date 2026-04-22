@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Kích hoạt bản quyền - Workflow Space Ultra</title>
+    <style>
+      body {
+        font-family:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica,
+          Arial, sans-serif;
+        background-color: #0d1117;
+        color: #c9d1d9;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        height: 100vh;
+        margin: 0;
+        padding: 20px;
+      }
+      .container {
+        background-color: #161b22;
+        border: 1px solid #30363d;
+        border-radius: 8px;
+        padding: 32px;
+        width: 100%;
+        max-width: 400px;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+      }
+      h2 {
+        margin-top: 0;
+        color: #58a6ff;
+        text-align: center;
+      }
+      p {
+        font-size: 14px;
+        line-height: 1.5;
+        margin-bottom: 24px;
+        color: #8b949e;
+      }
+      label {
+        font-size: 13px;
+        font-weight: 600;
+        display: block;
+        margin-bottom: 8px;
+      }
+      input {
+        width: 100%;
+        padding: 10px;
+        margin-bottom: 16px;
+        border-radius: 6px;
+        border: 1px solid #30363d;
+        background-color: #0d1117;
+        color: #c9d1d9;
+        box-sizing: border-box;
+        font-size: 14px;
+        font-family: monospace;
+      }
+      input:focus {
+        border-color: #58a6ff;
+        outline: none;
+        box-shadow: 0 0 0 3px rgba(88, 166, 255, 0.3);
+      }
+      .machine-id-box {
+        font-family: monospace;
+        font-size: 12px;
+        padding: 8px;
+        background: #010409;
+        border: 1px solid #30363d;
+        border-radius: 6px;
+        word-break: break-all;
+        margin-bottom: 24px;
+        color: #8b949e;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+      }
+      .machine-id-box button {
+        background: #238636;
+        border: 1px solid rgba(240, 246, 252, 0.1);
+        color: #fff;
+        padding: 4px 8px;
+        border-radius: 4px;
+        font-size: 11px;
+        cursor: pointer;
+      }
+      .machine-id-box button:hover {
+        background: #2ea043;
+      }
+      .btn-submit {
+        width: 100%;
+        padding: 10px;
+        background-color: #238636;
+        color: #ffffff;
+        border: 1px solid rgba(240, 246, 252, 0.1);
+        border-radius: 6px;
+        font-size: 14px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: 0.2s;
+      }
+      .btn-submit:hover {
+        background-color: #2ea043;
+      }
+      .btn-submit:disabled {
+        background-color: #1b5624;
+        color: #8b949e;
+        cursor: not-allowed;
+      }
+      .error {
+        color: #f85149;
+        font-size: 12px;
+        margin-bottom: 16px;
+        display: none;
+        text-align: center;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h2>Kích hoạt WSU</h2>
+      <p>
+        Phần mềm yêu cầu kích hoạt bản quyền để sử dụng. Vui lòng nhập License
+        Key bạn đã nhận được.
+      </p>
+
+      <label>Machine ID (dùng để cấp key):</label>
+      <div class="machine-id-box">
+        <span id="machineIdDisplay">Đang tải...</span>
+        <button onclick="copyMachineId()">Copy</button>
+      </div>
+
+      <label for="licenseKey">License Key:</label>
+      <input type="text" id="licenseKey" placeholder="WSU-XXXX-XXXX-XXXX" />
+
+      <div id="errorMsg" class="error">Key không hợp lệ hoặc đã hết hạn.</div>
+
+      <button id="submitBtn" class="btn-submit" onclick="submitLicense()">
+        Kích hoạt ngay
+      </button>
+    </div>
+
+    <script>
+      const { ipcRenderer } = require("electron");
+
+      ipcRenderer.on("set-machine-id", (e, id) => {
+        document.getElementById("machineIdDisplay").innerText = id;
+      });
+
+      ipcRenderer.on("activation-result", (e, success, errMessage) => {
+        const btn = document.getElementById("submitBtn");
+        const err = document.getElementById("errorMsg");
+        btn.disabled = false;
+        btn.innerText = "Kích hoạt ngay";
+
+        if (success) {
+          btn.innerText = "Thành công!";
+          btn.style.backgroundColor = "#2ea043";
+          setTimeout(() => ipcRenderer.send("license-success"), 1000);
+        } else {
+          err.innerText =
+            errMessage || "Kích hoạt thất bại. Vui lòng kiểm tra lại key.";
+          err.style.display = "block";
+        }
+      });
+
+      function copyMachineId() {
+        const id = document.getElementById("machineIdDisplay").innerText;
+        navigator.clipboard.writeText(id);
+      }
+
+      function submitLicense() {
+        const key = document.getElementById("licenseKey").value.trim();
+        if (!key) return;
+
+        const btn = document.getElementById("submitBtn");
+        const err = document.getElementById("errorMsg");
+        btn.disabled = true;
+        btn.innerText = "Đang kiểm tra...";
+        err.style.display = "none";
+
+        ipcRenderer.send("submit-license", key);
+      }
+    </script>
+  </body>
+</html>

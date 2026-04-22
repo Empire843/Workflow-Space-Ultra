@@ -9,6 +9,13 @@ out/
 build/
 dist/
 dist-mcp/
+dist-electron/
+
+# ==================== cloudflare ====================
+.wrangler/
+
+# ==================== electron bytecode ====================
+electron/*.jsc
 
 # ==================== env / secrets ====================
 .env
