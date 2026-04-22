@@ -12,7 +12,7 @@ import {
 } from "../cancellation";
 
 import { getCreateImageBatcher, readBatcherConfig } from "./batcher";
-import { cooldownRemainingMs, waitForCooldown } from "./cooldown";
+import { cooldownRemainingMs, recordRecaptchaStrike, waitForCooldown } from "./cooldown";
 import {
   isRecaptchaCaptureTimeout,
   isRecaptchaError,
@@ -181,13 +181,14 @@ async function buildBaseAuth(onLog?: LogFn, shouldCancel?: ShouldCancel) {
  * ```
  *
  * This is the "Option 2" ladder from the Python reference
- * (`A_workflow_text_to_video.py` lines 481-542). We deliberately do NOT
- * call `recordRecaptchaStrike` on the happy path any more: once requests
- * go through the browser, legitimate 403s are rare enough that the
- * lane-wide cooldown only helps in genuine abuse situations, where the
- * clearStorage / restartBrowser steps are the real cure. `cooldown.ts`
- * is kept as a best-effort safety net (`cooldownRemainingMs()` is still
- * honoured at entry).
+ * (`A_workflow_text_to_video.py` lines 481-542). Every 403 branch also
+ * calls `recordRecaptchaStrike()` so the lane-wide cooldown kicks in for
+ * ALL concurrent VEO callers, not just the one that caught this error.
+ * Without the shared cooldown, N parallel `gen.image` jobs would each
+ * run their own 4-attempt escalation ladder independently — 4 × 4 = 16
+ * more requests aimed at an account Google has already flagged. The
+ * debounce inside `recordRecaptchaStrike` makes concurrent 403s from
+ * the same burst count as a single strike.
  */
 
 const MAX_RECAPTCHA_ATTEMPTS = 4;
@@ -309,6 +310,18 @@ async function withRecaptcha<T>(
       if (attempt < MAX_RECAPTCHA_ATTEMPTS && isRecaptchaError(err)) {
         ensureNotCancelled(shouldCancel);
         collector.invalidateRecaptchaCache();
+        // Shared cooldown for the whole VEO lane. Concurrent callers
+        // that also hit a 403 in this burst get debounced to a single
+        // strike, and every in-flight attempt (including this one's
+        // next loop iteration) will block on `waitForCooldown` at the
+        // top of the loop until Google's flag cools. Without this, 4
+        // parallel jobs would each climb the retry ladder separately
+        // and keep the account in the penalty box permanently.
+        const cd = recordRecaptchaStrike();
+        onLog?.(
+          `Lane VEO cooldown ${(cd.delayMs / 1000).toFixed(0)}s (strike #${cd.strikes}) — ` +
+            `đợi trước khi thử lại…`,
+        );
         // Escalation ladder: retry → clearStorage → restartBrowser.
         // `attempt` is 1-based and already incremented, so the NEXT
         // attempt number is what drives the escalation choice here.

@@ -19,7 +19,11 @@ import {
   type GeneratedImage,
 } from "./createImage";
 import { URL_GENERATE_IMAGES_TEMPLATE } from "./constants";
-import { cooldownRemainingMs, waitForCooldown } from "./cooldown";
+import {
+  cooldownRemainingMs,
+  recordRecaptchaStrike,
+  waitForCooldown,
+} from "./cooldown";
 import {
   isRecaptchaCaptureTimeout,
   isRecaptchaError,
@@ -360,15 +364,30 @@ class CreateImageBatcher {
         }
       }
 
+      // A genuine 403 UNUSUAL_ACTIVITY from the batch POST. Google is
+      // mad at the whole account, not just this request. Record a
+      // strike so every other in-flight caller (including the per-item
+      // fallbacks we're about to kick off) sees `cooldownRemainingMs()`
+      // > 0 at the top of their loops and waits it out. The debounce
+      // inside `recordRecaptchaStrike` stops 4 concurrent groups hitting
+      // this line at the same millisecond from catapulting us to the
+      // 240s tier in one burst.
+      if (isRecaptchaError(err)) {
+        const cd = recordRecaptchaStrike();
+        log(
+          `[batch] Google flag 403 UNUSUAL_ACTIVITY — lane VEO cooldown ` +
+            `${(cd.delayMs / 1000).toFixed(0)}s (strike #${cd.strikes}).`,
+        );
+      }
+
       const msg = err instanceof Error ? err.message : String(err);
       log(`[batch] failed (${msg}); falling back to individual calls.`);
 
-      // With browser-routed requests, a failed batch is rarely Google
-      // throttling — it's usually a demux mismatch, a 401, or a single
-      // bad request. The per-item fallback below uses the same 403 ladder
-      // as `withRecaptcha` (clearStorage, then restartBrowser) so genuine
-      // abuse flags still get cleared; we no longer pre-punish the whole
-      // account with `recordRecaptchaStrike`.
+      // Per-item fallback below uses the same 403 ladder as
+      // `withRecaptcha` (clearStorage, then restartBrowser). Genuine
+      // abuse flags get their cooldown from the strike recorded above;
+      // everything else (401, transient tab) falls through the other
+      // branches above.
       for (const entry of group) {
         if (entry.shouldCancel?.()) {
           entry.reject(new JobCancelledError());
@@ -497,6 +516,16 @@ class CreateImageBatcher {
             ensureNotCancelled(shouldCancel);
             const collector = await raceCancel(getVeoCollector(), shouldCancel);
             collector.invalidateRecaptchaCache();
+            // Record a strike + trigger lane-wide cooldown. Debounced
+            // across concurrent 403s from the same burst — see
+            // cooldown.ts. The next loop iteration will call
+            // `waitForCooldown` at the top and block here until Google
+            // is ready for us again.
+            const cd = recordRecaptchaStrike();
+            log?.(
+              `Lane VEO cooldown ${(cd.delayMs / 1000).toFixed(0)}s ` +
+                `(strike #${cd.strikes}) — đợi trước khi thử lại…`,
+            );
             const nextAttempt = attempt + 1;
             if (nextAttempt === 3) {
               log?.("Google flag 403 lần 2 — xóa site storage + reload tab image…");

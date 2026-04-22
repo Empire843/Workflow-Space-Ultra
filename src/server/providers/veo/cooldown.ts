@@ -39,22 +39,20 @@ const s = (n: number) => n * 1000;
 
 /**
  * How long to wait after each strike, in order. Beyond the list, reuse the
- * last entry (so escalation caps at ~1 minute instead of growing forever).
+ * last entry (so escalation caps at ~5 minutes instead of growing forever).
  *
- * Since the refactor that routes every request through the Chrome tab
- * that minted its reCAPTCHA token, the genuine strike rate dropped to
- * near-zero — the "huge cooldown" strategy was only needed to dig out of
- * a lockout that browser-binding now prevents. These delays are kept as
- * a last-resort safety net for a truly misbehaving account:
- *  - 10s → first blip, usually self-heals.
- *  - 20/30s → still probably transient.
- *  - 60s → Google is actually angry; stop hammering the service.
- *
- * If a user still sees strikes piling up with these values, the root
- * cause is *not* rate limiting — investigate the browser tab health
- * (clearSiteStorage / restartBrowser) instead.
+ * Tuned after observing real PUBLIC_ERROR_UNUSUAL_ACTIVITY storms: once
+ * Google trips the flag, follow-up requests come back 403 for ~30-60s and
+ * then the account transitions into a "silent blackhole" mode where POSTs
+ * just time out at 60s. That second stage only clears when the account
+ * sits idle for 3-5 minutes. Short cooldowns let us dig deeper into the
+ * pit instead of climbing out.
+ *  - 30s → first blip; plenty for Google's short-window counter to reset.
+ *  - 60s → second strike in a row means the short-window reset wasn't
+ *          enough; let a little more time pass.
+ *  - 120s / 240s / 300s → account is clearly being watched; stop poking.
  */
-const STRIKE_DELAYS_MS = [s(10), s(20), s(30), s(60)];
+const STRIKE_DELAYS_MS = [s(30), s(60), s(120), s(240), s(300)];
 
 /**
  * If no new strike happens for this long, reset the escalation counter. We
@@ -62,6 +60,15 @@ const STRIKE_DELAYS_MS = [s(10), s(20), s(30), s(60)];
  * permanently move the user into the "high punishment" bucket.
  */
 const STRIKE_RESET_MS = s(10 * 60);
+
+/**
+ * Debounce window: concurrent callers that all hit the same 403 should
+ * count as ONE strike, not N. Without this, 4 parallel `gen.image` jobs
+ * each reporting a 403 within the same tick would bump `strikes` to 4
+ * and immediately push the cooldown to the 240s tier — punishing the
+ * user for parallelism the UI promised them.
+ */
+const STRIKE_DEBOUNCE_MS = s(3);
 
 /** Record an UNUSUAL_ACTIVITY hit. Returns when the cooldown will end. */
 export function recordRecaptchaStrike(now: number = Date.now()): {
@@ -72,6 +79,18 @@ export function recordRecaptchaStrike(now: number = Date.now()): {
   const st = getState();
   if (now - st.lastStrikeMs > STRIKE_RESET_MS) {
     st.strikes = 0;
+  }
+  // Debounce concurrent 403s from the same burst. When the last strike is
+  // fresh AND we still have cooldown time remaining, treat this report as
+  // the same event: extend nothing, no increment. Only a strike that
+  // arrives AFTER the previous cooldown expired (meaning we tried again
+  // and Google rejected again) counts as a NEW strike.
+  const sinceLast = now - st.lastStrikeMs;
+  const stillCooling = st.untilMs > now;
+  if (st.strikes > 0 && sinceLast < STRIKE_DEBOUNCE_MS && stillCooling) {
+    const delay =
+      STRIKE_DELAYS_MS[Math.min(st.strikes - 1, STRIKE_DELAYS_MS.length - 1)];
+    return { untilMs: st.untilMs, strikes: st.strikes, delayMs: delay };
   }
   st.strikes = Math.min(st.strikes + 1, 999);
   st.lastStrikeMs = now;
