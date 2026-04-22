@@ -1584,12 +1584,26 @@ function getStore(): VeoSingletonStore {
 async function dropStaleInstance(store: VeoSingletonStore): Promise<void> {
   const inst = store.instance;
   if (!inst) return;
-  const isCurrentClass = inst instanceof VeoTokenCollector;
-  const alive = isCurrentClass ? safeIsAlive(inst) : false;
-  if (isCurrentClass && alive) return;
-  console.warn(
-    `[VEO] Dropping cached collector (currentClass=${isCurrentClass}, alive=${alive}) — reinitialising`,
-  );
+  // DELIBERATELY no `instanceof VeoTokenCollector` check here.
+  //
+  // In Next.js dev mode every HMR reload creates a brand-new class
+  // object with a fresh function identity, so `old instanceof New` is
+  // always false for the cached instance. Previously this forced
+  // `alive = false`, which then called `.close()` on the live browser
+  // handle and disposed every Playwright request context held by
+  // in-flight jobs. Jobs would immediately fail with
+  // "apiRequestContext.post: Request context disposed", even though
+  // Chrome itself was perfectly healthy.
+  //
+  // Methods defined on the old prototype are still callable on the
+  // cached instance (JS keeps the prototype chain intact), and the
+  // public API (getFreshRecaptchaToken, collectAuth, getPageForMode,
+  // etc.) is backwards-compatible across revisions. If user-visible
+  // behaviour needs a cold restart of the collector they can close
+  // Chrome or restart the dev server — small cost for not killing
+  // every running job on every code save.
+  if (safeIsAlive(inst)) return;
+  console.warn(`[VEO] Dropping dead collector (alive=false) — reinitialising`);
   try {
     const closer = (inst as { close?: () => Promise<void> }).close;
     if (typeof closer === "function") await closer.call(inst);
@@ -1600,9 +1614,10 @@ async function dropStaleInstance(store: VeoSingletonStore): Promise<void> {
   store.initPromise = null;
 }
 
-function safeIsAlive(inst: VeoTokenCollector): boolean {
+function safeIsAlive(inst: unknown): boolean {
   try {
-    return inst.isAlive();
+    const i = inst as { isAlive?: () => boolean };
+    return typeof i?.isAlive === "function" && i.isAlive();
   } catch {
     return false;
   }
@@ -1618,7 +1633,7 @@ export async function getVeoCollector(): Promise<VeoTokenCollector> {
     // will clean it up on the next pass and we'll retry.
     try {
       const pending = await store.initPromise;
-      if (pending instanceof VeoTokenCollector && safeIsAlive(pending)) return pending;
+      if (pending && safeIsAlive(pending)) return pending;
     } catch {
       // fall through and start fresh
     }

@@ -312,21 +312,21 @@ function getGrokStore(): GrokSingletonStore {
 }
 
 /**
- * Same rationale as VEO's dropStaleInstance — see that file for the full
- * explanation. Summary: an `instanceof` check against the *current* class
- * catches stale HMR prototypes in one principled step, while `isAlive()`
- * catches the legitimate "user closed Chrome while idle" case. Either
- * failure triggers a full reinit, not a per-method workaround.
+ * Drop the cached singleton *only* when the underlying Chrome/CDP handle
+ * is genuinely dead. See veoTokenCollector.ts for the full rationale — in
+ * short: `instanceof` checks against the current class look principled but
+ * fire on every Next.js HMR reload (new class identity), which in turn
+ * calls `browser.close()` and disposes any Playwright request contexts
+ * in-flight jobs are currently using. That surfaces as
+ * "apiRequestContext.post: Request context disposed" crashes even though
+ * the user's Chrome is perfectly healthy. We avoid it by trusting
+ * `isAlive()` as the single source of truth.
  */
 async function dropStaleGrokInstance(store: GrokSingletonStore): Promise<void> {
   const inst = store.instance;
   if (!inst) return;
-  const isCurrentClass = inst instanceof GrokTokenCollector;
-  const alive = isCurrentClass ? safeGrokIsAlive(inst) : false;
-  if (isCurrentClass && alive) return;
-  console.warn(
-    `[Grok] Dropping cached collector (currentClass=${isCurrentClass}, alive=${alive}) — reinitialising`,
-  );
+  if (safeGrokIsAlive(inst)) return;
+  console.warn(`[Grok] Dropping dead collector (alive=false) — reinitialising`);
   try {
     const closer = (inst as { close?: () => Promise<void> }).close;
     if (typeof closer === "function") await closer.call(inst);
@@ -337,9 +337,10 @@ async function dropStaleGrokInstance(store: GrokSingletonStore): Promise<void> {
   store.initPromise = null;
 }
 
-function safeGrokIsAlive(inst: GrokTokenCollector): boolean {
+function safeGrokIsAlive(inst: unknown): boolean {
   try {
-    return inst.isAlive();
+    const i = inst as { isAlive?: () => boolean };
+    return typeof i?.isAlive === "function" && i.isAlive();
   } catch {
     return false;
   }
@@ -360,7 +361,7 @@ export async function getGrokCollector(profileName: string): Promise<GrokTokenCo
     try {
       const pending = await store.initPromise;
       if (
-        pending instanceof GrokTokenCollector &&
+        pending &&
         pending.profileName === profileName &&
         safeGrokIsAlive(pending)
       ) {
