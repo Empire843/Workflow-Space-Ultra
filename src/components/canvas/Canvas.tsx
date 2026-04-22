@@ -18,6 +18,7 @@ import type { NodeKind } from "@/lib/nodes";
 
 import FrameNode from "./FrameNode";
 import QuickAddMenu from "./QuickAddMenu";
+import ScenesImportDialog from "./ScenesImportDialog";
 import WSNode from "./WSNode";
 
 const nodeTypes: NodeTypes = { wsNode: WSNode, frame: FrameNode };
@@ -68,6 +69,9 @@ function Inner() {
   const [quickAdd, setQuickAdd] = useState<
     { screenX: number; screenY: number; flowX: number; flowY: number } | null
   >(null);
+  // Scenes Import dialog — opened from QuickAddMenu's "Import scenes" action.
+  // Carries the flow-coord anchor so the batch lands where the user clicked.
+  const [scenesImport, setScenesImport] = useState<{ flowX: number; flowY: number } | null>(null);
 
   const onPaneContextMenu = useCallback(
     (e: React.MouseEvent | MouseEvent) => {
@@ -324,6 +328,14 @@ function Inner() {
           flowX={quickAdd.flowX}
           flowY={quickAdd.flowY}
           onClose={() => setQuickAdd(null)}
+          onOpenScenesImport={(flowX, flowY) => setScenesImport({ flowX, flowY })}
+        />
+      )}
+      {scenesImport && (
+        <ScenesImportDialog
+          flowX={scenesImport.flowX}
+          flowY={scenesImport.flowY}
+          onClose={() => setScenesImport(null)}
         />
       )}
     </div>

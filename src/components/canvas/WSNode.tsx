@@ -21,6 +21,7 @@ import {
 } from "lucide-react";
 import { type ReactNode, useCallback } from "react";
 
+import { exportAssets, isLocalAssetUrl } from "@/lib/exportAssets";
 import {
   NODE_CATALOG_MAP,
   type NodeCatalogEntry,
@@ -29,6 +30,7 @@ import {
 } from "@/lib/nodes";
 import { cn } from "@/lib/utils";
 import { runSingleNode } from "@/state/runWorkflow";
+import { toast } from "@/state/toastStore";
 import { useWorkflowStore } from "@/state/workflowStore";
 import { getEdgesByTarget, getNodesById } from "@/state/graphMaps";
 
@@ -445,19 +447,41 @@ function DownloadToolButton({ data }: { data: NodeDataBase }) {
   const isVideo = Boolean(item.videoUrl || item.videoHdUrl);
   const raw = item.videoHdUrl || item.videoUrl || item.imageUrl || "";
   const ext = isVideo ? "mp4" : inferImageExt(item.mimeType, item.imageUrl);
-  const filename = `${data.kind.replace(/\./g, "_")}.${ext}`;
-  const href =
+  // Prefer the node's own label for the exported filename so users who rename
+  // scenes in the inspector get matching files on disk. Fall back to the
+  // kind-based name for anonymous nodes.
+  const baseName = (data.label || data.kind.replace(/\./g, "_")).trim() || data.kind.replace(/\./g, "_");
+  const filename = `${sanitizeFilename(baseName)}.${ext}`;
+
+  // Browser-download fallback path (used when EXPORT_DIR isn't configured or
+  // the source is a remote URL we can't hardlink).
+  const browserHref =
     raw.startsWith("/") || raw.startsWith("data:") || raw.startsWith("blob:")
       ? raw
       : `/api/download?url=${encodeURIComponent(raw)}&filename=${encodeURIComponent(filename)}`;
+
+  const onClick = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!isLocalAssetUrl(raw)) {
+      // Remote URL — can't hardlink a file that isn't on disk yet. Stream via
+      // the existing proxy download route (saves to OS Downloads folder).
+      triggerSave(browserHref, filename);
+      return;
+    }
+    const outcome = await exportAssets([{ sourceUrl: raw, filename }]);
+    if (outcome.needsConfig) {
+      // Nudge the user toward Settings and fall back to browser download so
+      // the click still produces a visible file.
+      toast.info(
+        "Chưa cấu hình Export folder",
+        "Mở Settings → Download/Export để chỉ định thư mục cố định. Trước mắt dùng Downloads của trình duyệt.",
+      );
+      triggerSave(browserHref, filename);
+    }
+  };
+
   return (
-    <ToolIconButton
-      title={`Download ${filename}`}
-      onClick={(e) => {
-        e.stopPropagation();
-        triggerSave(href, filename);
-      }}
-    >
+    <ToolIconButton title={`Download ${filename}`} onClick={onClick}>
       <Download className="h-3.5 w-3.5" />
     </ToolIconButton>
   );
@@ -642,6 +666,14 @@ function triggerSave(href: string, filename: string) {
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
+}
+
+/** Strip filesystem-unsafe characters from a node label before it becomes a
+ *  filename. The server's `/api/download/export` also sanitizes so this is
+ *  a best-effort for the download-attribute fallback path and for nicer
+ *  dest paths in toast messages. */
+function sanitizeFilename(name: string): string {
+  return name.replace(/[\\/:*?"<>|\r\n\t]+/g, "_").slice(0, 200) || "download";
 }
 
 function inferImageExt(mime?: string, url?: string): string {

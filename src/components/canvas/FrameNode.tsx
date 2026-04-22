@@ -7,6 +7,7 @@ import {
 } from "@xyflow/react";
 import {
   CheckCircle2,
+  Download,
   Frame as FrameIcon,
   Loader2,
   Play,
@@ -14,9 +15,11 @@ import {
 } from "lucide-react";
 import { useRef, useState } from "react";
 
-import type { NodeDataBase } from "@/lib/nodes";
+import { exportAssets, isLocalAssetUrl, type ExportItem } from "@/lib/exportAssets";
+import type { NodeDataBase, OutputItem } from "@/lib/nodes";
 import { cn } from "@/lib/utils";
 import { runFrame } from "@/state/runWorkflow";
+import { toast } from "@/state/toastStore";
 import { useWorkflowStore } from "@/state/workflowStore";
 
 /**
@@ -42,6 +45,7 @@ function FrameNodeInner(props: NodeProps) {
   const label = d.frameLabel || "Frame";
 
   const [busy, setBusy] = useState(false);
+  const [exporting, setExporting] = useState(false);
   const [editing, setEditing] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -65,6 +69,78 @@ function FrameNodeInner(props: NodeProps) {
       await runFrame(id);
     } finally {
       setBusy(false);
+    }
+  };
+
+  const handleDownloadFrame = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (exporting) return;
+    setExporting(true);
+    try {
+      // Collect every media output reachable inside this Frame. We read the
+      // store snapshot directly (not a selector) because the button is only
+      // clicked occasionally — no need to subscribe to every node change.
+      const snapshot = useWorkflowStore.getState().nodes;
+      const items: ExportItem[] = [];
+      const subdir = label;
+      let sceneIdx = 0;
+      for (const n of snapshot) {
+        if (n.parentId !== id) continue;
+        const d = n.data as NodeDataBase;
+        const kind = d.kind;
+        // Only gen.* nodes produce downloadable outputs. Content nodes (text,
+        // upload) and xforms either have no bytes or live on the same disk
+        // already; skipping them keeps bulk exports clean.
+        if (!(kind.startsWith("gen.") || kind === "xform.upscale.grok")) continue;
+
+        sceneIdx += 1;
+        const outs: OutputItem[] =
+          d.outputs && d.outputs.length > 0
+            ? d.outputs
+            : d.videoUrl || d.videoHdUrl
+              ? [{ videoUrl: d.videoUrl, videoHdUrl: d.videoHdUrl, mimeType: undefined }]
+              : d.imageUrl
+                ? [{ imageUrl: d.imageUrl, imageMediaId: d.imageMediaId, mimeType: undefined }]
+                : [];
+
+        const baseLabel = (d.label || kind.replace(/\./g, "_")).trim();
+        outs.forEach((item, outIdx) => {
+          const raw = item.videoHdUrl || item.videoUrl || item.imageUrl || "";
+          if (!isLocalAssetUrl(raw)) return;
+          const isVideo = Boolean(item.videoUrl || item.videoHdUrl);
+          const ext = isVideo ? "mp4" : imageExtFromMime(item.mimeType, item.imageUrl);
+          // Names follow `NN_<label>[_k].<ext>` so a sorted directory
+          // listing mirrors the scene order on the canvas. `NN` is derived
+          // from the Y-position of the node so visually-higher scenes
+          // come first even if the user added them out of order; but we
+          // approximate via the iteration counter because the full
+          // ordering algorithm belongs to runFrame, not the export.
+          const idxPrefix = String(sceneIdx).padStart(2, "0");
+          const multi = outs.length > 1 ? `_${outIdx + 1}` : "";
+          const fname = `${idxPrefix}_${sanitizeLabel(baseLabel)}${multi}.${ext}`;
+          items.push({ sourceUrl: raw, filename: fname, subdir });
+        });
+      }
+
+      if (items.length === 0) {
+        toast.info(
+          "Frame chưa có output nào để export",
+          "Chạy Run Frame trước (hoặc các node con chưa sinh media).",
+        );
+        return;
+      }
+
+      const outcome = await exportAssets(items, {
+        successLabel: `Đã export ${items.length} file từ "${label}"`,
+      });
+      if (outcome.needsConfig) {
+        toast.info(
+          "Chưa cấu hình Export folder",
+          "Mở Settings → Download/Export để chỉ định thư mục.",
+        );
+      }
+    } finally {
+      setExporting(false);
     }
   };
 
@@ -247,6 +323,30 @@ function FrameNodeInner(props: NodeProps) {
         </button>
         <button
           type="button"
+          onClick={handleDownloadFrame}
+          disabled={exporting || childCount === 0}
+          title={
+            childCount === 0
+              ? "Frame trống — chưa có gì để download"
+              : `Download toàn bộ ảnh/video trong "${label}" ra thư mục Export (Settings)`
+          }
+          className={cn(
+            "h-7 w-7 grid place-items-center rounded-full border bg-[color:var(--color-bg-elev-1)]/90 backdrop-blur shadow-md transition",
+            exporting
+              ? "border-emerald-400/40 text-emerald-200 cursor-wait"
+              : childCount === 0
+                ? "border-white/10 text-[color:var(--color-fg-dim)] opacity-60 cursor-not-allowed"
+                : "border-white/15 text-[color:var(--color-fg-muted)] hover:text-emerald-300 hover:border-emerald-500/50",
+          )}
+        >
+          {exporting ? (
+            <Loader2 className="h-3 w-3 animate-spin" />
+          ) : (
+            <Download className="h-3 w-3" />
+          )}
+        </button>
+        <button
+          type="button"
           onClick={handleDelete}
           title="Xoá Frame (và tất cả node con)"
           className="h-7 w-7 grid place-items-center rounded-full border border-white/15 bg-[color:var(--color-bg-elev-1)]/90 backdrop-blur shadow-md text-[color:var(--color-fg-muted)] hover:text-red-300 hover:border-red-500/50"
@@ -313,6 +413,30 @@ function FrameCorner({
  * non-content children are `done`. Lives in its own component so the parent
  * doesn't re-render every progress tick.
  */
+/** Strip filesystem-unsafe characters from a node label. Mirrors the
+ *  server-side sanitizer so names round-trip; we still sanitize here so
+ *  toasts that echo the path are honest about what hit disk. */
+function sanitizeLabel(label: string): string {
+  return label.replace(/[\\/:*?"<>|\r\n\t]+/g, "_").trim().slice(0, 120) || "scene";
+}
+
+/** Best-effort extension inference for images. Kept tiny and dependency-free
+ *  — prefer mimeType, fall back to URL suffix, default png. Video nodes
+ *  always emit mp4 so this is image-only. */
+function imageExtFromMime(mime?: string, url?: string): string {
+  if (mime) {
+    if (mime.includes("png")) return "png";
+    if (mime.includes("jpeg") || mime.includes("jpg")) return "jpg";
+    if (mime.includes("webp")) return "webp";
+    if (mime.includes("gif")) return "gif";
+  }
+  if (url) {
+    const m = url.toLowerCase().match(/\.(png|jpe?g|webp|gif)(?:\?|$)/);
+    if (m) return m[1] === "jpeg" ? "jpg" : m[1];
+  }
+  return "png";
+}
+
 function FrameDoneBadge({ frameId }: { frameId: string }) {
   const allDone = useWorkflowStore((s) => {
     let any = false;

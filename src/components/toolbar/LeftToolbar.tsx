@@ -18,6 +18,7 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 
 import { cn } from "@/lib/utils";
 import type { GenMode, NodeDataBase, NodeKind } from "@/lib/nodes";
+import { VEO_I2V_DEFAULT_LABEL, VEO_T2V_DEFAULT_LABEL } from "@/lib/veoVideoModels";
 import { useWorkflowStore } from "@/state/workflowStore";
 import type { CanvasTool } from "@/state/workflowStore";
 
@@ -104,7 +105,9 @@ const VIDEO_FLYOUT: FlyoutItem[] = [
     label: "Video · VEO",
     sublabel: "Text / Image → Video",
     nodeKind: "gen.video",
-    extra: { genMode: "t2v.veo" satisfies GenMode },
+    // Pin Lower Priority (0 cr) as the default so new nodes don't silently
+    // burn Fast credits when the user hasn't touched the model dropdown.
+    extra: { genMode: "t2v.veo" satisfies GenMode, modelLabel: VEO_T2V_DEFAULT_LABEL },
   },
   {
     icon: Sparkles,
@@ -117,6 +120,7 @@ const VIDEO_FLYOUT: FlyoutItem[] = [
     icon: ArrowLeftRight,
     label: "Start + End → Video · VEO",
     nodeKind: "gen.start-end",
+    extra: { modelLabel: VEO_I2V_DEFAULT_LABEL },
   },
 ];
 

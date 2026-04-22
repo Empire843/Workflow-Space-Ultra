@@ -6,7 +6,9 @@ import { useShallow } from "zustand/react/shallow";
 
 import { NODE_CATALOG, type GenMode, type NodeDataBase } from "@/lib/nodes";
 import {
+  VEO_I2V_DEFAULT_LABEL,
   VEO_I2V_MODELS,
+  VEO_T2V_DEFAULT_LABEL,
   VEO_T2V_MODELS,
   getCreditsFor,
 } from "@/lib/veoVideoModels";
@@ -494,10 +496,23 @@ function VideoGenConfig({ nodeId, data }: { nodeId: string; data: NodeDataBase }
   const isI2V = hasImageUpstream;
 
   const veoModels = isI2V ? VEO_I2V_MODELS : VEO_T2V_MODELS;
-  const veoDefault = veoModels[1]?.label || veoModels[0].label; // Ultra Fast as default
+  const veoDefault = isI2V ? VEO_I2V_DEFAULT_LABEL : VEO_T2V_DEFAULT_LABEL;
   const credits = isVeo
     ? getCreditsFor(veoModels, data.modelLabel, data.aspectRatio)
     : -1;
+
+  // Persist the VEO default (Lower Priority · 0 cr) onto the node the first
+  // time the inspector sees a VEO video node without a model label. Without
+  // this, nodes spawned from LeftToolbar / ScenesImportDialog / MCP keep a
+  // blank `modelLabel` on disk and the server falls back to its own picker
+  // (which returns Fast · 20 cr for ULTRA accounts). Writing the default here
+  // keeps the UI dropdown and the actual execution in sync.
+  useEffect(() => {
+    if (isVeo && !data.modelLabel) {
+      updateNodeData(nodeId, { modelLabel: veoDefault });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nodeId, isVeo, isI2V]);
 
   /**
    * When genMode changes, also reset modelLabel to match the new provider.
@@ -519,8 +534,7 @@ function VideoGenConfig({ nodeId, data }: { nodeId: string; data: NodeDataBase }
         const curLen = Number(data.videoLength) || 6;
         patch.videoLength = curLen >= 1 && curLen <= 10 ? curLen : 6;
       } else if (goingVeo) {
-        const targetModels = isI2V ? VEO_I2V_MODELS : VEO_T2V_MODELS;
-        patch.modelLabel = targetModels[1]?.label || targetModels[0].label;
+        patch.modelLabel = isI2V ? VEO_I2V_DEFAULT_LABEL : VEO_T2V_DEFAULT_LABEL;
       }
     }
 
@@ -632,7 +646,7 @@ function StartEndGenConfig({ nodeId, data }: { nodeId: string; data: NodeDataBas
       <div className="flex flex-wrap items-end gap-2">
         <Field label={`Model${credits >= 0 ? ` · ${credits} cr` : ""}`}>
           <Select
-            value={data.modelLabel || VEO_I2V_MODELS[1].label}
+            value={data.modelLabel || VEO_I2V_DEFAULT_LABEL}
             onChange={(v) => updateNodeData(nodeId, { modelLabel: v, videoModelKey: undefined })}
             options={VEO_I2V_MODELS.map((m) => ({
               value: m.label,

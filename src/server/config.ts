@@ -85,6 +85,17 @@ export interface AppConfig {
   SEED_VALUE?: number;
   VEO_CONCURRENCY?: number;
   GROK_CONCURRENCY?: number;
+  /**
+   * Nơi "Download" ghi file ra khi user bấm nút tải. File gốc vẫn nằm nguyên
+   * trong `Workflows/<id>/assets/outputs/` (internal cache cho preview + re-run),
+   * nên app không thể thay thế bằng `move`. Thay vào đó `/api/assets/export`
+   * tạo **hardlink** vào thư mục này — cùng ổ đĩa thì 0 byte thêm, khác ổ thì
+   * tự fallback sang `fs.copyFile`.
+   *
+   * Để trống → nút Download rơi về hành vi cũ (browser download vào thư mục
+   * Downloads mặc định của OS).
+   */
+  EXPORT_DIR?: string;
 }
 
 const DEFAULT_CONFIG: AppConfig = {

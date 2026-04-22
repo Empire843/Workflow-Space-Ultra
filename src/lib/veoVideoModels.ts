@@ -80,9 +80,14 @@ export const VEO_I2V_MODELS: VeoVideoModelOption[] = [
   },
 ];
 
-/** Default = Ultra Fast (20 cr, not Lower Priority so users don't accidentally wait forever). */
-export const VEO_T2V_DEFAULT_LABEL = "VEO 3.1 Ultra (Fast)";
-export const VEO_I2V_DEFAULT_LABEL = "VEO 3.1 Ultra (Fast)";
+/**
+ * Default = Lower Priority (0 cr).
+ * Rationale: with an Ultra subscription the "Relaxed" tier is free, so using it
+ * by default keeps credits untouched until the user deliberately upgrades to
+ * Fast/Quality. Users who need faster turnaround can switch in the inspector.
+ */
+export const VEO_T2V_DEFAULT_LABEL = "VEO 3.1 Ultra (Lower Priority)";
+export const VEO_I2V_DEFAULT_LABEL = "VEO 3.1 Ultra (Lower Priority)";
 
 /**
  * Get the credit cost for the given label + selected aspect.

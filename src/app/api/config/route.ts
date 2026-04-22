@@ -18,6 +18,7 @@ export async function GET() {
     seedValue: c.SEED_VALUE ?? 9797,
     veoConcurrency: c.VEO_CONCURRENCY ?? 1,
     grokConcurrency: c.GROK_CONCURRENCY ?? 1,
+    exportDir: c.EXPORT_DIR || "",
   };
   return NextResponse.json({ settings });
 }
@@ -36,6 +37,11 @@ export async function POST(req: Request) {
   c.SEED_VALUE = s.seedValue;
   c.VEO_CONCURRENCY = s.veoConcurrency;
   c.GROK_CONCURRENCY = s.grokConcurrency;
+  // Persist the chosen export directory. The POST handler intentionally does
+  // not validate that the path exists — we let the user point at a folder
+  // that will be mounted later. The /api/assets/export endpoint is where
+  // existence / mkdir / permission checks actually bite.
+  c.EXPORT_DIR = s.exportDir?.trim() || undefined;
   saveConfig(c);
 
   setLaneConcurrency("veo", s.veoConcurrency || 1);

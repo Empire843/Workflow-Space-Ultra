@@ -17,6 +17,8 @@ interface AppSettings {
   seedValue: number;
   veoConcurrency: number;
   grokConcurrency: number;
+  /** Absolute path. Empty = dùng fallback browser download của OS. */
+  exportDir: string;
 }
 
 export default function SettingsDialog({
@@ -256,6 +258,34 @@ export default function SettingsDialog({
                   setSettings((s) => (s ? { ...s, grokConcurrency: Math.max(1, Math.min(5, Number(e.target.value) || 1)) } : s))
                 }
                 className="bg-[color:var(--color-bg-elev-2)] border border-[color:var(--color-border)] rounded-md px-2 py-1 text-sm outline-none w-24"
+              />
+            </Row>
+          </Section>
+
+          <Section title="Download / Export">
+            <div className="rounded-md bg-[color:var(--color-bg-elev-2)] border border-[color:var(--color-border)] p-2.5 space-y-1 text-[11px] text-[color:var(--color-fg-muted)]">
+              <p>
+                File gốc luôn giữ trong <code>Workflows/&lt;id&gt;/assets/outputs/</code> để preview
+                và re-run chạy được. Nút Download sẽ{" "}
+                <b>hardlink</b> sang thư mục bên dưới (cùng ổ đĩa = 0 byte thêm, khác ổ sẽ fallback copy).
+              </p>
+              <p>
+                Để trống → rơi về hành vi cũ (trình duyệt tự lưu vào Downloads của OS).
+              </p>
+            </div>
+            <Row label="Export folder (absolute path)">
+              <input
+                type="text"
+                value={settings?.exportDir || ""}
+                onChange={(e) =>
+                  setSettings((s) => (s ? { ...s, exportDir: e.target.value } : s))
+                }
+                placeholder={
+                  // Hint a Windows path since this project ships with chrome_user_data on Windows.
+                  "VD: D:\\Videos\\workflow-space-exports"
+                }
+                spellCheck={false}
+                className="flex-1 bg-[color:var(--color-bg-elev-2)] border border-[color:var(--color-border)] rounded-md px-2 py-1 text-sm outline-none font-mono"
               />
             </Row>
           </Section>

@@ -12,7 +12,8 @@ import {
 } from "@xyflow/react";
 import { create } from "zustand";
 
-import { NODE_CATALOG, type NodeDataBase, type NodeKind } from "@/lib/nodes";
+import { NODE_CATALOG, type GenMode, type NodeDataBase, type NodeKind } from "@/lib/nodes";
+import { VEO_I2V_DEFAULT_LABEL } from "@/lib/veoVideoModels";
 import { uid } from "@/lib/utils";
 import {
   getWorkflow,
@@ -79,6 +80,20 @@ function stripRuntimeFields(nodes: WSNode[]): WSNode[] {
  * (connecting an image node still runs the I2V pipeline) without leaving the
  * deprecated option visible in the inspector dropdown.
  */
+/**
+ * Strip the `data:<mime>;base64,` prefix from a data URL, returning just the
+ * raw base64 payload. `content.upload` stores the payload without the prefix
+ * on `data.uploadBase64` so `executor.resolveVeoMediaId` can forward it to
+ * the provider upload endpoints unchanged. If no prefix is present (already
+ * a raw payload) the string is returned as-is.
+ */
+function stripDataUrlPrefix(dataUrl: string): string {
+  const comma = dataUrl.indexOf(",");
+  if (comma === -1) return dataUrl;
+  const header = dataUrl.slice(0, comma);
+  return header.startsWith("data:") ? dataUrl.slice(comma + 1) : dataUrl;
+}
+
 function migrateNodes(nodes: WSNode[]): WSNode[] {
   let changed = false;
   const out: WSNode[] = nodes.map((n) => {
@@ -394,6 +409,36 @@ interface WorkflowState {
   addNode: (kind: NodeKind, position: { x: number; y: number }, extra?: Partial<NodeDataBase>) => string;
   addNodes: (nodes: WSNode[]) => void;
   addEdges: (edges: WSEdge[]) => void;
+  importScenes: (args: {
+    imagePrompts: string[];
+    videoPrompts: string[];
+    imageGenMode: GenMode;
+    videoGenMode: GenMode;
+    /**
+     * Aspect ratio applied uniformly to every gen.image and gen.video node
+     * in this batch. Only the 3 backend-supported ratios are accepted —
+     * 2:3/3:2/etc. would be silently coerced to LANDSCAPE by the VEO
+     * executor, so the Import dialog restricts the dropdown to these.
+     */
+    aspectRatio: "16:9" | "9:16" | "1:1";
+    anchor: { x: number; y: number };
+    groupInFrame: boolean;
+    /**
+     * Shared "character / style sheet" text. When present, a single
+     * `content.text` node is created at the top of the Frame and wired into
+     * EVERY gen.image + gen.video child, so its content is concatenated in
+     * front of each scene-specific prompt via the normal upstream-text
+     * pipeline. Edit once, updates all scenes.
+     */
+    stylePrefix?: string;
+    /**
+     * Shared reference images (e.g. character portrait, mood board). Each
+     * becomes a `content.upload` node wired as input to every gen.image in
+     * the batch. Nano Banana 2 / pro use them as identity/style anchors.
+     * Imagen silently drops them.
+     */
+    referenceImages?: Array<{ dataUrl: string; mime: string; name?: string }>;
+  }) => void;
   cloneNode: (sourceId: string, offsetIndex: number, extra?: Partial<NodeDataBase>) => WSNode | null;
   updateNodeData: (id: string, data: Partial<NodeDataBase>) => void;
   removeNode: (id: string) => void;
@@ -574,6 +619,272 @@ export const useWorkflowStore = create<WorkflowState>()(
     addEdges: (es) => {
       get()._takeSnapshot();
       set({ edges: [...get().edges, ...es] });
+      scheduleSave();
+    },
+
+    importScenes: ({
+      imagePrompts,
+      videoPrompts,
+      imageGenMode,
+      videoGenMode,
+      aspectRatio,
+      anchor,
+      groupInFrame,
+      stylePrefix,
+      referenceImages,
+    }) => {
+      const n = Math.min(imagePrompts.length, videoPrompts.length);
+      if (n === 0) return;
+
+      // Layout: 4 columns per scene, stacked vertically.
+      // col 0: Text (image prompt)  → col 1: gen.image  → col 2: Text (video prompt)  → col 3: gen.video
+      // Edges: textImg→genImage, genImage→genVideo, textVid→genVideo
+      const COL_W = 320;
+      // Row height has to clear the tallest node on the row. gen.image and
+      // gen.video both scale with aspectRatio (see FRAME_DIMS in WSNode):
+      //   16:9 → 158h, 1:1 → 220h, 9:16 → 320h  (preview area only)
+      // plus ~40px chrome (NodeLabel header + handle padding). A hard-coded
+      // 260 used to work for 16:9 only and caused the 9:16 rows to overlap
+      // by ~100px. Pick a per-ratio row height with ~60–80px gap so labels
+      // and handles never collide with the row below.
+      const ROW_H =
+        aspectRatio === "9:16" ? 440 : aspectRatio === "1:1" ? 320 : 260;
+      const FRAME_PAD_X = 40;
+      const FRAME_PAD_Y = 60; // extra top padding so the frame title bar doesn't cover row 0
+      const COLS = 4;
+
+      // Optional header row (stylePrefix text + reference upload nodes) — one
+      // extra row above all scenes, so everyone downstream inherits them.
+      const hasStyle = !!stylePrefix && stylePrefix.trim().length > 0;
+      const refs = (referenceImages ?? []).filter((r) => r.dataUrl);
+      const hasRefs = refs.length > 0;
+      const hasHeader = hasStyle || hasRefs;
+      const headerRowY = 0;
+      const sceneStartRowIdx = hasHeader ? 1 : 0;
+
+      get()._takeSnapshot();
+
+      const newNodes: WSNode[] = [];
+      const newEdges: WSEdge[] = [];
+
+      // Optional wrapping frame. When present, child positions are frame-relative.
+      let frameId: string | null = null;
+      if (groupInFrame) {
+        frameId = uid("node");
+        const frameW = COLS * COL_W + FRAME_PAD_X * 2;
+        const frameH = (n + sceneStartRowIdx) * ROW_H + FRAME_PAD_Y + FRAME_PAD_X;
+        const existingFrames = get().nodes.filter(
+          (nd) => (nd.data as NodeDataBase).kind === "frame",
+        ).length;
+        const label = `Scenes ${existingFrames + 1}`;
+        newNodes.push({
+          id: frameId,
+          type: "frame",
+          position: { x: anchor.x, y: anchor.y },
+          zIndex: -1,
+          style: { width: frameW, height: frameH },
+          data: {
+            kind: "frame",
+            status: "idle",
+            frameLabel: label,
+            frameWidth: frameW,
+            frameHeight: frameH,
+          },
+        });
+      }
+
+      // Base offset for child positions.
+      // - Inside frame: relative to frame top-left, with padding so nodes sit
+      //   below the frame title bar and inside the right/bottom edges.
+      // - Without frame: absolute canvas coords anchored at `anchor`.
+      const baseX = groupInFrame ? FRAME_PAD_X : anchor.x;
+      const baseY = groupInFrame ? FRAME_PAD_Y : anchor.y;
+
+      // Header row: shared style text (col 0) + reference upload nodes
+      // (col 1..K). These IDs are collected so every scene's gen.image and
+      // gen.video can reference them via edges further down.
+      let styleTextId: string | null = null;
+      const refUploadIds: string[] = [];
+
+      if (hasHeader) {
+        const headerY = baseY + headerRowY * ROW_H;
+
+        if (hasStyle) {
+          styleTextId = uid("node");
+          newNodes.push({
+            id: styleTextId,
+            type: "wsNode",
+            position: { x: baseX + 0 * COL_W, y: headerY },
+            ...(frameId ? { parentId: frameId } : {}),
+            data: {
+              kind: "content.text",
+              status: "idle",
+              label: "Shared style / character sheet",
+              text: stylePrefix!.trim(),
+            },
+          });
+        }
+
+        // Reference images: lay out in cols 1..N of the header row; if they
+        // don't all fit (K > 3), wrap by reducing column width slightly —
+        // simplest is to cap at 3 cols in a single row for the happy path.
+        // Users rarely upload more than 2-3 refs in practice.
+        refs.forEach((ref, idx) => {
+          const uploadId = uid("node");
+          refUploadIds.push(uploadId);
+          const col = 1 + idx; // col 0 is the style text
+          newNodes.push({
+            id: uploadId,
+            type: "wsNode",
+            position: { x: baseX + col * COL_W, y: headerY },
+            ...(frameId ? { parentId: frameId } : {}),
+            data: {
+              kind: "content.upload",
+              status: "idle",
+              label: ref.name
+                ? `Reference · ${ref.name}`
+                : `Reference #${idx + 1}`,
+              // `uploadBase64` should hold just the base64 payload (no
+              // `data:` prefix) — matches what executor.resolveVeoMediaId
+              // expects. The raw dataUrl is also kept on `imageUrl` so the
+              // node's media preview renders without a round-trip.
+              uploadBase64: stripDataUrlPrefix(ref.dataUrl),
+              uploadMime: ref.mime,
+              uploadAccept: "image/*",
+              imageUrl: ref.dataUrl,
+            },
+          });
+        });
+      }
+
+      for (let i = 0; i < n; i++) {
+        const y = baseY + (i + sceneStartRowIdx) * ROW_H;
+        const imgPrompt = imagePrompts[i] ?? "";
+        const vidPrompt = videoPrompts[i] ?? "";
+
+        const textImgId = uid("node");
+        const genImgId = uid("node");
+        const textVidId = uid("node");
+        const genVidId = uid("node");
+
+        const parentProps = frameId ? { parentId: frameId } : {};
+
+        newNodes.push({
+          id: textImgId,
+          type: "wsNode",
+          position: { x: baseX + 0 * COL_W, y },
+          ...parentProps,
+          data: {
+            kind: "content.text",
+            status: "idle",
+            label: `Scene ${i + 1} · Image prompt`,
+            text: imgPrompt,
+          },
+        });
+
+        newNodes.push({
+          id: genImgId,
+          type: "wsNode",
+          position: { x: baseX + 1 * COL_W, y },
+          ...parentProps,
+          data: {
+            kind: "gen.image",
+            status: "idle",
+            genMode: imageGenMode,
+            label: `Scene ${i + 1} · Image`,
+            aspectRatio,
+          },
+        });
+
+        newNodes.push({
+          id: textVidId,
+          type: "wsNode",
+          position: { x: baseX + 2 * COL_W, y },
+          ...parentProps,
+          data: {
+            kind: "content.text",
+            status: "idle",
+            label: `Scene ${i + 1} · Video prompt`,
+            text: vidPrompt,
+          },
+        });
+
+        // For VEO video we pin the default to the free "Lower Priority" tier
+        // so batch imports don't silently burn Fast credits. Grok has its own
+        // label set lazily by the inspector. I2V default is used when an image
+        // is upstream; here the upstream is always gen.image, so use I2V.
+        const isVeoVideo = videoGenMode === "t2v.veo";
+        newNodes.push({
+          id: genVidId,
+          type: "wsNode",
+          position: { x: baseX + 3 * COL_W, y },
+          ...parentProps,
+          data: {
+            kind: "gen.video",
+            status: "idle",
+            genMode: videoGenMode,
+            label: `Scene ${i + 1} · Video`,
+            aspectRatio,
+            ...(isVeoVideo ? { modelLabel: VEO_I2V_DEFAULT_LABEL } : {}),
+          },
+        });
+
+        const edgeStyle = { animated: true, style: { stroke: "#ff3c8e" } };
+        // Header-row fan-out FIRST so the shared style text appears at the
+        // head of the concatenated prompt (buildCombinedPrompt joins upstream
+        // text in edge order). This also means reference uploads are resolved
+        // before the per-scene text.
+        if (styleTextId) {
+          newEdges.push({
+            id: uid("edge"),
+            source: styleTextId,
+            target: genImgId,
+            ...edgeStyle,
+          });
+          newEdges.push({
+            id: uid("edge"),
+            source: styleTextId,
+            target: genVidId,
+            ...edgeStyle,
+          });
+        }
+        for (const refId of refUploadIds) {
+          // Refs only wire to gen.image: Nano Banana takes them via
+          // `imageInputs`. Feeding them to gen.video would collide with
+          // the I2V start-frame slot, which is already filled by the
+          // scene's own gen.image output via the genImage → genVideo
+          // edge below.
+          newEdges.push({
+            id: uid("edge"),
+            source: refId,
+            target: genImgId,
+            ...edgeStyle,
+          });
+        }
+        newEdges.push({
+          id: uid("edge"),
+          source: textImgId,
+          target: genImgId,
+          ...edgeStyle,
+        });
+        newEdges.push({
+          id: uid("edge"),
+          source: genImgId,
+          target: genVidId,
+          ...edgeStyle,
+        });
+        newEdges.push({
+          id: uid("edge"),
+          source: textVidId,
+          target: genVidId,
+          ...edgeStyle,
+        });
+      }
+
+      set({
+        nodes: [...get().nodes, ...newNodes],
+        edges: [...get().edges, ...newEdges],
+      });
       scheduleSave();
     },
 

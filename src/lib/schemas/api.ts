@@ -86,6 +86,9 @@ export const ClientSettingsSchema = z.object({
   seedValue: z.number().int(),
   veoConcurrency: z.number().int().min(1).max(8),
   grokConcurrency: z.number().int().min(1).max(8),
+  /** Absolute path where Download buttons export media. Empty → use browser
+   *  fallback. Server validates path is absolute when non-empty. */
+  exportDir: z.string().max(1024).optional().default(""),
 });
 
 export const SaveConfigSchema = z.object({
