@@ -825,11 +825,29 @@ function GenerateButton({ nodeId }: { nodeId: string }) {
     return "Generate";
   }, [status]);
 
+  /**
+   * Mirror the canvas Play button (`runSingleNode(id)` with `cascade=false`)
+   * so clicking Generate from the inspector only re-runs **this** node and
+   * reuses whatever output upstream nodes already have. The previous
+   * default of `cascade: true` would force every upstream gen node to be
+   * cleared and re-run, which surprised users (and burned credits) when
+   * they opened the inspector just to tweak a downstream parameter on a
+   * graph whose earlier nodes were already done.
+   *
+   * Power users can still opt into the full chain refresh with Shift+Click
+   * — same semantics as the Workflow icon button on the canvas.
+   */
+  const handleClick = (e: React.MouseEvent<HTMLButtonElement>) => {
+    const cascade = e.shiftKey;
+    void runSingleNode(nodeId, { cascade });
+  };
+
   return (
     <button
       type="button"
       disabled={running}
-      onClick={() => void runSingleNode(nodeId, { cascade: true })}
+      onClick={handleClick}
+      title="Generate node hiện tại — Shift+Click để re-run toàn bộ upstream"
       className={cn(
         "ml-auto h-8 px-4 rounded-lg bg-gradient-to-r from-pink-500 to-rose-500 text-white text-xs font-semibold flex items-center gap-1.5 transition",
         running ? "opacity-70 cursor-not-allowed" : "hover:opacity-95 shadow-lg shadow-pink-500/20"

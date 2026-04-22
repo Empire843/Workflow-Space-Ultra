@@ -220,17 +220,17 @@ async function verifyGrokSessionCookie(page: import("playwright").Page): Promise
       "Grok session: Chrome Grok chưa login (không tìm thấy cookie của grok.com). Hãy mở Chrome Grok và đăng nhập Super Grok Heavy trước khi chạy.",
     );
   }
+  // Grok rotates cookie names every few months (we've seen `sso`, `sso-rw`,
+  // `xai-session-*`, etc.) so a name-based whitelist false-positives the
+  // moment they ship a redesign and bricks every job until we ship a new
+  // build. Any cookie value >= 24 chars on grok.com is overwhelmingly
+  // likely to be an opaque session/JWT token — guest cookies and feature
+  // flags rarely cross that bar. We keep the strict "no cookies at all"
+  // short-circuit above to still catch the actually-logged-out case.
+  const AUTH_VALUE_MIN = 24;
   const hasAuthish = cookies.some((c) => {
-    const n = c.name.toLowerCase();
-    if (!c.value || c.value.length < 8) return false;
-    return (
-      n === "sso" ||
-      n === "sso-rw" ||
-      n.startsWith("sso") ||
-      n.startsWith("auth") ||
-      n.includes("session") ||
-      n.includes("token")
-    );
+    if (!c.value) return false;
+    return c.value.length >= AUTH_VALUE_MIN;
   });
   if (!hasAuthish) {
     const names = cookies.map((c) => c.name).join(",");

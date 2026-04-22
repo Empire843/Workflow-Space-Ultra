@@ -78,8 +78,9 @@ export default function SessionErrorDialog() {
 
   if (!pending) return null;
 
-  const { provider, message, nodeLabel } = pending;
+  const { provider, kind, message, nodeLabel } = pending;
   const providerName = provider === "veo" ? "VEO 3" : "Super Grok";
+  const isPageNotReady = kind === "page-not-ready";
 
   const openChrome = async () => {
     setStep("opening");
@@ -176,10 +177,16 @@ export default function SessionErrorDialog() {
             </div>
             <div>
               <h2 className="text-base font-semibold text-zinc-100">
-                Cần đăng nhập lại {providerName}
+                {isPageNotReady
+                  ? `Trang ${providerName} chưa sẵn sàng`
+                  : `Cần đăng nhập lại ${providerName}`}
               </h2>
               <p className="mt-0.5 text-xs text-zinc-400">
-                {nodeLabel
+                {isPageNotReady
+                  ? nodeLabel
+                    ? `Node "${nodeLabel}" không lấy được token từ tab ${providerName} (Chrome vẫn login bình thường). Thường là do tab đã đóng / về trang chủ, có popup chặn, hoặc Flow đang bị treo.`
+                    : `Một node không lấy được token từ tab ${providerName} (Chrome vẫn login bình thường). Thường là do tab đã đóng / về trang chủ, có popup chặn, hoặc Flow đang bị treo.`
+                  : nodeLabel
                   ? `Node "${nodeLabel}" không chạy được vì session ${providerName} đã hết hạn hoặc chưa sẵn sàng.`
                   : `Một node không chạy được vì session ${providerName} đã hết hạn hoặc chưa sẵn sàng.`}
               </p>
@@ -201,7 +208,37 @@ export default function SessionErrorDialog() {
           </div>
 
           <div className="rounded-md border border-zinc-800 bg-zinc-950/50 p-3 text-xs leading-relaxed text-zinc-400">
-            {provider === "veo" ? (
+            {isPageNotReady ? (
+              provider === "veo" ? (
+                <ol className="list-inside list-decimal space-y-1">
+                  <li>
+                    Quay sang Chrome VEO, mở 1 tab{" "}
+                    <span className="text-fuchsia-300">labs.google/fx/tools/flow</span> → vào 1
+                    project bất kỳ.
+                  </li>
+                  <li>Đóng mọi popup/cookie banner đang nổi trên Flow (nếu có).</li>
+                  <li>
+                    Bấm <b>Verify Now</b> hoặc chạy lại node — backend đã tự retry và mở lại tab,
+                    thường lần 2 sẽ chạy.
+                  </li>
+                  <li>
+                    Nếu vẫn fail, dùng <b>Mở Chrome &amp; Login VEO</b> để khởi động lại Chrome từ
+                    đầu.
+                  </li>
+                </ol>
+              ) : (
+                <ol className="list-inside list-decimal space-y-1">
+                  <li>
+                    Quay sang Chrome Grok, mở lại tab{" "}
+                    <span className="text-fuchsia-300">grok.com/imagine</span>.
+                  </li>
+                  <li>Đóng popup / cookie banner trên Grok (nếu có).</li>
+                  <li>
+                    Bấm <b>Verify Now</b> hoặc chạy lại node — backend sẽ thử lấy token lại.
+                  </li>
+                </ol>
+              )
+            ) : provider === "veo" ? (
               <ol className="list-inside list-decimal space-y-1">
                 <li>
                   Bấm <b>Mở Chrome &amp; Login VEO</b> bên dưới
@@ -263,21 +300,18 @@ export default function SessionErrorDialog() {
           </button>
           <button
             type="button"
-            onClick={() => void verify()}
-            disabled={step === "opening"}
-            className="inline-flex items-center gap-1.5 rounded-md border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-xs text-zinc-200 hover:bg-zinc-700 disabled:opacity-50"
-          >
-            <RefreshCw className="h-3.5 w-3.5" /> Verify Now
-          </button>
-          <button
-            type="button"
             onClick={() => void openChrome()}
             disabled={step === "opening" || step === "verified"}
             className={cn(
-              "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-semibold text-white transition disabled:opacity-60",
-              provider === "veo"
-                ? "bg-gradient-to-r from-blue-500 to-sky-500 hover:opacity-95"
-                : "bg-gradient-to-r from-fuchsia-500 to-pink-500 hover:opacity-95",
+              "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs transition disabled:opacity-60",
+              isPageNotReady
+                ? "border border-zinc-700 bg-zinc-800 text-zinc-200 hover:bg-zinc-700"
+                : cn(
+                    "font-semibold text-white",
+                    provider === "veo"
+                      ? "bg-gradient-to-r from-blue-500 to-sky-500 hover:opacity-95"
+                      : "bg-gradient-to-r from-fuchsia-500 to-pink-500 hover:opacity-95",
+                  ),
             )}
           >
             {step === "opening" ? (
@@ -285,7 +319,25 @@ export default function SessionErrorDialog() {
             ) : (
               <ExternalLink className="h-3.5 w-3.5" />
             )}
-            Mở Chrome &amp; Login {providerName}
+            {isPageNotReady ? `Mở lại Chrome ${providerName}` : `Mở Chrome & Login ${providerName}`}
+          </button>
+          <button
+            type="button"
+            onClick={() => void verify()}
+            disabled={step === "opening"}
+            className={cn(
+              "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs transition disabled:opacity-50",
+              isPageNotReady
+                ? cn(
+                    "font-semibold text-white",
+                    provider === "veo"
+                      ? "bg-gradient-to-r from-blue-500 to-sky-500 hover:opacity-95"
+                      : "bg-gradient-to-r from-fuchsia-500 to-pink-500 hover:opacity-95",
+                  )
+                : "border border-zinc-700 bg-zinc-800 text-zinc-200 hover:bg-zinc-700",
+            )}
+          >
+            <RefreshCw className="h-3.5 w-3.5" /> Verify Now
           </button>
         </div>
       </div>

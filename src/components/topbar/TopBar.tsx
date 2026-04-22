@@ -38,6 +38,12 @@ interface AuthSlice {
   ageMs: number | null;
   updatedAt: string | null;
   chromeConnected: boolean;
+  /**
+   * Optional reason returned by `computeVeoHealth` / `computeGrokHealth`.
+   * Currently we only react to `"chrome-disconnected"` to swap the badge
+   * tooltip; everything else is purely informational telemetry.
+   */
+  reason?: string;
 }
 
 interface AuthStatus {
@@ -168,20 +174,24 @@ export default function TopBar() {
   );
 
   // Auto pre-warm stale providers: runs whenever the polled status flips
-  // to "stale" (and Chrome is still connected — otherwise the user just
-  // needs to click Login). One fire per status change.
+  // to "stale". We deliberately no longer gate on `chromeConnected` — when
+  // the singleton has just been wiped (server restart, HMR, user closed
+  // Chrome) the prewarm endpoint is exactly the thing that re-attaches it,
+  // so requiring it here would deadlock the badge in amber forever. If the
+  // user has actually logged out, the next status poll will flip us to
+  // `expired` and we won't loop.
   useEffect(() => {
     if (!auth) return;
     const targets: Array<"veo" | "grok"> = [];
-    if (auth.veo.status === "stale" && auth.veo.chromeConnected && !prewarming.veo) {
+    if (auth.veo.status === "stale" && !prewarming.veo) {
       targets.push("veo");
     }
-    if (auth.grok.status === "stale" && auth.grok.chromeConnected && !prewarming.grok) {
+    if (auth.grok.status === "stale" && !prewarming.grok) {
       targets.push("grok");
     }
     if (targets.length > 0) void triggerPrewarm(targets);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [auth?.veo.status, auth?.grok.status, auth?.veo.chromeConnected, auth?.grok.chromeConnected]);
+  }, [auth?.veo.status, auth?.grok.status]);
 
 
 
@@ -252,6 +262,7 @@ export default function TopBar() {
             target="veo"
             status={auth.veo.status}
             ageMs={auth.veo.ageMs}
+            reason={auth.veo.reason}
             prewarming={prewarming.veo}
             onLogin={() => openAndVerify("veo", refreshAuth)}
             onLogout={() => handleLogout("veo")}
@@ -261,6 +272,7 @@ export default function TopBar() {
             target="grok"
             status={auth.grok.status}
             ageMs={auth.grok.ageMs}
+            reason={auth.grok.reason}
             prewarming={prewarming.grok}
             onLogin={() => openAndVerify("grok", refreshAuth)}
             onLogout={() => handleLogout("grok")}
@@ -362,6 +374,7 @@ function ProviderBadge({
   target,
   status,
   ageMs,
+  reason,
   prewarming,
   onLogin,
   onLogout,
@@ -370,6 +383,7 @@ function ProviderBadge({
   target: "veo" | "grok";
   status: AuthStatusKind;
   ageMs: number | null;
+  reason?: string;
   prewarming?: boolean;
   onLogin?: () => void;
   onLogout?: () => Promise<void> | void;
@@ -406,6 +420,9 @@ function ProviderBadge({
       case "fresh":
         return `${label}: Sẵn sàng tạo${ageLabel ? ` (cache ${ageLabel})` : ""} — hover để logout`;
       case "stale":
+        if (reason === "chrome-disconnected") {
+          return `${label}: Chrome đang reconnect…${ageLabel ? ` (cache ${ageLabel})` : ""}`;
+        }
         return `${label}: Cache sắp hết hạn${ageLabel ? ` (${ageLabel})` : ""} — đang tự làm mới…`;
       default:
         return `${label}: Chưa đăng nhập — click để login`;

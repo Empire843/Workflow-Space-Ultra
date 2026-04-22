@@ -183,15 +183,47 @@ export class GrokTokenCollector {
   }
 
   async autoDiscoverStatsig(opts?: { force?: boolean; persist?: boolean }): Promise<GrokHeaders> {
-    const { force = false, persist = true } = opts || {};
+    let { force = false } = opts || {};
+    const { persist = true } = opts || {};
 
     if (!force) {
       const cached = getCachedGrokHeaders(this.profileName);
       if (cached) {
-        sessionTelemetry.record({ target: "grok", kind: "cache_hit" });
-        return cached;
+        // Cache freshness alone isn't a guarantee Grok is reachable: the
+        // user may have closed all grok.com tabs in the meantime, leaving
+        // Chrome on about:blank or some other site. If we hand back the
+        // cached header without verifying the live tab, the very next
+        // request that needs to round-trip through Playwright will throw
+        // "Target page, context or browser has been closed" or land on
+        // an unrelated origin. Probe `getLivePage()` + URL before trusting
+        // the cache; on any failure, fall through to the discover path
+        // which will navigate a fresh tab to /imagine.
+        let live = false;
+        try {
+          if (this.browser && this.context) {
+            const probe = await this.getLivePage();
+            const url = (() => {
+              try {
+                return (probe.url() || "").toLowerCase();
+              } catch {
+                return "";
+              }
+            })();
+            live = !probe.isClosed() && url.includes("grok.com");
+          }
+        } catch {
+          live = false;
+        }
+        if (live) {
+          sessionTelemetry.record({ target: "grok", kind: "cache_hit" });
+          return cached;
+        }
+        console.warn("[Grok] Cache hit but live tab not on grok.com — re-discovering");
+        sessionTelemetry.record({ target: "grok", kind: "cache_stale" });
+        force = true;
+      } else {
+        sessionTelemetry.record({ target: "grok", kind: "cache_stale" });
       }
-      sessionTelemetry.record({ target: "grok", kind: "cache_stale" });
     }
 
     // Use a live page handle — not `this.page` directly — so we don't

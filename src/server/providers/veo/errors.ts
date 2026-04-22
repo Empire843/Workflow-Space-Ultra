@@ -16,6 +16,29 @@ export function isRecaptchaError(err: unknown): boolean {
   );
 }
 
+/**
+ * Capture-side reCAPTCHA failure: `_captureRecaptchaOnce` waited for the
+ * Flow tab to fire `/recaptcha/enterprise/reload` but nothing came back
+ * before the deadline. Distinct from `isRecaptchaError` (which is Google
+ * REJECTING a token we successfully captured) — here we never even got a
+ * token, usually because:
+ *   - the tab is on the wrong project page,
+ *   - a modal is intercepting the "Tạo" click,
+ *   - the cached page handle is alive but the underlying tab was
+ *     navigated away by the user, or
+ *   - Flow's UI hit a client-side limit and short-circuited grecaptcha.
+ *
+ * The right recovery is to **drop the cached page handle** so the next
+ * attempt re-attaches/re-navigates to a project page (`_getPageForMode`
+ * does the heavy lifting), NOT to nuke auth or restart the browser. We
+ * also invalidate the recaptcha cache so we don't accidentally reuse a
+ * token from a half-finished capture.
+ */
+export function isRecaptchaCaptureTimeout(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /Không bắt được recaptcha token/i.test(msg);
+}
+
 export function isUnauthenticated(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   return / 401/.test(msg) || /UNAUTHENTICATED/i.test(msg);

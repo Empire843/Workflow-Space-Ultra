@@ -766,8 +766,28 @@ export class VeoTokenCollector {
    * filling up with duplicate Flow tabs every time Next restarts.
    */
   private async _getPageForMode(mode: "video" | "image"): Promise<Page> {
-    if (this._pages[mode] && !this._pages[mode]!.isClosed()) return this._pages[mode]!;
-    if (this._pages[mode]?.isClosed()) this._pages[mode] = undefined;
+    // Re-validate the cached page before handing it back. The previous
+    // implementation only checked `isClosed()` — a tab the user navigated
+    // away from (e.g. clicked a link, opened DevTools "Open in new tab",
+    // or the OAuth cookie expired and Flow redirected to accounts.google)
+    // would still be reused and then immediately throw "page.route: Target
+    // page, context or browser has been closed" or recapture-timeout when
+    // the next request landed on it. By demanding a `labs.google/fx` URL
+    // we force a fresh tab boot in those cases instead.
+    const cached = this._pages[mode];
+    if (cached) {
+      const cachedUrl = (() => {
+        try {
+          return (cached.url() || "").toLowerCase();
+        } catch {
+          return "";
+        }
+      })();
+      const usable =
+        !cached.isClosed() && cachedUrl.includes("labs.google/fx");
+      if (usable) return cached;
+      this._pages[mode] = undefined;
+    }
     if (this._pageInitPromises[mode]) return this._pageInitPromises[mode]!;
     if (!this.context) throw new Error("Context not ready");
 
@@ -1142,8 +1162,65 @@ export class VeoTokenCollector {
    * request with route.fulfill(403) but still let the UI trigger → Flow calls
    * grecaptcha.enterprise.execute() with the EXACT action → /recaptcha/enterprise/reload response contains rresp.
    */
-  async getFreshRecaptchaToken(timeoutMs = 25_000, mode: "video" | "image" = "video"): Promise<string> {
+  /**
+   * Capture a fresh reCAPTCHA enterprise token from the live Flow tab.
+   *
+   * The first capture for a given `mode` after the collector boots
+   * usually has to also pay for `_getPageForMode` opening a brand new
+   * tab, navigating to `labs.google/fx`, settling for ~3.5s and waiting
+   * for `grecaptcha.enterprise.execute` to load. On a slow network the
+   * 25s default isn't enough to cover all of that plus the actual
+   * recaptcha reload roundtrip — we observed repeated
+   * `Không bắt được recaptcha token sau 25000ms` errors in
+   * `logs/error.log`. Bumping the first-use deadline to 40s removes the
+   * need for the caller to pay another ~15s retry delay just to land on
+   * a tab that was already going to take that long anyway.
+   *
+   * Subsequent captures reuse the same warm tab (route block already
+   * installed → tab is in `_routeBlockedPages`) so the original 25s
+   * budget is plenty.
+   *
+   * Both signatures are kept for backwards compatibility:
+   *   - `getFreshRecaptchaToken(timeoutMs, mode)` — legacy positional
+   *   - `getFreshRecaptchaToken({ timeoutMs, firstUseTimeoutMs, mode })` — new opts
+   */
+  async getFreshRecaptchaToken(
+    optsOrTimeout?:
+      | number
+      | {
+          timeoutMs?: number;
+          firstUseTimeoutMs?: number;
+          mode?: "video" | "image";
+        },
+    legacyMode: "video" | "image" = "video",
+  ): Promise<string> {
     if (!this.context) throw new Error("Context not ready");
+
+    let timeoutMs: number;
+    let firstUseTimeoutMs: number;
+    let mode: "video" | "image";
+    if (typeof optsOrTimeout === "object" && optsOrTimeout != null) {
+      timeoutMs = optsOrTimeout.timeoutMs ?? 25_000;
+      firstUseTimeoutMs = optsOrTimeout.firstUseTimeoutMs ?? 40_000;
+      mode = optsOrTimeout.mode ?? legacyMode;
+    } else {
+      timeoutMs = optsOrTimeout ?? 25_000;
+      firstUseTimeoutMs = Math.max(timeoutMs, 40_000);
+      mode = legacyMode;
+    }
+
+    // "First use" = no cached page handle for this mode, OR the cached
+    // page hasn't been route-blocked yet (i.e. _getPageForMode hasn't
+    // wired up the block-the-real-generate-request route handler that
+    // forces grecaptcha.enterprise.execute to actually fire). Either way
+    // the next capture has to pay the full goto + settle + grecaptcha
+    // bootstrap cost.
+    const cachedPage = this._pages[mode];
+    const isFirstUse =
+      !cachedPage ||
+      cachedPage.isClosed() ||
+      !this._routeBlockedPages.has(cachedPage);
+    const effectiveTimeout = isFirstUse ? firstUseTimeoutMs : timeoutMs;
 
     // Global chain lock: synchronous .then() chaining. Ensures only one recaptcha capture
     // runs at any given time across the entire collector.
@@ -1154,7 +1231,7 @@ export class VeoTokenCollector {
     });
     try {
       await previous.catch(() => undefined);
-      return await this._captureRecaptchaOnce(timeoutMs, mode);
+      return await this._captureRecaptchaOnce(effectiveTimeout, mode);
     } finally {
       release();
     }

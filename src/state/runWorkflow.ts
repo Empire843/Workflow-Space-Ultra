@@ -57,10 +57,11 @@ function providerForNodeData(data: NodeDataBase): "veo" | "grok" | null {
 function reportIfSessionError(nodeId: string, message: string | undefined): void {
   if (!message) return;
   const node = useWorkflowStore.getState().nodes.find((n) => n.id === nodeId);
-  const provider = classifySessionError(message, node?.data);
-  if (!provider) return;
+  const classified = classifySessionError(message, node?.data);
+  if (!classified) return;
   useSessionErrorStore.getState().show({
-    provider,
+    provider: classified.provider,
+    kind: classified.kind,
     message,
     nodeId,
     nodeLabel: node?.data.label || node?.data.kind,

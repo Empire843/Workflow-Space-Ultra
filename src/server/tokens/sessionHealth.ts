@@ -40,6 +40,13 @@ export const VEO_TTL_MS = 45 * 60_000;
 // rotation on the next pre-warm tick.
 export const GROK_TTL_MS = 2 * 60 * 60_000;
 const STALE_FRACTION = 0.8;
+// If the cache file is this young, we trust it even when the in-process
+// collector singleton reports Chrome as disconnected — this is the normal
+// state right after Next.js server startup where nothing has called
+// `getVeoCollector()` yet, so flashing amber immediately would confuse the
+// user. After the window, we escalate to amber/stale so auto-prewarm kicks
+// in and re-attaches Chrome before the user clicks create.
+const CHROME_DISCONNECT_GRACE_MS = 5 * 60_000;
 
 interface VeoCache {
   sessionId?: string;
@@ -72,6 +79,27 @@ function classifyAge(ageMs: number | null, ttlMs: number): AuthStatusKind {
   if (ageMs >= ttlMs) return "expired";
   if (ageMs >= ttlMs * STALE_FRACTION) return "stale";
   return "fresh";
+}
+
+/**
+ * Demote `fresh` → `stale` when the in-process Chrome handle is known dead
+ * (user closed the window, CDP socket dropped, HMR wiped the singleton).
+ * The cache file may still be young, but every downstream API call needs a
+ * live Chrome; without this demotion the badge stays green for up to 36
+ * minutes while every create-image request fails with "Không bắt được
+ * recaptcha token". We keep the very-first-minutes grace so a brand-new
+ * server start doesn't flash amber before anyone had a chance to use the
+ * tool (the singleton is only created on demand).
+ */
+function combineWithChromeLiveness(
+  status: AuthStatusKind,
+  ageMs: number | null,
+  chromeConnected: boolean,
+): { status: AuthStatusKind; reason?: string } {
+  if (status !== "fresh") return { status };
+  if (chromeConnected) return { status };
+  if (ageMs != null && ageMs < CHROME_DISCONNECT_GRACE_MS) return { status };
+  return { status: "stale", reason: "chrome-disconnected" };
 }
 
 /**
@@ -120,13 +148,17 @@ export function computeVeoHealth(): AuthHealth {
   }
   const updated = cache.updatedAt ? Date.parse(cache.updatedAt) : NaN;
   const ageMs = Number.isFinite(updated) ? Date.now() - updated : null;
-  const status = classifyAge(ageMs, VEO_TTL_MS);
+  const rawStatus = classifyAge(ageMs, VEO_TTL_MS);
+  const combined = combineWithChromeLiveness(rawStatus, ageMs, chromeConnected);
   return {
-    status,
+    status: combined.status,
     ageMs,
     updatedAt: cache.updatedAt || null,
     chromeConnected,
-    reason: status === "expired" ? "ttl-exceeded" : undefined,
+    reason:
+      combined.status === "expired"
+        ? "ttl-exceeded"
+        : combined.reason,
     projectId: cache.projectId,
   };
 }
@@ -148,13 +180,17 @@ export function computeGrokHealth(profileName: string = GROK_PROFILE_NAME): Auth
   }
   const updated = entry.updated_at ? Date.parse(entry.updated_at) : NaN;
   const ageMs = Number.isFinite(updated) ? Date.now() - updated : null;
-  const status = classifyAge(ageMs, GROK_TTL_MS);
+  const rawStatus = classifyAge(ageMs, GROK_TTL_MS);
+  const combined = combineWithChromeLiveness(rawStatus, ageMs, chromeConnected);
   return {
-    status,
+    status: combined.status,
     ageMs,
     updatedAt: entry.updated_at || null,
     chromeConnected,
-    reason: status === "expired" ? "ttl-exceeded" : undefined,
+    reason:
+      combined.status === "expired"
+        ? "ttl-exceeded"
+        : combined.reason,
     profileName,
   };
 }

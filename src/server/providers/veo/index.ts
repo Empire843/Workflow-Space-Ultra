@@ -14,6 +14,7 @@ import {
 import { getCreateImageBatcher, readBatcherConfig } from "./batcher";
 import { cooldownRemainingMs, waitForCooldown } from "./cooldown";
 import {
+  isRecaptchaCaptureTimeout,
   isRecaptchaError,
   isTransientPageError,
   isUnauthenticated,
@@ -260,10 +261,33 @@ async function withRecaptcha<T>(
         // in the next loop iteration, which is fine).
         continue;
       }
+      // Capture-side recaptcha timeout: the Flow tab never fired
+      // `/recaptcha/enterprise/reload` within our deadline. Most often
+      // this is the cached tab being on the wrong URL / project page
+      // even though `_getPageForMode` thought it was fine, OR a modal
+      // intercepting the "Tạo" click. Either way, dropping the page
+      // handle so the next attempt re-navigates to a known-good project
+      // URL is the right fix — far cheaper than escalating to
+      // clearStorage / restartBrowser. Auth tokens are NOT touched.
+      if (attempt < MAX_RECAPTCHA_ATTEMPTS && isRecaptchaCaptureTimeout(err)) {
+        ensureNotCancelled(shouldCancel);
+        onLog?.(
+          `Page Flow chưa trả recaptcha (mode=${mode}) — mở lại tab và thử lần ${attempt + 1}/${MAX_RECAPTCHA_ATTEMPTS}…`,
+        );
+        collector.invalidatePageForMode(mode);
+        collector.invalidateRecaptchaCache();
+        continue;
+      }
       if (attempt < MAX_RECAPTCHA_ATTEMPTS && isUnauthenticated(err)) {
         ensureNotCancelled(shouldCancel);
         onLog?.("Token hết hạn (401) — đang refresh session… (~15s)");
         collector.invalidateAuth();
+        // Drop the cached page handle for this mode too: a 401 typically
+        // means Google bounced the tab to a sign-in / consent screen, so
+        // its URL is no longer `labs.google/fx`. Without this, the next
+        // iteration would race `_getPageForMode` against the stale tab,
+        // recapture-timeout, and burn another retry slot.
+        collector.invalidatePageForMode(mode);
         const refreshed = await buildBaseAuth(onLog);
         collector = refreshed.collector;
         auth = await collector.collectAuth({ force: true });
@@ -284,7 +308,10 @@ async function withRecaptcha<T>(
         } else if (nextAttempt === 4) {
           onLog?.("Google flag 403 UNUSUAL_ACTIVITY lần 3 — khởi động lại Chrome…");
           await collector.restartBrowser();
-          // restartBrowser cleared auth; reload it from cache.
+          // restartBrowser cleared auth AND wiped the `_pages` map, so we
+          // don't need a separate `invalidatePageForMode(mode)` here —
+          // the next `getPageForMode` will scan a brand-new context and
+          // open a fresh tab anyway. Reload auth from cache.
           const refreshed = await buildBaseAuth(onLog);
           collector = refreshed.collector;
           auth = refreshed.auth;
