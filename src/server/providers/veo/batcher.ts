@@ -21,6 +21,7 @@ import {
 import { URL_GENERATE_IMAGES_TEMPLATE } from "./constants";
 import { cooldownRemainingMs, waitForCooldown } from "./cooldown";
 import {
+  isRecaptchaCaptureTimeout,
   isRecaptchaError,
   isTransientPageError,
   isUnauthenticated,
@@ -333,6 +334,24 @@ class CreateImageBatcher {
         }
       }
 
+      // Capture-side recaptcha timeout on the batch: the image tab
+      // failed to return a token in time. Drop the page + recaptcha
+      // caches so each `dispatchSingle` fallback below starts by
+      // re-navigating to a project page (instead of inheriting the
+      // same half-frozen tab). Without this the per-item fallback
+      // also pays the full 40s first-use timeout and all N entries
+      // end up rejected with the same message.
+      if (isRecaptchaCaptureTimeout(err)) {
+        log("[batch] recaptcha capture timeout — mở lại tab image trước khi thử từng request.");
+        try {
+          const collector = await getVeoCollector();
+          collector.invalidatePageForMode("image");
+          collector.invalidateRecaptchaCache();
+        } catch {
+          // best-effort
+        }
+      }
+
       const msg = err instanceof Error ? err.message : String(err);
       log(`[batch] failed (${msg}); falling back to individual calls.`);
 
@@ -441,6 +460,25 @@ class CreateImageBatcher {
               // naturally; don't swallow it here.
               throw refreshErr;
             }
+            continue;
+          }
+          // Capture-side recaptcha timeout: the Flow tab never fired
+          // `/recaptcha/enterprise/reload` within our deadline. Usually
+          // the cached page is on the wrong project page / got
+          // background-throttled / a modal intercepted the click. Drop
+          // the page handle + recaptcha cache so the next attempt
+          // re-navigates and re-captures. Mirrors the capture-timeout
+          // branch of `withRecaptcha` in index.ts. Without this branch
+          // the first capture timeout would bubble straight to the user
+          // even though the recovery is trivial.
+          if (attempt < maxAttempts && isRecaptchaCaptureTimeout(err)) {
+            ensureNotCancelled(shouldCancel);
+            log?.(
+              `Page Flow chưa trả recaptcha (mode=image) — mở lại tab và thử lần ${attempt + 1}/${maxAttempts}…`,
+            );
+            const collector = await getVeoCollector();
+            collector.invalidatePageForMode("image");
+            collector.invalidateRecaptchaCache();
             continue;
           }
           if (attempt < maxAttempts && isRecaptchaError(err)) {

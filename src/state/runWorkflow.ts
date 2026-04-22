@@ -550,24 +550,49 @@ export async function runSingleNode(
 /* -------------------------------------------------------------------------- */
 
 /**
+ * Default cap on concurrent gen nodes dispatched from a single `runFrame`
+ * call. Per-provider concurrency is enforced further downstream by
+ * `src/server/lanes.ts` (VEO video = 1, VEO image via batcher = 3, Grok = 1),
+ * so this is just an upper bound that lets independent images from the
+ * same frame enter the batcher together instead of one-at-a-time. Picked
+ * slightly above the batcher's `maxBatchSize` (3) so a full batch can
+ * form without starving a gen.video that's waiting its turn.
+ */
+const FRAME_DEFAULT_MAX_IN_FLIGHT = 6;
+
+/**
  * Run every node whose `parentId === frameId`. The run is **forced**:
  *
  *  - All non-content children are cleared first, regardless of whether they
  *    already carry an output. Even fully-`done` nodes are re-run so the user
  *    can be sure the entire Frame produced fresh artifacts.
- *  - Children execute **strictly sequentially** in topological order computed
- *    from edges that lie inside the Frame. Each subsequent gen node therefore
- *    sees the latest output of every internal upstream before its own job is
- *    enqueued.
+ *  - Children execute **in parallel** subject to a `maxInFlight` cap and the
+ *    topological order computed from edges that lie inside the Frame. A gen
+ *    node never starts before all its internal upstream nodes have finished,
+ *    so downstream gen.video still sees the freshly-generated gen.image it
+ *    depends on. Independent siblings (e.g. 10 `gen.image` siblings fed by
+ *    their own text nodes) DO run concurrently — server-side lanes then
+ *    fold them into the VEO image batcher so 3 siblings become 1 HTTP
+ *    request + 1 reCAPTCHA token. VEO video and Grok are each capped to
+ *    concurrency 1 by their lanes, so parallelism there degrades gracefully
+ *    to sequential.
  *  - Edges crossing the Frame boundary don't change the order — the external
  *    node is assumed to already have its output in the store (or it's the
  *    user's responsibility to run it via the cascade button on a child).
  *
  * Live progress is mirrored onto the Frame's own node data
  * (`frameRunning`, `frameRunIndex`, `frameRunTotal`, `frameRunCurrentLabel`)
- * so `FrameNode` can render a counter like "Running 3/7".
+ * so `FrameNode` can render a counter. `frameRunIndex` is the **completed**
+ * count (updated as each gen finishes) and `frameRunCurrentLabel` shows the
+ * most recently started gen — or `"${activeCount} đang chạy · ${label}"`
+ * when more than one is in flight.
  */
-export async function runFrame(frameId: string): Promise<void> {
+export async function runFrame(
+  frameId: string,
+  opts?: { maxInFlight?: number },
+): Promise<void> {
+  const maxInFlight = Math.max(1, opts?.maxInFlight ?? FRAME_DEFAULT_MAX_IN_FLIGHT);
+
   const store = useWorkflowStore.getState();
   const children = store.nodes.filter((n) => n.parentId === frameId);
   if (!children.length) return;
@@ -591,8 +616,11 @@ export async function runFrame(frameId: string): Promise<void> {
   const freshStore = useWorkflowStore.getState();
   const frameChildren = freshStore.nodes.filter((n) => n.parentId === frameId);
   const idSet = new Set(frameChildren.map((n) => n.id));
+  const nodeById = new Map(frameChildren.map((n) => [n.id, n]));
 
   // Build local adjacency (only edges whose endpoints are both in the frame).
+  // `indegree` is mutable during the run so children can be popped into the
+  // ready queue as their parents finish.
   const indegree = new Map<string, number>();
   const adj = new Map<string, string[]>();
   for (const id of idSet) {
@@ -606,28 +634,11 @@ export async function runFrame(frameId: string): Promise<void> {
     }
   }
 
-  // Kahn's algorithm — deterministic topological order. Isolated children
-  // (no internal edges) start with indegree=0 and run too.
-  const queue: string[] = [];
-  for (const [id, d] of indegree) if (d === 0) queue.push(id);
-  const order: string[] = [];
-  while (queue.length) {
-    const id = queue.shift()!;
-    order.push(id);
-    for (const ch of adj.get(id) ?? []) {
-      const next = (indegree.get(ch) ?? 0) - 1;
-      indegree.set(ch, next);
-      if (next === 0) queue.push(ch);
-    }
-  }
-  // Any nodes left out (cycle) — append them so they still get a run pass.
-  for (const id of idSet) if (!order.includes(id)) order.push(id);
-
   // Force re-run: clear outputs on every non-content child up-front so the
   // visual state matches the "running" intent and downstream nodes don't pick
   // up stale data while waiting for their turn.
   for (const id of idSet) {
-    const node = freshStore.nodes.find((n) => n.id === id);
+    const node = nodeById.get(id);
     if (!node) continue;
     if (node.data.kind.startsWith("content.") || node.data.kind === "frame") continue;
     clearGenOutput(id);
@@ -635,10 +646,13 @@ export async function runFrame(frameId: string): Promise<void> {
 
   // Count gen nodes (content + frames don't count toward the X/Y counter the
   // user sees) so the progress label is meaningful.
-  const totalGens = order.filter((id) => {
-    const n = freshStore.nodes.find((nn) => nn.id === id);
-    return n && !n.data.kind.startsWith("content.") && n.data.kind !== "frame";
-  }).length;
+  let totalGens = 0;
+  for (const id of idSet) {
+    const node = nodeById.get(id);
+    if (!node) continue;
+    if (node.data.kind.startsWith("content.") || node.data.kind === "frame") continue;
+    totalGens++;
+  }
 
   useWorkflowStore.getState().updateNodeData(frameId, {
     frameRunning: true,
@@ -647,35 +661,142 @@ export async function runFrame(frameId: string): Promise<void> {
     frameRunCurrentLabel: undefined,
   });
 
-  let genIndex = 0;
-  try {
-    for (let i = 0; i < order.length; i++) {
-      const id = order[i];
-      const node = useWorkflowStore.getState().nodes.find((n) => n.id === id);
-      if (!node) continue;
+  // Seed ready queue with indegree-0 nodes — content ones are drained
+  // synchronously below, gen ones are dispatched by the scheduler.
+  const ready: string[] = [];
+  for (const [id, d] of indegree) if (d === 0) ready.push(id);
 
-      if (node.data.kind === "content.text") {
-        const combined = computeEffectiveText(id);
-        useWorkflowStore.getState().updateNodeData(id, {
-          effectiveText: combined,
-          status: "done",
-          progress: 100,
-        });
-        continue;
-      }
-      if (node.data.kind.startsWith("content.")) {
-        useWorkflowStore.getState().updateNodeData(id, { status: "done", progress: 100 });
-        continue;
-      }
-      if (node.data.kind === "frame") continue;
+  const pending = new Set(idSet);
+  let completedGens = 0;
+  // Track currently running gen ids for the counter label. Using a Map
+  // instead of a Set so we can pick the "most recent" label deterministically
+  // by insertion order.
+  const activeLabels = new Map<string, string>();
 
-      genIndex++;
-      useWorkflowStore.getState().updateNodeData(frameId, {
-        frameRunIndex: genIndex,
-        frameRunCurrentLabel: node.data.label || node.data.kind,
-      });
-      await runGenerationById(id);
+  const markReadyChildren = (parentId: string) => {
+    for (const ch of adj.get(parentId) ?? []) {
+      const next = (indegree.get(ch) ?? 0) - 1;
+      indegree.set(ch, next);
+      if (next === 0) ready.push(ch);
     }
+  };
+
+  const settleContentNow = (id: string) => {
+    const node = nodeById.get(id);
+    if (!node) return;
+    if (node.data.kind === "content.text") {
+      const combined = computeEffectiveText(id);
+      useWorkflowStore.getState().updateNodeData(id, {
+        effectiveText: combined,
+        status: "done",
+        progress: 100,
+      });
+    } else if (node.data.kind.startsWith("content.")) {
+      useWorkflowStore.getState().updateNodeData(id, { status: "done", progress: 100 });
+    }
+    pending.delete(id);
+    markReadyChildren(id);
+  };
+
+  const updateCounter = () => {
+    let label: string | undefined;
+    if (activeLabels.size > 0) {
+      const last = Array.from(activeLabels.values()).pop();
+      label = activeLabels.size > 1
+        ? `${activeLabels.size} đang chạy · ${last}`
+        : last;
+    }
+    useWorkflowStore.getState().updateNodeData(frameId, {
+      frameRunIndex: completedGens,
+      frameRunCurrentLabel: label,
+    });
+  };
+
+  try {
+    await new Promise<void>((resolveAll) => {
+      let inFlight = 0;
+
+      const tryDispatch = () => {
+        // Drain content/frame nodes synchronously in every pass — they never
+        // enqueue a job but their "done" status might unblock a gen child.
+        for (let i = 0; i < ready.length; ) {
+          const id = ready[i];
+          const node = nodeById.get(id);
+          if (!node) {
+            ready.splice(i, 1);
+            pending.delete(id);
+            continue;
+          }
+          if (node.data.kind === "frame") {
+            ready.splice(i, 1);
+            pending.delete(id);
+            markReadyChildren(id);
+            continue;
+          }
+          if (node.data.kind.startsWith("content.")) {
+            ready.splice(i, 1);
+            settleContentNow(id);
+            continue;
+          }
+          i++;
+        }
+
+        while (inFlight < maxInFlight && ready.length > 0) {
+          // Dispatch the next gen node in the ready queue.
+          let pickedIdx = -1;
+          for (let i = 0; i < ready.length; i++) {
+            const node = nodeById.get(ready[i]);
+            if (!node) continue;
+            if (node.data.kind === "frame" || node.data.kind.startsWith("content.")) {
+              // These should have been drained above; guard anyway.
+              continue;
+            }
+            pickedIdx = i;
+            break;
+          }
+          if (pickedIdx < 0) break;
+          const id = ready.splice(pickedIdx, 1)[0];
+          const node = nodeById.get(id)!;
+
+          inFlight++;
+          const label = node.data.label || node.data.kind;
+          activeLabels.set(id, label);
+          updateCounter();
+
+          void runGenerationById(id)
+            .catch((err) => {
+              // `runGenerationById` already writes status=error via the
+              // executor; this catch is just a safety net so one failed job
+              // doesn't abort the whole scheduler. Log to console so the
+              // developer notices unexpected throws that bypass the normal
+              // error pipeline.
+              console.error(`[runFrame] ${id} threw:`, err);
+            })
+            .finally(() => {
+              inFlight--;
+              completedGens++;
+              activeLabels.delete(id);
+              pending.delete(id);
+              markReadyChildren(id);
+              updateCounter();
+              if (pending.size === 0 && inFlight === 0) {
+                resolveAll();
+                return;
+              }
+              tryDispatch();
+            });
+        }
+
+        // Nothing left to do: scheduler can resolve.
+        if (pending.size === 0 && inFlight === 0) {
+          resolveAll();
+        }
+      };
+
+      tryDispatch();
+      // Edge case: no gen nodes at all (pure content frame).
+      if (pending.size === 0 && inFlight === 0) resolveAll();
+    });
   } finally {
     useWorkflowStore.getState().updateNodeData(frameId, {
       frameRunning: false,

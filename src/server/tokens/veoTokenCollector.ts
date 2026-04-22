@@ -1260,7 +1260,9 @@ export class VeoTokenCollector {
         reject(
           new Error(
             `Không bắt được recaptcha token sau ${timeoutMs}ms (mode=${mode}). ` +
-              `Đảm bảo đang ở project page và UI Flow load xong.`
+              `Đảm bảo đang ở project page và UI Flow load xong. ` +
+              `Nếu cửa sổ Chrome VEO bị minimize / tab VEO đang là tab nền, ` +
+              `Chrome sẽ throttle grecaptcha → hãy giữ cửa sổ Chrome VEO foreground khi chạy.`
           )
         );
       }, timeoutMs);
