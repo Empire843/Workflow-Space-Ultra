@@ -118,20 +118,27 @@ async function verifyVeoPageAccessible(
   }
 }
 
-async function buildBaseAuth(onLog?: LogFn) {
+async function buildBaseAuth(onLog?: LogFn, shouldCancel?: ShouldCancel) {
   return timedSpan("veo.buildAuth", async () => {
     onLog?.("Kết nối VEO session…");
-    const collector = await getVeoCollector();
+    // Race everything that can hang on Playwright against the cancel
+    // signal. Previously a stuck `getVeoCollector` / `collectAuth` call
+    // could pin a job in "running" state for the full ~30-60s Chrome
+    // boot even after the user hit cancel.
+    const collector = await raceCancel(getVeoCollector(), shouldCancel);
     // Race the pre-flight check against a 5s budget so we don't add
     // perceptible latency when things are fine.
-    await Promise.race([
-      verifyVeoPageAccessible(collector, onLog),
-      new Promise<void>((resolve) => setTimeout(resolve, 5_000)),
-    ]);
+    await raceCancel(
+      Promise.race([
+        verifyVeoPageAccessible(collector, onLog),
+        new Promise<void>((resolve) => setTimeout(resolve, 5_000)),
+      ]),
+      shouldCancel,
+    );
     const collectStarted = Date.now();
     let auth;
     try {
-      auth = await collector.collectAuth();
+      auth = await raceCancel(collector.collectAuth(), shouldCancel);
       sessionTelemetry.record({
         target: "veo",
         kind: "collect_ok",
@@ -199,7 +206,7 @@ async function withRecaptcha<T>(
   shouldCancel?: ShouldCancel,
 ): Promise<T> {
   ensureNotCancelled(shouldCancel);
-  let { collector, auth, accountType } = await buildBaseAuth(onLog);
+  let { collector, auth, accountType } = await buildBaseAuth(onLog, shouldCancel);
   let attempt = 0;
   while (true) {
     attempt++;
@@ -229,13 +236,17 @@ async function withRecaptcha<T>(
     // is simply unused.
     const recaptcha = await raceCancel(
       timedSpan(`veo.recaptcha.${mode}`, () =>
-        collector.getFreshRecaptchaToken(25_000, mode),
+        collector.getFreshRecaptchaToken(
+          { timeoutMs: 25_000, mode, shouldCancel },
+          mode,
+          shouldCancel,
+        ),
       ),
       shouldCancel,
     );
     ensureNotCancelled(shouldCancel);
     onLog?.("reCAPTCHA OK. Đang gửi request qua Chrome…");
-    const page = await collector.getPageForMode(mode);
+    const page = await raceCancel(collector.getPageForMode(mode), shouldCancel);
     const ctx: AuthCtx = {
       accessToken: auth.accessToken,
       sessionId: auth.sessionId,
@@ -288,9 +299,9 @@ async function withRecaptcha<T>(
         // iteration would race `_getPageForMode` against the stale tab,
         // recapture-timeout, and burn another retry slot.
         collector.invalidatePageForMode(mode);
-        const refreshed = await buildBaseAuth(onLog);
+        const refreshed = await buildBaseAuth(onLog, shouldCancel);
         collector = refreshed.collector;
-        auth = await collector.collectAuth({ force: true });
+        auth = await raceCancel(collector.collectAuth({ force: true }), shouldCancel);
         accountType = refreshed.accountType;
         collector.invalidateRecaptchaCache();
         continue;
@@ -304,15 +315,15 @@ async function withRecaptcha<T>(
         const nextAttempt = attempt + 1;
         if (nextAttempt === 3) {
           onLog?.("Google flag 403 UNUSUAL_ACTIVITY lần 2 — xóa site storage + reload tab…");
-          await collector.clearSiteStorage(mode);
+          await raceCancel(collector.clearSiteStorage(mode), shouldCancel);
         } else if (nextAttempt === 4) {
           onLog?.("Google flag 403 UNUSUAL_ACTIVITY lần 3 — khởi động lại Chrome…");
-          await collector.restartBrowser();
+          await raceCancel(collector.restartBrowser(), shouldCancel);
           // restartBrowser cleared auth AND wiped the `_pages` map, so we
           // don't need a separate `invalidatePageForMode(mode)` here —
           // the next `getPageForMode` will scan a brand-new context and
           // open a fresh tab anyway. Reload auth from cache.
-          const refreshed = await buildBaseAuth(onLog);
+          const refreshed = await buildBaseAuth(onLog, shouldCancel);
           collector = refreshed.collector;
           auth = refreshed.auth;
           accountType = refreshed.accountType;
@@ -507,20 +518,27 @@ export interface PollResult {
   finishedAll: boolean;
 }
 
-export async function veoPollStatus(operations: OperationRef[]): Promise<PollResult> {
-  let { collector, auth } = await buildBaseAuth();
+export async function veoPollStatus(
+  operations: OperationRef[],
+  shouldCancel?: ShouldCancel,
+): Promise<PollResult> {
+  let { collector, auth } = await buildBaseAuth(undefined, shouldCancel);
   let attempt = 0;
   while (true) {
     attempt++;
-    const { http, entries } = await timedSpan("veo.api.pollStatus", () =>
-      requestCheckStatus(operations, auth.accessToken, auth.sessionId, auth.cookie)
+    ensureNotCancelled(shouldCancel);
+    const { http, entries } = await raceCancel(
+      timedSpan("veo.api.pollStatus", () =>
+        requestCheckStatus(operations, auth.accessToken, auth.sessionId, auth.cookie),
+      ),
+      shouldCancel,
     );
     if (!http.ok) {
       if (attempt < 2 && http.status === 401) {
         collector.invalidateAuth();
-        const refreshed = await buildBaseAuth();
+        const refreshed = await buildBaseAuth(undefined, shouldCancel);
         collector = refreshed.collector;
-        auth = await collector.collectAuth({ force: true });
+        auth = await raceCancel(collector.collectAuth({ force: true }), shouldCancel);
         continue;
       }
       throw new Error(`VEO pollStatus ${http.status}: ${http.body.slice(0, 300)}`);
@@ -545,7 +563,14 @@ export async function veoWaitForVideos(
   let last: StatusEntry[] = [];
   while (Date.now() < deadline) {
     ensureNotCancelled(shouldCancel);
-    const { entries, finishedAll } = await veoPollStatus(operations);
+    // Race the HTTP status poll against the cancel signal. Without this
+    // wrap, a hung fetch to the VEO batch-check endpoint could block
+    // cancellation for up to 15 minutes (the poll-level timeout) because
+    // `requestCheckStatus` has no idea the user pressed cancel.
+    const { entries, finishedAll } = await raceCancel(
+      veoPollStatus(operations, shouldCancel),
+      shouldCancel,
+    );
     last = entries;
     onProgress?.(entries);
     if (finishedAll) return entries;

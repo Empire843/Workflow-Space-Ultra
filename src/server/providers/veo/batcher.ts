@@ -210,8 +210,12 @@ class CreateImageBatcher {
     try {
       if (groupShouldCancel()) throw new JobCancelledError();
       await timedSpan("veo.batch.createImage", async () => {
-        const collector = await getVeoCollector();
-        const auth = await collector.collectAuth();
+        // Race every Playwright/network await against the group cancel
+        // so a stuck Chrome boot can't pin all callers. Once we're past
+        // these points, each `await raceCancel(...)` later in the path
+        // provides another escape hatch.
+        const collector = await raceCancel(getVeoCollector(), groupShouldCancel);
+        const auth = await raceCancel(collector.collectAuth(), groupShouldCancel);
         const config = loadConfig();
         const accountType: AccountType = config.account1.TYPE_ACCOUNT || "ULTRA";
 
@@ -220,11 +224,15 @@ class CreateImageBatcher {
         // no longer matches the minted token.
         const recaptcha = await raceCancel(
           timedSpan("veo.recaptcha.image", () =>
-            collector.getFreshRecaptchaToken(25_000, "image"),
+            collector.getFreshRecaptchaToken(
+              { timeoutMs: 25_000, mode: "image", shouldCancel: groupShouldCancel },
+              "image",
+              groupShouldCancel,
+            ),
           ),
           groupShouldCancel,
         );
-        const imagePage = await collector.getPageForMode("image");
+        const imagePage = await raceCancel(collector.getPageForMode("image"), groupShouldCancel);
 
         // Build merged payload: reuse buildCreateImagePayload per-caller to
         // produce the nested `requests` array, then concatenate.
@@ -396,17 +404,21 @@ class CreateImageBatcher {
           await cancelableSleep(d, shouldCancel);
         }
         try {
-          const collector = await getVeoCollector();
-          const auth = await collector.collectAuth();
+          const collector = await raceCancel(getVeoCollector(), shouldCancel);
+          const auth = await raceCancel(collector.collectAuth(), shouldCancel);
           const config = loadConfig();
           const accountType: AccountType = config.account1.TYPE_ACCOUNT || "ULTRA";
           const recaptcha = await raceCancel(
             timedSpan("veo.recaptcha.image", () =>
-              collector.getFreshRecaptchaToken(25_000, "image"),
+              collector.getFreshRecaptchaToken(
+                { timeoutMs: 25_000, mode: "image", shouldCancel },
+                "image",
+                shouldCancel,
+              ),
             ),
             shouldCancel,
           );
-          const imagePage = await collector.getPageForMode("image");
+          const imagePage = await raceCancel(collector.getPageForMode("image"), shouldCancel);
           const res = await raceCancel(
             timedSpan("veo.api.createImage", () =>
               requestCreateImageViaBrowser(imagePage, {
@@ -483,15 +495,15 @@ class CreateImageBatcher {
           }
           if (attempt < maxAttempts && isRecaptchaError(err)) {
             ensureNotCancelled(shouldCancel);
-            const collector = await getVeoCollector();
+            const collector = await raceCancel(getVeoCollector(), shouldCancel);
             collector.invalidateRecaptchaCache();
             const nextAttempt = attempt + 1;
             if (nextAttempt === 3) {
               log?.("Google flag 403 lần 2 — xóa site storage + reload tab image…");
-              await collector.clearSiteStorage("image");
+              await raceCancel(collector.clearSiteStorage("image"), shouldCancel);
             } else if (nextAttempt === 4) {
               log?.("Google flag 403 lần 3 — khởi động lại Chrome…");
-              await collector.restartBrowser();
+              await raceCancel(collector.restartBrowser(), shouldCancel);
             } else {
               log?.("Google flag 403 — thử lại với token mới…");
             }

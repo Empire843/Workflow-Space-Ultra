@@ -5,7 +5,21 @@ import type { Browser, BrowserContext, Page } from "playwright";
 
 import { DATA_GENERAL_DIR, VEO_CDP_HOST, VEO_FLOW_URL, RECAPTCHA_SITE_KEY, ensureDirs } from "../config";
 import { openVeoChrome } from "../chrome/veoChromeManager";
+import {
+  JobCancelledError,
+  type ShouldCancel,
+} from "../providers/cancellation";
 import { sessionTelemetry } from "./sessionTelemetry";
+
+/**
+ * Hard cap on how long a single caller is willing to wait for the global
+ * recaptcha lock to drain. Picked so that ~3 back-to-back captures (each
+ * 40s first-use + some slack) can complete in order but a single broken
+ * capture never permanently blocks the chain. If the wait hits this
+ * ceiling we give up on the lock — a rare but necessary escape valve
+ * during Chrome hangs.
+ */
+const RECAPTCHA_LOCK_MAX_WAIT_MS = 2 * 60_000;
 
 /**
  * Port of A_workflow_get_token.py (TokenCollector).
@@ -74,6 +88,50 @@ function extractRecaptchaToken(body: string): string | null {
   const end = body.indexOf('"', from);
   if (end < 0) return null;
   return body.slice(from, end);
+}
+
+/**
+ * Await `previous` but bail out early if either
+ *   a) `shouldCancel()` flips to true (poll every 200ms), or
+ *   b) the wall-clock exceeds `maxWaitMs`.
+ *
+ * The underlying `previous` promise is allowed to keep running — we
+ * merely stop *waiting* on it so our caller can proceed / cancel. A
+ * stuck capture ahead of us never gets to pin a fresh caller.
+ */
+async function waitForLock(
+  previous: Promise<unknown>,
+  shouldCancel: ShouldCancel | undefined,
+  maxWaitMs: number,
+): Promise<void> {
+  if (shouldCancel?.()) throw new JobCancelledError();
+  if (!shouldCancel && !Number.isFinite(maxWaitMs)) {
+    await previous.catch(() => undefined);
+    return;
+  }
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const done = (err?: unknown) => {
+      if (settled) return;
+      settled = true;
+      if (poll) clearInterval(poll);
+      if (wallclock) clearTimeout(wallclock);
+      if (err) reject(err);
+      else resolve();
+    };
+    const wallclock = setTimeout(() => {
+      done(); // timed out → proceed anyway, don't block forever
+    }, maxWaitMs);
+    const poll = shouldCancel
+      ? setInterval(() => {
+          if (shouldCancel()) done(new JobCancelledError());
+        }, 200)
+      : null;
+    previous.then(
+      () => done(),
+      () => done(), // ignore previous errors; we only care about timing
+    );
+  });
 }
 
 function isRecaptchaReload(url: string): boolean {
@@ -1191,22 +1249,27 @@ export class VeoTokenCollector {
           timeoutMs?: number;
           firstUseTimeoutMs?: number;
           mode?: "video" | "image";
+          shouldCancel?: ShouldCancel;
         },
     legacyMode: "video" | "image" = "video",
+    legacyShouldCancel?: ShouldCancel,
   ): Promise<string> {
     if (!this.context) throw new Error("Context not ready");
 
     let timeoutMs: number;
     let firstUseTimeoutMs: number;
     let mode: "video" | "image";
+    let shouldCancel: ShouldCancel | undefined;
     if (typeof optsOrTimeout === "object" && optsOrTimeout != null) {
       timeoutMs = optsOrTimeout.timeoutMs ?? 25_000;
       firstUseTimeoutMs = optsOrTimeout.firstUseTimeoutMs ?? 40_000;
       mode = optsOrTimeout.mode ?? legacyMode;
+      shouldCancel = optsOrTimeout.shouldCancel ?? legacyShouldCancel;
     } else {
       timeoutMs = optsOrTimeout ?? 25_000;
       firstUseTimeoutMs = Math.max(timeoutMs, 40_000);
       mode = legacyMode;
+      shouldCancel = legacyShouldCancel;
     }
 
     // "First use" = no cached page handle for this mode, OR the cached
@@ -1224,21 +1287,44 @@ export class VeoTokenCollector {
 
     // Global chain lock: synchronous .then() chaining. Ensures only one recaptcha capture
     // runs at any given time across the entire collector.
+    //
+    // We install OUR promise into `_recaptchaLock` synchronously so the
+    // next caller chains behind us. But `previous` — the in-flight
+    // capture we're waiting on — must NEVER block us past either
+    //   a) `RECAPTCHA_LOCK_MAX_WAIT_MS` wall-clock (dead capture never
+    //      hit its finally), or
+    //   b) the caller's cancel flag flipping (we don't hold a capture
+    //      hostage for a job that the user already gave up on).
+    //
+    // Without this race the lock chain accumulates indefinitely: every
+    // new submit piled on top of a stuck one silently extends total
+    // wait, and the user sees "RUNNING · cancelling… · 800s · 1%"
+    // while the executor is pinned waiting for `previous` to resolve.
     const previous = this._recaptchaLock;
     let release: () => void = () => {};
     this._recaptchaLock = new Promise<void>((resolve) => {
       release = resolve;
     });
     try {
-      await previous.catch(() => undefined);
-      return await this._captureRecaptchaOnce(effectiveTimeout, mode);
+      await waitForLock(previous, shouldCancel, RECAPTCHA_LOCK_MAX_WAIT_MS);
+      // Final cancel check right before the expensive capture so a
+      // user who hit cancel WHILE we were queued doesn't burn a 40s
+      // token budget on their behalf.
+      if (shouldCancel?.()) throw new JobCancelledError();
+      return await this._captureRecaptchaOnce(effectiveTimeout, mode, shouldCancel);
     } finally {
       release();
     }
   }
 
-  private async _captureRecaptchaOnce(timeoutMs: number, mode: "video" | "image"): Promise<string> {
+  private async _captureRecaptchaOnce(
+    timeoutMs: number,
+    mode: "video" | "image",
+    shouldCancel?: ShouldCancel,
+  ): Promise<string> {
+    if (shouldCancel?.()) throw new JobCancelledError();
     const page = await this._getPageForMode(mode);
+    if (shouldCancel?.()) throw new JobCancelledError();
 
     // Foreground tab: Chrome throttles grecaptcha on background tabs.
     try {
@@ -1254,6 +1340,8 @@ export class VeoTokenCollector {
       // ignore
     }
 
+    if (shouldCancel?.()) throw new JobCancelledError();
+
     return new Promise<string>((resolve, reject) => {
       const timer = setTimeout(() => {
         cleanup();
@@ -1266,6 +1354,22 @@ export class VeoTokenCollector {
           )
         );
       }, timeoutMs);
+
+      // Cancel-poll: if the caller's cancel flag flips while we're
+      // waiting for the network response, bail out within ~200ms
+      // instead of burning the full capture budget. Matches the polling
+      // cadence of `raceCancel` upstream so the cancel signal
+      // propagates cleanly through the provider chain.
+      let cancelTimer: ReturnType<typeof setInterval> | null = null;
+      if (shouldCancel) {
+        cancelTimer = setInterval(() => {
+          if (shouldCancel?.()) {
+            cleanup();
+            clearTimeout(timer);
+            reject(new JobCancelledError());
+          }
+        }, 200);
+      }
 
       const onResponse = async (resp: { url(): string; text(): Promise<string> }) => {
         try {
@@ -1287,6 +1391,10 @@ export class VeoTokenCollector {
           page.off("response", onResponse);
         } catch {
           // ignore
+        }
+        if (cancelTimer) {
+          clearInterval(cancelTimer);
+          cancelTimer = null;
         }
       };
 
