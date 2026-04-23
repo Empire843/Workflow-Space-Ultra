@@ -41,7 +41,9 @@ export function isGrokPageClosedError(err: unknown): boolean {
     /page\.evaluate:\s*(?:Target|Protocol|Connection)/i.test(msg) ||
     /page has been closed/i.test(msg) ||
     /Request context disposed/i.test(msg) ||
-    /Protocol error.*Target closed/i.test(msg)
+    /Protocol error.*Target closed/i.test(msg) ||
+    /Execution context was destroyed/i.test(msg) ||
+    /net::ERR_ABORTED/i.test(msg)
   );
 }
 

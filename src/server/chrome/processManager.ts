@@ -306,9 +306,9 @@ export async function spawnChrome(opts: SpawnChromeOptions): Promise<ChromeHandl
     const err = stderrBuf.join("").trim().slice(-400);
     throw new Error(
       `Chrome exit ngay sau khi start (code=${child.exitCode}). ` +
-        `Thường do Chrome đang mở với profile khác và forward cmd-line sang đó. ` +
-        `Thử đóng hết Chrome đang mở rồi thử lại, hoặc đặt CHROME_WINDOW_MODE=headful. ` +
-        (err ? `stderr: ${err}` : "")
+      `Thường do Chrome đang mở với profile khác và forward cmd-line sang đó. ` +
+      `Thử đóng hết Chrome đang mở rồi thử lại, hoặc đặt CHROME_WINDOW_MODE=headful. ` +
+      (err ? `stderr: ${err}` : "")
     );
   }
 
@@ -354,17 +354,31 @@ export async function openOrReuseChrome(opts: {
     return { process: null as unknown as ChildProcess, pid: -1, userDataDir, host, port: running };
   }
 
-  // 2. If preferredPort already has CDP ready → almost certainly this profile's Chrome
-  //    (since each profile uses a fixed port). Reuse it directly.
+  // 2. If preferredPort already has CDP ready → ONLY reuse if it belongs to
+  //    the same user-data-dir. Without this check, VEO (port 9222) could
+  //    claim a Grok Chrome (port 9223) if ports drift after a dynamic pick.
   if (await isCdpReady(host, preferredPort)) {
-    return { process: null as unknown as ChildProcess, pid: -1, userDataDir, host, port: preferredPort };
+    const ownerPort = findRunningCdpPortForUserData(userDataDir);
+    if (ownerPort === preferredPort) {
+      return { process: null as unknown as ChildProcess, pid: -1, userDataDir, host, port: preferredPort };
+    }
+    // Port busy but belongs to a different profile — skip to avoid
+    // cross-contaminating another provider's Chrome window.
   }
 
-  // 3. Fallback: probe CDP ports nearby; if the URL matches, reuse it
+  // 3. Fallback: probe CDP ports nearby; if the URL matches, reuse it.
+  //    Narrow range to +5 (was +30) to avoid grabbing a port owned by
+  //    another provider (VEO=9222, Grok=9223 — a +30 scan from either
+  //    would overlap into the other's range and cause tab cross-contamination).
   if (probeMatchUrl) {
-    const found = await probeExistingCdpPort(host, preferredPort, preferredPort + 30, probeMatchUrl);
+    const found = await probeExistingCdpPort(host, preferredPort, preferredPort + 5, probeMatchUrl);
     if (found) {
-      return { process: null as unknown as ChildProcess, pid: -1, userDataDir, host, port: found };
+      // Double-check: make sure this port actually belongs to our userDataDir,
+      // not just any Chrome that happens to have a matching URL open.
+      const ownerPort = findRunningCdpPortForUserData(userDataDir);
+      if (ownerPort === found || !ownerPort) {
+        return { process: null as unknown as ChildProcess, pid: -1, userDataDir, host, port: found };
+      }
     }
   }
 

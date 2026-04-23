@@ -259,14 +259,33 @@ async function ensureGrokReady(profileName?: string) {
     // this, every subsequent call failed with
     //   "page.evaluate: Target page, context or browser has been closed"
     // even though the Grok window was visibly still there.
-    const page = await collector.getLivePage();
+    let page = await collector.getLivePage();
 
-    try {
-      if (!page.url().includes("grok.com")) {
-        await page.goto("https://grok.com/imagine", { waitUntil: "domcontentloaded", timeout: 20_000 });
+    // Navigation retry: grok.com/imagine may fail transiently due to
+    // redirects (ERR_ABORTED), context destruction (VEO cross-contamination),
+    // or network timeouts. Retry up to 3 times with backoff + fresh page.
+    for (let navAttempt = 1; navAttempt <= 3; navAttempt++) {
+      try {
+        const currentUrl = (() => { try { return page.url(); } catch { return ""; } })();
+        if (!currentUrl.includes("grok.com")) {
+          await page.goto("https://grok.com/imagine", {
+            waitUntil: "domcontentloaded",
+            timeout: 25_000,
+          });
+        }
+        break; // success
+      } catch (err) {
+        if (navAttempt >= 3) {
+          throw new Error(
+            `Không thể navigate tới grok.com (attempt ${navAttempt}/3): ${err instanceof Error ? err.message : err}`,
+          );
+        }
+        console.warn(
+          `[Grok] Navigation attempt ${navAttempt}/3 failed: ${err instanceof Error ? err.message : err}`,
+        );
+        await new Promise((r) => setTimeout(r, 2000 * navAttempt));
+        page = await collector.getLivePage(); // get fresh page handle
       }
-    } catch (err) {
-      throw new Error(`Không thể navigate tới grok.com: ${err instanceof Error ? err.message : err}`);
     }
 
     // Fast-fail if the profile is logged out — surfaces a clear "mở Chrome
@@ -486,10 +505,10 @@ export async function grokDownloadVideo(
           method: "GET",
           headers: cookieHeader
             ? {
-                cookie: cookieHeader,
-                "user-agent":
-                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-              }
+              cookie: cookieHeader,
+              "user-agent":
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            }
             : {},
           bodyTimeout: 60_000,
           headersTimeout: 30_000,
