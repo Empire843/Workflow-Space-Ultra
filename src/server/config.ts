@@ -33,6 +33,22 @@ export const GROK_CDP_PORT = Number(process.env.GROK_CDP_PORT || 9223);
 export const VEO_FLOW_URL = process.env.VEO_FLOW_URL || "https://labs.google/fx/vi/tools/flow";
 export const GROK_URL = process.env.GROK_URL || "https://grok.com/";
 
+// Clone Video — ChatGPT Playwright
+export const CHATGPT_USER_DATA_DIR = process.env.CHATGPT_CHROME_USER_DATA_DIR
+  ? path.resolve(BASE_DIR, process.env.CHATGPT_CHROME_USER_DATA_DIR)
+  : path.join(BASE_DIR, "chrome_user_data_chatgpt");
+export const CHATGPT_CDP_HOST = process.env.CHATGPT_CDP_HOST || "127.0.0.1";
+export const CHATGPT_CDP_PORT = Number(process.env.CHATGPT_CDP_PORT || 9225);
+export const CHATGPT_URL = process.env.CHATGPT_URL || "https://chatgpt.com/";
+
+// Clone Video — AI Studio Playwright
+export const AISTUDIO_USER_DATA_DIR = process.env.AISTUDIO_CHROME_USER_DATA_DIR
+  ? path.resolve(BASE_DIR, process.env.AISTUDIO_CHROME_USER_DATA_DIR)
+  : path.join(BASE_DIR, "chrome_user_data_aistudio");
+export const AISTUDIO_CDP_HOST = process.env.AISTUDIO_CDP_HOST || "127.0.0.1";
+export const AISTUDIO_CDP_PORT = Number(process.env.AISTUDIO_CDP_PORT || 9224);
+export const AISTUDIO_URL = process.env.AISTUDIO_URL || "https://aistudio.google.com/prompts/new_chat";
+
 export const WINDOW_MODE: WindowMode =
   (process.env.CHROME_WINDOW_MODE as WindowMode) || "headful";
 
@@ -96,6 +112,32 @@ export interface AppConfig {
    * Downloads mặc định của OS).
    */
   EXPORT_DIR?: string;
+
+  // ── Clone Video settings ──────────────────────────────────────
+  /** Gemini API key from https://aistudio.google.com/apikey (free). */
+  GEMINI_API_KEY?: string;
+  /** Which provider to use for video analysis. */
+  VIDEO_ANALYZER_PROVIDER?: "gemini-api" | "gemini-playwright" | "chatgpt-playwright";
+  /** Which Gemini model to use for analysis. */
+  GEMINI_MODEL?: "gemini-2.5-flash" | "gemini-2.5-pro";
+
+  // ── Clone Video → Clone TTS (voice-over) ───────────────────────
+  // Reuses GEMINI_API_KEY above. Kept as a narrow union of the three preview
+  // TTS IDs exposed on aistudio — anything outside the list should go through
+  // the Settings UI, not a raw string poke. Default is the newest (3.1).
+  GEMINI_TTS_MODEL?:
+    | "gemini-3.1-flash-tts-preview"
+    | "gemini-2.5-flash-preview-tts"
+    | "gemini-2.5-pro-preview-tts";
+  /** Prebuilt voice name (e.g. Kore / Puck / Aoede). See GEMINI_TTS_VOICES. */
+  GEMINI_TTS_VOICE?: string;
+  /**
+   * BCP-47 language code for TTS synthesis (e.g. "vi-vn", "en-us"). Special
+   * value "auto" (default) omits the field so Gemini infers from the text —
+   * this is usually what you want because the narration is already in the
+   * original language of the source video.
+   */
+  GEMINI_TTS_LANGUAGE?: string;
 }
 
 const DEFAULT_CONFIG: AppConfig = {

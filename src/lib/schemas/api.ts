@@ -89,6 +89,30 @@ export const ClientSettingsSchema = z.object({
   /** Absolute path where Download buttons export media. Empty → use browser
    *  fallback. Server validates path is absolute when non-empty. */
   exportDir: z.string().max(1024).optional().default(""),
+  // Clone Video
+  geminiApiKey: z.string().max(256).optional().default(""),
+  videoAnalyzerProvider: z
+    .enum(["gemini-api", "gemini-playwright", "chatgpt-playwright"])
+    .optional()
+    .default("gemini-api"),
+  geminiModel: z
+    .enum(["gemini-2.5-flash", "gemini-2.5-pro"])
+    .optional()
+    .default("gemini-2.5-flash"),
+  // Clone TTS (voice-over from Clone Video narration). Reuses geminiApiKey.
+  geminiTtsModel: z
+    .enum([
+      "gemini-3.1-flash-tts-preview",
+      "gemini-2.5-flash-preview-tts",
+      "gemini-2.5-pro-preview-tts",
+    ])
+    .optional()
+    .default("gemini-3.1-flash-tts-preview"),
+  /** Prebuilt Gemini TTS voice name. Not enum-constrained so we can add voices
+   *  without a schema bump; the Settings UI enforces the list client-side. */
+  geminiTtsVoice: z.string().max(64).optional().default("Kore"),
+  /** BCP-47 language code, or the sentinel "auto" to let Gemini infer. */
+  geminiTtsLanguage: z.string().max(32).optional().default("auto"),
 });
 
 export const SaveConfigSchema = z.object({

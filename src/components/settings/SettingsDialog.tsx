@@ -1,8 +1,9 @@
 "use client";
 
-import { ExternalLink, Loader2, X } from "lucide-react";
+import { ExternalLink, KeyRound, Loader2, X } from "lucide-react";
 import { useEffect, useState } from "react";
 
+import { GEMINI_TTS_LANGUAGES, GEMINI_TTS_VOICES } from "@/lib/tts";
 import { cn } from "@/lib/utils";
 import OAuthClientsSection from "./OAuthClientsSection";
 
@@ -19,6 +20,17 @@ interface AppSettings {
   grokConcurrency: number;
   /** Absolute path. Empty = dùng fallback browser download của OS. */
   exportDir: string;
+  // Clone Video
+  geminiApiKey: string;
+  videoAnalyzerProvider: "gemini-api" | "gemini-playwright" | "chatgpt-playwright";
+  geminiModel: "gemini-2.5-flash" | "gemini-2.5-pro";
+  // Clone TTS (voice-over sub-feature of Clone Video)
+  geminiTtsModel:
+    | "gemini-3.1-flash-tts-preview"
+    | "gemini-2.5-flash-preview-tts"
+    | "gemini-2.5-pro-preview-tts";
+  geminiTtsVoice: string;
+  geminiTtsLanguage: string;
 }
 
 export default function SettingsDialog({
@@ -323,6 +335,111 @@ export default function SettingsDialog({
                 />
               </Row>
             )}
+          </Section>
+
+          <Section title="Clone Video">
+            <div className="rounded-md bg-[color:var(--color-bg-elev-2)] border border-[color:var(--color-border)] p-2.5 space-y-1 text-[11px] text-[color:var(--color-fg-muted)]">
+              <p>Upload video → AI phân tích cắt scenes → tự tạo workflow. Lấy Gemini API key <b>miễn phí</b> tại{" "}
+                <a href="https://aistudio.google.com/apikey" target="_blank" rel="noreferrer" className="text-[color:var(--color-accent)] underline">aistudio.google.com/apikey</a>
+              </p>
+            </div>
+            <Row label="Gemini API Key">
+              <div className="flex-1 flex items-center gap-2">
+                <KeyRound className="h-3.5 w-3.5 text-[color:var(--color-fg-muted)] shrink-0" />
+                <input
+                  type="password"
+                  value={settings?.geminiApiKey || ""}
+                  onChange={(e) =>
+                    setSettings((s) => (s ? { ...s, geminiApiKey: e.target.value } : s))
+                  }
+                  placeholder="AIza..."
+                  spellCheck={false}
+                  className="flex-1 bg-[color:var(--color-bg-elev-2)] border border-[color:var(--color-border)] rounded-md px-2 py-1 text-sm outline-none font-mono"
+                />
+              </div>
+            </Row>
+            <Row label="Provider">
+              <select
+                value={settings?.videoAnalyzerProvider || "gemini-api"}
+                onChange={(e) =>
+                  setSettings((s) => (s ? { ...s, videoAnalyzerProvider: e.target.value as AppSettings["videoAnalyzerProvider"] } : s))
+                }
+                className="bg-[color:var(--color-bg-elev-2)] border border-[color:var(--color-border)] rounded-md px-2 py-1 text-sm outline-none"
+              >
+                <option value="gemini-api">Gemini API Key (recommended)</option>
+                <option value="gemini-playwright">Gemini Playwright (coming soon)</option>
+                <option value="chatgpt-playwright">ChatGPT Playwright (coming soon)</option>
+              </select>
+            </Row>
+            <Row label="Gemini Model">
+              <select
+                value={settings?.geminiModel || "gemini-2.5-flash"}
+                onChange={(e) =>
+                  setSettings((s) => (s ? { ...s, geminiModel: e.target.value as AppSettings["geminiModel"] } : s))
+                }
+                className="bg-[color:var(--color-bg-elev-2)] border border-[color:var(--color-border)] rounded-md px-2 py-1 text-sm outline-none"
+              >
+                <option value="gemini-2.5-flash">Gemini 2.5 Flash (nhanh, free quota cao)</option>
+                <option value="gemini-2.5-pro">Gemini 2.5 Pro (chính xác hơn)</option>
+              </select>
+            </Row>
+          </Section>
+
+          <Section title="Clone TTS (voice-over)">
+            <div className="rounded-md bg-[color:var(--color-bg-elev-2)] border border-[color:var(--color-border)] p-2.5 space-y-1 text-[11px] text-[color:var(--color-fg-muted)]">
+              <p>
+                Khi bật trong Clone Video, Gemini sẽ transcribe voice-over theo
+                từng scene từ audio gốc, và bạn có thể sinh TTS bằng giọng
+                Google bên dưới. Audio là file WAV rời để download — KHÔNG được
+                ghép vào video tạo ra.
+              </p>
+              <p>
+                Dùng chung <b>Gemini API Key</b> ở section Clone Video trên.
+              </p>
+            </div>
+            <Row label="TTS Model">
+              <select
+                value={settings?.geminiTtsModel || "gemini-3.1-flash-tts-preview"}
+                onChange={(e) =>
+                  setSettings((s) => (s ? { ...s, geminiTtsModel: e.target.value as AppSettings["geminiTtsModel"] } : s))
+                }
+                className="bg-[color:var(--color-bg-elev-2)] border border-[color:var(--color-border)] rounded-md px-2 py-1 text-sm outline-none"
+              >
+                <option value="gemini-3.1-flash-tts-preview">Gemini 3.1 Flash TTS Preview (mới nhất)</option>
+                <option value="gemini-2.5-flash-preview-tts">Gemini 2.5 Flash Preview TTS</option>
+                <option value="gemini-2.5-pro-preview-tts">Gemini 2.5 Pro Preview TTS (chất lượng cao nhất)</option>
+              </select>
+            </Row>
+            <Row label="Default voice">
+              <select
+                value={settings?.geminiTtsVoice || "Kore"}
+                onChange={(e) =>
+                  setSettings((s) => (s ? { ...s, geminiTtsVoice: e.target.value } : s))
+                }
+                className="bg-[color:var(--color-bg-elev-2)] border border-[color:var(--color-border)] rounded-md px-2 py-1 text-sm outline-none"
+              >
+                {GEMINI_TTS_VOICES.map((v) => (
+                  <option key={v} value={v}>
+                    {v}
+                  </option>
+                ))}
+              </select>
+            </Row>
+            <Row label="Default language">
+              <select
+                value={settings?.geminiTtsLanguage || "auto"}
+                onChange={(e) =>
+                  setSettings((s) => (s ? { ...s, geminiTtsLanguage: e.target.value } : s))
+                }
+                className="bg-[color:var(--color-bg-elev-2)] border border-[color:var(--color-border)] rounded-md px-2 py-1 text-sm outline-none"
+              >
+                {GEMINI_TTS_LANGUAGES.map((l) => (
+                  <option key={l.value} value={l.value}>
+                    {l.label}
+                  </option>
+                ))}
+              </select>
+            </Row>
           </Section>
         </div>
 

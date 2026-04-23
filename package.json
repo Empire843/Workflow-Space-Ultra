@@ -24,6 +24,8 @@
     "license:create": "npx tsx server-license/scripts/create-key.ts"
   },
   "dependencies": {
+    "@ffmpeg-installer/ffmpeg": "^1.1.0",
+    "@ffprobe-installer/ffprobe": "^2.1.2",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@xyflow/react": "^12.3.5",
     "bytenode": "^1.5.7",

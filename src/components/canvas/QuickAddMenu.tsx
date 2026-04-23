@@ -44,7 +44,7 @@ const ICON_MAP: Record<string, React.ComponentType<{ className?: string }>> = {
  * Scenes Import dialog spawns a whole batch of nodes + edges).
  */
 type QuickAction = {
-  id: "scenes-import";
+  id: "scenes-import" | "clone-video";
   label: string;
   description?: string;
   icon: keyof typeof ICON_MAP;
@@ -56,6 +56,12 @@ const QUICK_ACTIONS: QuickAction[] = [
     label: "Import scenes from prompts…",
     description: "Paste 2 cột prompt song song để tạo batch scene (Text → Image → Video)",
     icon: "list-plus",
+  },
+  {
+    id: "clone-video",
+    label: "Clone video…",
+    description: "Upload video → AI phân tích → tự tạo workflow scene (Image → Video)",
+    icon: "film",
   },
 ];
 
@@ -88,6 +94,8 @@ export interface QuickAddMenuProps {
   onClose: () => void;
   /** Open the Scenes Import dialog anchored at (flowX, flowY). */
   onOpenScenesImport?: (flowX: number, flowY: number) => void;
+  /** Open the Analyze Video (Clone) dialog. */
+  onOpenAnalyzeVideo?: () => void;
 }
 
 /**
@@ -102,6 +110,7 @@ export default function QuickAddMenu({
   flowY,
   onClose,
   onOpenScenesImport,
+  onOpenAnalyzeVideo,
 }: QuickAddMenuProps) {
   const addNode = useWorkflowStore((s) => s.addNode);
 
@@ -203,6 +212,8 @@ export default function QuickAddMenu({
     if (item.type === "action") {
       if (item.action.id === "scenes-import") {
         onOpenScenesImport?.(flowX, flowY);
+      } else if (item.action.id === "clone-video") {
+        onOpenAnalyzeVideo?.();
       }
       onClose();
       return;

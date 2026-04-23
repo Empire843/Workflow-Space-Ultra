@@ -19,6 +19,7 @@ import type { NodeKind } from "@/lib/nodes";
 import FrameNode from "./FrameNode";
 import QuickAddMenu from "./QuickAddMenu";
 import ScenesImportDialog from "./ScenesImportDialog";
+import AnalyzeVideoDialog from "./AnalyzeVideoDialog";
 import WSNode from "./WSNode";
 
 const nodeTypes: NodeTypes = { wsNode: WSNode, frame: FrameNode };
@@ -72,6 +73,12 @@ function Inner() {
   // Scenes Import dialog — opened from QuickAddMenu's "Import scenes" action.
   // Carries the flow-coord anchor so the batch lands where the user clicked.
   const [scenesImport, setScenesImport] = useState<{ flowX: number; flowY: number } | null>(null);
+  // Initial state for ScenesImportDialog when opened via Clone Video.
+  const [scenesInitial, setScenesInitial] = useState<{
+    imagePrompts: string; videoPrompts: string; aspectRatio: "16:9" | "9:16" | "1:1";
+  } | null>(null);
+  // Analyze Video (Clone) dialog state.
+  const [analyzeVideo, setAnalyzeVideo] = useState(false);
 
   const onPaneContextMenu = useCallback(
     (e: React.MouseEvent | MouseEvent) => {
@@ -328,14 +335,36 @@ function Inner() {
           flowX={quickAdd.flowX}
           flowY={quickAdd.flowY}
           onClose={() => setQuickAdd(null)}
-          onOpenScenesImport={(flowX, flowY) => setScenesImport({ flowX, flowY })}
+          onOpenScenesImport={(flowX, flowY) => {
+            setScenesInitial(null);
+            setScenesImport({ flowX, flowY });
+          }}
+          onOpenAnalyzeVideo={() => setAnalyzeVideo(true)}
         />
       )}
       {scenesImport && (
         <ScenesImportDialog
           flowX={scenesImport.flowX}
           flowY={scenesImport.flowY}
-          onClose={() => setScenesImport(null)}
+          onClose={() => {
+            setScenesImport(null);
+            setScenesInitial(null);
+          }}
+          initialState={scenesInitial ?? undefined}
+        />
+      )}
+      {analyzeVideo && (
+        <AnalyzeVideoDialog
+          onClose={() => setAnalyzeVideo(false)}
+          onResult={(result) => {
+            setAnalyzeVideo(false);
+            setScenesInitial(result);
+            // Open ScenesImportDialog centred on viewport
+            const cx = window.innerWidth / 2;
+            const cy = window.innerHeight / 2;
+            const flow = screenToFlowPosition({ x: cx, y: cy });
+            setScenesImport({ flowX: flow.x, flowY: flow.y });
+          }}
         />
       )}
     </div>

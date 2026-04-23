@@ -19,6 +19,12 @@ export async function GET() {
     veoConcurrency: c.VEO_CONCURRENCY ?? 1,
     grokConcurrency: c.GROK_CONCURRENCY ?? 1,
     exportDir: c.EXPORT_DIR || "",
+    geminiApiKey: c.GEMINI_API_KEY || "",
+    videoAnalyzerProvider: c.VIDEO_ANALYZER_PROVIDER || "gemini-api",
+    geminiModel: c.GEMINI_MODEL || "gemini-2.5-flash",
+    geminiTtsModel: c.GEMINI_TTS_MODEL || "gemini-3.1-flash-tts-preview",
+    geminiTtsVoice: c.GEMINI_TTS_VOICE || "Kore",
+    geminiTtsLanguage: c.GEMINI_TTS_LANGUAGE || "auto",
   };
   return NextResponse.json({ settings });
 }
@@ -42,6 +48,12 @@ export async function POST(req: Request) {
   // that will be mounted later. The /api/assets/export endpoint is where
   // existence / mkdir / permission checks actually bite.
   c.EXPORT_DIR = s.exportDir?.trim() || undefined;
+  c.GEMINI_API_KEY = s.geminiApiKey?.trim() || undefined;
+  c.VIDEO_ANALYZER_PROVIDER = s.videoAnalyzerProvider || undefined;
+  c.GEMINI_MODEL = s.geminiModel || undefined;
+  c.GEMINI_TTS_MODEL = s.geminiTtsModel || undefined;
+  c.GEMINI_TTS_VOICE = s.geminiTtsVoice?.trim() || undefined;
+  c.GEMINI_TTS_LANGUAGE = s.geminiTtsLanguage?.trim() || undefined;
   saveConfig(c);
 
   setLaneConcurrency("veo", s.veoConcurrency || 1);

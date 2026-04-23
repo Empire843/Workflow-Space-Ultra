@@ -12,6 +12,12 @@ export interface ScenesImportDialogProps {
   flowX: number;
   flowY: number;
   onClose: () => void;
+  /** Pre-fill from Clone Video analysis result. */
+  initialState?: {
+    imagePrompts: string;
+    videoPrompts: string;
+    aspectRatio: "16:9" | "9:16" | "1:1";
+  };
 }
 
 type ImageGenModeOpt = "t2i.veo";
@@ -54,11 +60,11 @@ const MAX_REF_COUNT = 3;
 
 type RefImage = { dataUrl: string; mime: string; name: string; bytes: number };
 
-export default function ScenesImportDialog({ flowX, flowY, onClose }: ScenesImportDialogProps) {
+export default function ScenesImportDialog({ flowX, flowY, onClose, initialState }: ScenesImportDialogProps) {
   const importScenes = useWorkflowStore((s) => s.importScenes);
 
-  const [imageText, setImageText] = useState("");
-  const [videoText, setVideoText] = useState("");
+  const [imageText, setImageText] = useState(initialState?.imagePrompts ?? "");
+  const [videoText, setVideoText] = useState(initialState?.videoPrompts ?? "");
   const [imageGenMode, setImageGenMode] = useState<ImageGenModeOpt>("t2i.veo");
   const [videoGenMode, setVideoGenMode] = useState<VideoGenModeOpt>("t2v.veo");
   const [groupInFrame, setGroupInFrame] = useState(true);
@@ -71,7 +77,7 @@ export default function ScenesImportDialog({ flowX, flowY, onClose }: ScenesImpo
   const [oneVideoPrompt, setOneVideoPrompt] = useState(false);
   // Applied uniformly to every gen.image AND gen.video node created in
   // this batch. User can still override per-node later via the inspector.
-  const [aspectRatio, setAspectRatio] = useState<AspectRatio>("16:9");
+  const [aspectRatio, setAspectRatio] = useState<AspectRatio>(initialState?.aspectRatio ?? "16:9");
 
   // Consistency tools (Shared style text + reference images). Collapsed by
   // default: unfamiliar users shouldn't be forced to deal with it, but the

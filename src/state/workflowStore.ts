@@ -1294,3 +1294,72 @@ async function _boot() {
 if (typeof window !== "undefined") {
   void _boot();
 }
+
+// ---------------------------------------------------------------------------
+// Frame helpers — exported as pure functions so components (FrameNode's
+// "Export final video" button) can compute selections without subscribing to
+// the whole nodes array on every change.
+// ---------------------------------------------------------------------------
+
+export interface FrameVideoChild {
+  nodeId: string;
+  /** URL the `/api/workflows/.../assets/...` route serves. */
+  videoUrl: string;
+  /** Computed ordering index — lower = earlier in the concat output. */
+  order: number;
+  /** Raw position used for sorting; kept for diagnostics only. */
+  position: { x: number; y: number };
+}
+
+/**
+ * Collect every `gen.video` child of the given frame that has a `videoUrl`,
+ * sorted in the order they should be concatenated. Ordering is
+ *   primary: row (y rounded to 80-px buckets so small alignment drift doesn't
+ *            flip left/right ordering)
+ *   secondary: x (left-to-right within a row)
+ *
+ * We deliberately bucket y so a horizontally-flowing "strip" of scenes reads
+ * left-to-right even when the user hasn't snap-aligned them perfectly. Vertical
+ * stacks still work because different rows still sort top-to-bottom.
+ *
+ * Returns `[]` when the frame has no videos yet or when any child is missing
+ * a `videoUrl` — the caller decides whether to surface "not ready" to the UI.
+ */
+export function getFrameVideoChildren(frameId: string): FrameVideoChild[] {
+  const nodes = useWorkflowStore.getState().nodes;
+  const children: Array<{
+    nodeId: string;
+    videoUrl: string;
+    x: number;
+    y: number;
+  }> = [];
+  for (const n of nodes) {
+    if (n.parentId !== frameId) continue;
+    const d = n.data as NodeDataBase;
+    if (d.kind !== "gen.video") continue;
+    const url = d.videoHdUrl || d.videoUrl;
+    if (!url || typeof url !== "string") continue;
+    children.push({
+      nodeId: n.id,
+      videoUrl: url,
+      x: n.position?.x ?? 0,
+      y: n.position?.y ?? 0,
+    });
+  }
+  // 80-pixel row bucket — big enough to tolerate manual drag drift, small
+  // enough that rows of different grid lines stay separate. Tune if scenes
+  // get laid out more densely.
+  const ROW_BUCKET = 80;
+  children.sort((a, b) => {
+    const ra = Math.round(a.y / ROW_BUCKET);
+    const rb = Math.round(b.y / ROW_BUCKET);
+    if (ra !== rb) return ra - rb;
+    return a.x - b.x;
+  });
+  return children.map((c, i) => ({
+    nodeId: c.nodeId,
+    videoUrl: c.videoUrl,
+    order: i,
+    position: { x: c.x, y: c.y },
+  }));
+}

@@ -8,6 +8,7 @@ import {
 import {
   CheckCircle2,
   Download,
+  Film,
   Frame as FrameIcon,
   Loader2,
   Play,
@@ -20,7 +21,7 @@ import type { NodeDataBase, OutputItem } from "@/lib/nodes";
 import { cn } from "@/lib/utils";
 import { runFrame } from "@/state/runWorkflow";
 import { toast } from "@/state/toastStore";
-import { useWorkflowStore } from "@/state/workflowStore";
+import { getFrameVideoChildren, useWorkflowStore } from "@/state/workflowStore";
 
 /**
  * Frame node — a visual group container. Other nodes dropped inside a Frame
@@ -46,6 +47,7 @@ function FrameNodeInner(props: NodeProps) {
 
   const [busy, setBusy] = useState(false);
   const [exporting, setExporting] = useState(false);
+  const [composing, setComposing] = useState(false);
   const [editing, setEditing] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -54,6 +56,30 @@ function FrameNodeInner(props: NodeProps) {
     for (const node of s.nodes) if (node.parentId === id) n++;
     return n;
   });
+
+  // How many child gen.video nodes already have a videoUrl. Drives whether
+  // the "Export final video" button is enabled. Subscribed via a selector so
+  // that re-computes only fire when a child video URL changes.
+  const readyVideoCount = useWorkflowStore((s) => {
+    let n = 0;
+    for (const node of s.nodes) {
+      if (node.parentId !== id) continue;
+      const cd = node.data as NodeDataBase;
+      if (cd.kind !== "gen.video") continue;
+      if (cd.videoHdUrl || cd.videoUrl) n++;
+    }
+    return n;
+  });
+  const totalVideoChildCount = useWorkflowStore((s) => {
+    let n = 0;
+    for (const node of s.nodes) {
+      if (node.parentId !== id) continue;
+      if ((node.data as NodeDataBase).kind === "gen.video") n++;
+    }
+    return n;
+  });
+  const allVideosReady =
+    totalVideoChildCount >= 2 && readyVideoCount === totalVideoChildCount;
 
   // Live run progress — populated by runFrame() while a run is in flight.
   const running = Boolean(d.frameRunning) || busy;
@@ -141,6 +167,68 @@ function FrameNodeInner(props: NodeProps) {
       }
     } finally {
       setExporting(false);
+    }
+  };
+
+  const handleCompose = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (composing) return;
+
+    const workflowId = useWorkflowStore.getState().activeWorkflowId;
+    if (!workflowId) {
+      toast.error("Chưa có workflow active", "Mở hoặc tạo workflow trước khi compose.");
+      return;
+    }
+    const children = getFrameVideoChildren(id);
+    if (children.length < 2) {
+      toast.info(
+        "Cần ít nhất 2 video để compose",
+        "Frame phải chứa ≥ 2 node gen.video có videoUrl.",
+      );
+      return;
+    }
+
+    setComposing(true);
+    try {
+      const res = await fetch(`/api/frames/${encodeURIComponent(id)}/compose`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          workflowId,
+          videoUrls: children.map((c) => c.videoUrl),
+        }),
+      });
+      if (!res.ok) {
+        const err = (await res.json().catch(() => ({ error: `HTTP ${res.status}` }))) as {
+          error?: string;
+        };
+        toast.error("Compose thất bại", err.error || `HTTP ${res.status}`);
+        return;
+      }
+      const data = (await res.json()) as {
+        outputUrl: string;
+        bytes: number;
+        durationMs: number;
+        fastPath: boolean;
+      };
+      const sizeMb = (data.bytes / 1024 / 1024).toFixed(1);
+      toast.success(
+        `Export xong (${sizeMb} MB)`,
+        `${children.length} scenes · ${data.fastPath ? "fast-path" : "re-encode"} · ${Math.round(data.durationMs / 1000)}s`,
+      );
+      // Trigger a browser download of the concatenated file. The server
+      // wrote it to `Workflows/<id>/assets/outputs/` so re-running the
+      // frame or re-opening the workflow keeps the artifact around.
+      const a = document.createElement("a");
+      a.href = data.outputUrl;
+      a.download = `${label.replace(/[^a-zA-Z0-9._-]+/g, "_") || "frame"}-final.mp4`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    } catch (err) {
+      toast.error("Compose thất bại", err instanceof Error ? err.message : String(err));
+    } finally {
+      setComposing(false);
     }
   };
 
@@ -344,6 +432,28 @@ function FrameNodeInner(props: NodeProps) {
           ) : (
             <Download className="h-3 w-3" />
           )}
+        </button>
+        <button
+          type="button"
+          onClick={handleCompose}
+          disabled={composing || !allVideosReady}
+          title={
+            totalVideoChildCount < 2
+              ? "Cần ít nhất 2 node gen.video trong Frame để ghép"
+              : !allVideosReady
+                ? `Một số video chưa sẵn sàng (${readyVideoCount}/${totalVideoChildCount})`
+                : `Ghép ${totalVideoChildCount} video con thành 1 MP4 hoàn chỉnh (không chỉnh sửa, giữ audio gốc)`
+          }
+          className={cn(
+            "h-7 w-7 grid place-items-center rounded-full border bg-[color:var(--color-bg-elev-1)]/90 backdrop-blur shadow-md transition",
+            composing
+              ? "border-sky-400/40 text-sky-200 cursor-wait"
+              : !allVideosReady
+                ? "border-white/10 text-[color:var(--color-fg-dim)] opacity-60 cursor-not-allowed"
+                : "border-white/15 text-[color:var(--color-fg-muted)] hover:text-sky-300 hover:border-sky-500/50",
+          )}
+        >
+          {composing ? <Loader2 className="h-3 w-3 animate-spin" /> : <Film className="h-3 w-3" />}
         </button>
         <button
           type="button"
