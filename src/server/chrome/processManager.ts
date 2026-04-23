@@ -261,7 +261,27 @@ export function killChromeForUserData(userDataDir: string) {
 
 /**
  * Chrome flags optimized for power + lower detectability.
- * Derived from GROK_WORKFLOW_CHROME_EXTRA_ARGS + CHROME_EXTRA_ARGS in the Python tool.
+ * Derived from GROK_WORKFLOW_CHROME_EXTRA_ARGS + CHROME_EXTRA_ARGS in the Python tool
+ * plus the anti-bot flags from `sonrasa2k/flow-captcha-solver` (config.py).
+ *
+ * Anti-detection additions (VEO Strike Prevention Hardening):
+ *  - `--disable-blink-features=AutomationControlled`: removes the biggest
+ *    automation signal Blink still leaks (webdriver flag on the runtime).
+ *    Paired with the JS stealth patch in `stealthScript.ts`.
+ *  - `--disable-features=...,IsolateOrigins,site-per-process`: avoids one
+ *    well-known detection vector where Google probes cross-origin iframes
+ *    behaving differently under site isolation.
+ *  - `--exclude-switches=enable-automation`: historically a ChromeDriver
+ *    capability; Chrome itself accepts it without error and it signals to
+ *    some internal telemetry that we do NOT want the "automated by test
+ *    software" infobar/flag pinned on this session.
+ *  - `--disable-infobars`: stops the "Chrome is being controlled by
+ *    automated test software" bar even when telemetry picks us up.
+ *
+ * NOTE: these only apply to Chrome processes spawned by us. If the user
+ * already has a Chrome instance open under the VEO user-data-dir we reuse
+ * it via CDP (no flags applied). For maximum effect, the user should let
+ * the app spawn Chrome itself — which is the default path.
  */
 export const CHROME_BASE_ARGS = [
   "--no-first-run",
@@ -271,7 +291,10 @@ export const CHROME_BASE_ARGS = [
   "--disable-default-apps",
   "--disable-popup-blocking",
   "--mute-audio",
-  "--disable-features=Translate,BackForwardCache",
+  "--disable-features=Translate,BackForwardCache,IsolateOrigins,site-per-process,AutomationControlled",
+  "--disable-blink-features=AutomationControlled",
+  "--exclude-switches=enable-automation",
+  "--disable-infobars",
   "--disable-background-timer-throttling",
   "--disable-renderer-backgrounding",
   "--disable-dev-shm-usage",

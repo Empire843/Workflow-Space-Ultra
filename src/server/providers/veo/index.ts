@@ -12,6 +12,7 @@ import {
 } from "../cancellation";
 
 import { getCreateImageBatcher, readBatcherConfig } from "./batcher";
+import { bumpAndMaybeClear, preCaptureJitter } from "./captureCounter";
 import { cooldownRemainingMs, recordRecaptchaStrike, waitForCooldown } from "./cooldown";
 import {
   isRecaptchaCaptureTimeout,
@@ -200,7 +201,42 @@ interface RecaptchaCtx {
   collector: VeoTokenCollector;
 }
 
-const VEO_THROTTLE_MS = 20000; // 20 seconds between requests
+/**
+ * Base inter-request spacing (ms). A timing-jitter is applied on top (±
+ * `VEO_THROTTLE_JITTER_MS`) so consecutive submissions don't land on
+ * exact 20_000ms boundaries — one of the "too-regular" signals
+ * reCAPTCHA Enterprise uses to score traffic as non-human.
+ *
+ * Overridable via `VEO_THROTTLE_MS` (default 20_000) and
+ * `VEO_THROTTLE_JITTER_MS` (default 2_500 → ±2.5s window).
+ */
+const VEO_THROTTLE_BASE_MS_DEFAULT = 20_000;
+const VEO_THROTTLE_JITTER_DEFAULT = 2_500;
+
+function readThrottleBaseMs(): number {
+  const raw = Number(process.env.VEO_THROTTLE_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : VEO_THROTTLE_BASE_MS_DEFAULT;
+}
+
+function readThrottleJitterMs(): number {
+  const raw = Number(process.env.VEO_THROTTLE_JITTER_MS);
+  return Number.isFinite(raw) && raw >= 0 ? raw : VEO_THROTTLE_JITTER_DEFAULT;
+}
+
+/**
+ * Compute a single throttle slot duration with ±jitter. Used both when
+ * scheduling ourselves behind an existing slot and when initialising
+ * `nextReadyMs` from scratch. Kept deterministic per call so concurrent
+ * submitters see a consistent number when reading the same invocation.
+ */
+function throttleSlotMs(): number {
+  const base = readThrottleBaseMs();
+  const jitter = readThrottleJitterMs();
+  if (jitter <= 0) return base;
+  const delta = Math.floor((Math.random() * 2 - 1) * jitter);
+  const slot = base + delta;
+  return slot < 1_000 ? 1_000 : slot; // clamp to a sane floor
+}
 
 interface ThrottleState { nextReadyMs: number; }
 function getThrottleState(): ThrottleState {
@@ -212,14 +248,15 @@ function getThrottleState(): ThrottleState {
 async function waitVeoThrottle(onLog?: LogFn, shouldCancel?: ShouldCancel) {
   const st = getThrottleState();
   const now = Date.now();
-  
+
   let myWait = 0;
   // Synchronous atomic state update
+  const slot = throttleSlotMs();
   if (st.nextReadyMs > now) {
     myWait = st.nextReadyMs - now;
-    st.nextReadyMs = st.nextReadyMs + VEO_THROTTLE_MS;
+    st.nextReadyMs = st.nextReadyMs + slot;
   } else {
-    st.nextReadyMs = now + VEO_THROTTLE_MS;
+    st.nextReadyMs = now + slot;
   }
 
   if (myWait > 0) {
@@ -228,6 +265,10 @@ async function waitVeoThrottle(onLog?: LogFn, shouldCancel?: ShouldCancel) {
     await cancelableSleep(myWait, shouldCancel);
   }
 }
+
+// Periodic proactive clear + pre-capture jitter helpers live in
+// `./captureCounter.ts` so the batcher can call them too without
+// importing this module (avoids an import cycle with `./batcher.ts`).
 
 async function withRecaptcha<T>(
   fn: (ctx: RecaptchaCtx) => Promise<T>,
@@ -252,6 +293,15 @@ async function withRecaptcha<T>(
     // We only wait the main throttle line on attempt 1.
     if (attempt === 1) {
       await waitVeoThrottle(onLog, shouldCancel);
+      // Periodic proactive storage clear — runs ONCE per user-visible
+      // submission, not on every retry (each retry already drags the
+      // account through one burst; piling a clear on top would only
+      // pad latency). Guarded inside bumpAndMaybeClear so it's a no-op
+      // when the counter hasn't hit the cadence yet.
+      await bumpAndMaybeClear(collector, mode, onLog, shouldCancel);
+      // Human-pause jitter right before we trigger the Flow "Tạo"
+      // button. Tiny cost (≤1s), meaningful risk-score improvement.
+      await preCaptureJitter(shouldCancel);
     } else {
       // Human-like delay between retries
       const delayMs = 3000 + Math.floor(Math.random() * 5000);

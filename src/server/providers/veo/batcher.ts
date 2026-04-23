@@ -18,6 +18,7 @@ import {
   type CreateImageOptions,
   type GeneratedImage,
 } from "./createImage";
+import { bumpAndMaybeClear, preCaptureJitter } from "./captureCounter";
 import { URL_GENERATE_IMAGES_TEMPLATE } from "./constants";
 import {
   cooldownRemainingMs,
@@ -223,6 +224,14 @@ class CreateImageBatcher {
         const config = loadConfig();
         const accountType: AccountType = config.account1.TYPE_ACCOUNT || "ULTRA";
 
+        // VEO Strike Prevention: proactive periodic storage clear +
+        // human-pause jitter BEFORE we mint a token. One bump per
+        // merged batch (not per entry) — the batch really does send
+        // one recaptcha token for N prompts, so counting each entry
+        // would over-clear and reset the counter prematurely.
+        await bumpAndMaybeClear(collector, "image", log, groupShouldCancel);
+        await preCaptureJitter(groupShouldCancel);
+
         // Fetch recaptcha and grab the image-mode page in the same step:
         // the follow-up POST has to go through THIS tab or the fingerprint
         // no longer matches the minted token.
@@ -427,6 +436,13 @@ class CreateImageBatcher {
           const auth = await raceCancel(collector.collectAuth(), shouldCancel);
           const config = loadConfig();
           const accountType: AccountType = config.account1.TYPE_ACCOUNT || "ULTRA";
+          // VEO Strike Prevention: same periodic clear + jitter as the
+          // merged batch path. Only on the first attempt — the retry
+          // escalation ladder below has its own recovery steps.
+          if (attempt === 1) {
+            await bumpAndMaybeClear(collector, "image", log, shouldCancel);
+            await preCaptureJitter(shouldCancel);
+          }
           const recaptcha = await raceCancel(
             timedSpan("veo.recaptcha.image", () =>
               collector.getFreshRecaptchaToken(

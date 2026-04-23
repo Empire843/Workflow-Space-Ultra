@@ -57,6 +57,39 @@ export const CHROME_EXE_PATH_ENV = process.env.CHROME_EXE_PATH || "";
 export const RECAPTCHA_SITE_KEY = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV";
 
 /**
+ * VEO Strike Prevention Hardening — runtime-tunable env vars (all optional).
+ *
+ * These are read directly from `process.env` at the point of use (not
+ * persisted to `config.json`) because they are operational knobs tuned
+ * per-deployment / per-debug-session, not per-user settings.
+ *
+ *   VEO_STEALTH_DISABLED = "1"
+ *     Skip injecting `STEALTH_SCRIPT` into the Playwright context.
+ *     Use only when debugging a suspected stealth-induced breakage.
+ *
+ *   VEO_THROTTLE_MS = number (default 20000)
+ *     Base inter-request spacing between successive VEO calls. Kept at
+ *     ~20s so a single account doesn't burn its daily risk budget.
+ *
+ *   VEO_THROTTLE_JITTER_MS = number (default 2500)
+ *     Half-width of the random jitter applied on top of VEO_THROTTLE_MS
+ *     (so the actual wait is 20000 ± up to 2500ms). Set to 0 to disable.
+ *
+ *   VEO_CLEAR_STORAGE_EVERY = number (default 6, 0 disables)
+ *     How many successful captures per mode before we proactively wipe
+ *     `labs.google/fx` site storage. Mirrors Python `CLEAR_DATA_EVERY`.
+ *
+ *   VEO_PRECAPTURE_JITTER_MIN_MS = number (default 300)
+ *   VEO_PRECAPTURE_JITTER_MAX_MS = number (default 1000)
+ *     Random human-pause applied right before we trigger the Flow
+ *     "Tạo" click. Set the max to 0 to disable the jitter entirely.
+ *
+ * Full operational notes live in `wiki/reference/env-vars.md` and
+ * `wiki/operations/debugging-veo.md`.
+ */
+
+
+/**
  * Public base URL the WSU server is reachable at from the outside world.
  * Required when exposing WSU as a ChatGPT Custom GPT Action — ChatGPT's
  * servers must be able to hit `/api/oauth/*` and `/api/actions/*`, so the

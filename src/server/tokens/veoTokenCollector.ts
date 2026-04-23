@@ -5,6 +5,7 @@ import type { Browser, BrowserContext, Page } from "playwright";
 
 import { DATA_GENERAL_DIR, VEO_CDP_HOST, VEO_FLOW_URL, RECAPTCHA_SITE_KEY, ensureDirs } from "../config";
 import { openVeoChrome } from "../chrome/veoChromeManager";
+import { STEALTH_SCRIPT } from "../chrome/stealthScript";
 import {
   JobCancelledError,
   type ShouldCancel,
@@ -239,6 +240,24 @@ export class VeoTokenCollector {
 
     const contexts = this.browser.contexts();
     this.context = contexts[0] || (await this.browser.newContext());
+
+    // Inject anti-detection / stealth script at the CONTEXT level. `addInitScript`
+    // runs before any page script in every frame of every page opened (or already
+    // open) in this context — so both the auth page and the per-mode tabs get it
+    // automatically without having to re-inject on each `_getPageForMode`.
+    //
+    // Set VEO_STEALTH_DISABLED=1 to skip injection when debugging suspected
+    // stealth-related breakage (e.g. spoofed WebGL tripping a WebGL-based check).
+    if (process.env.VEO_STEALTH_DISABLED !== "1") {
+      try {
+        await this.context.addInitScript(STEALTH_SCRIPT);
+        console.log("[VEO stealth] addInitScript registered on context");
+      } catch (err) {
+        console.warn("[VEO stealth] Failed to register init script:", err);
+      }
+    } else {
+      console.log("[VEO stealth] Disabled via VEO_STEALTH_DISABLED=1");
+    }
 
     // Reclaim any tabs left behind by a previous session (Next.js HMR / server
     // restart). Without this, every dev reload spawned two fresh image+video
