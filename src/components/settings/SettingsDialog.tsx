@@ -45,6 +45,7 @@ export default function SettingsDialog({
   const [grokTest, setGrokTest] = useState<{ state: TestState; msg?: string }>({ state: "idle" });
   const [veoOpen, setVeoOpen] = useState<{ state: TestState; msg?: string }>({ state: "idle" });
   const [grokOpen, setGrokOpen] = useState<{ state: TestState; msg?: string }>({ state: "idle" });
+  const [aistudioOpen, setAistudioOpen] = useState<{ state: TestState; msg?: string }>({ state: "idle" });
 
   useEffect(() => {
     if (!open) return;
@@ -88,8 +89,8 @@ export default function SettingsDialog({
     }
   };
 
-  const openChrome = async (target: "veo" | "grok") => {
-    const setter = target === "veo" ? setVeoOpen : setGrokOpen;
+  const openChrome = async (target: "veo" | "grok" | "aistudio") => {
+    const setter = target === "veo" ? setVeoOpen : target === "grok" ? setGrokOpen : setAistudioOpen;
     setter({ state: "loading" });
     try {
       const res = await fetch("/api/chrome/open", {
@@ -367,10 +368,36 @@ export default function SettingsDialog({
                 className="bg-[color:var(--color-bg-elev-2)] border border-[color:var(--color-border)] rounded-md px-2 py-1 text-sm outline-none"
               >
                 <option value="gemini-api">Gemini API Key (recommended)</option>
-                <option value="gemini-playwright">Gemini Playwright (coming soon)</option>
+                <option value="gemini-playwright">Gemini Playwright (gemini.google.com UI)</option>
                 <option value="chatgpt-playwright">ChatGPT Playwright (coming soon)</option>
               </select>
             </Row>
+            {settings?.videoAnalyzerProvider === "gemini-playwright" && (
+              <>
+                <div className="rounded-md bg-[color:var(--color-bg-elev-2)] border border-[color:var(--color-border)] p-2.5 space-y-1.5 text-[11px] text-[color:var(--color-fg-muted)]">
+                  <p className="font-medium text-[color:var(--color-fg)]">Cách dùng Gemini Playwright:</p>
+                  <ol className="list-decimal list-inside space-y-0.5">
+                    <li>Cần tài khoản <b>Gemini Advanced</b> (Google One AI Premium) — tier miễn phí không upload được video.</li>
+                    <li>Bấm <b>Open Gemini Chrome</b> bên dưới → đăng nhập Google account có Gemini Advanced.</li>
+                    <li>Clone video: Playwright sẽ tự mở tab <code>gemini.google.com/app</code> → upload → gửi prompt → scrape response.</li>
+                  </ol>
+                  <p>Không cần API key — authenticate hoàn toàn qua cookie của Chrome profile. Mỗi lần phân tích tốn 1 turn Gemini Advanced (giống hệt user làm thủ công).</p>
+                </div>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <button
+                    type="button"
+                    onClick={() => openChrome("aistudio")}
+                    className="h-8 px-3 rounded-md bg-[color:var(--color-bg-elev-2)] border border-[color:var(--color-border)] hover:border-[color:var(--color-accent)] text-xs flex items-center gap-1.5"
+                  >
+                    {aistudioOpen.state === "loading" && <Loader2 className="h-3 w-3 animate-spin" />}
+                    <ExternalLink className="h-3 w-3" />
+                    Open Gemini Chrome
+                  </button>
+                </div>
+                {aistudioOpen.state === "ok" && <span className="text-xs text-[color:var(--color-ok)]">✓ {aistudioOpen.msg}</span>}
+                {aistudioOpen.state === "error" && <span className="text-xs text-red-400 break-words">✗ {aistudioOpen.msg}</span>}
+              </>
+            )}
             <Row label="Gemini Model">
               <select
                 value={settings?.geminiModel || "gemini-2.5-flash"}

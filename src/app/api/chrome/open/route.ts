@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 
-import { GROK_CDP_HOST, GROK_PROFILE_NAME, VEO_CDP_HOST } from "@/server/config";
+import { AISTUDIO_CDP_HOST, GROK_CDP_HOST, GROK_PROFILE_NAME, VEO_CDP_HOST } from "@/server/config";
+import { openAiStudioChrome } from "@/server/chrome/aistudioChromeManager";
 import { openGrokChrome } from "@/server/chrome/grokChromeManager";
 import { openVeoChrome } from "@/server/chrome/veoChromeManager";
 
@@ -33,13 +34,23 @@ async function forceWindowOnScreen(host: string, port: number, left: number, top
  */
 export async function POST(req: Request) {
   const { target, profileName } = (await req.json().catch(() => ({}))) as {
-    target?: "veo" | "grok";
+    target?: "veo" | "grok" | "aistudio";
     profileName?: string;
   };
   if (!target) {
-    return NextResponse.json({ ok: false, message: "target=veo|grok is required" }, { status: 400 });
+    return NextResponse.json({ ok: false, message: "target=veo|grok|aistudio is required" }, { status: 400 });
   }
   try {
+    if (target === "aistudio") {
+      const handle = await openAiStudioChrome();
+      await forceWindowOnScreen(AISTUDIO_CDP_HOST, handle.port, 120, 40);
+      return NextResponse.json({
+        ok: true,
+        message: `Đã mở Chrome Gemini tại CDP port ${handle.port}. Hãy đăng nhập Google account có Gemini Advanced trong cửa sổ vừa mở, sau đó quay lại và Clone video.`,
+        port: handle.port,
+        userDataDir: handle.userDataDir,
+      });
+    }
     if (target === "veo") {
       const handle = await openVeoChrome();
       await forceWindowOnScreen(VEO_CDP_HOST, handle.port, 40, 40);

@@ -5,6 +5,8 @@
 
 const BASE_PROMPT = `Analyze this video carefully. Split it into individual scenes where each scene represents one continuous shot (a new scene starts on each camera cut or significant transition).
 
+CRITICAL LIMITATION: AI video generators (like VEO, Grok, Runway) can only generate max 4-5 seconds per request. If any continuous shot lasts longer than 5 seconds, you MUST artificially split it into multiple consecutive sub-scenes (e.g. "Subject enters room" then "Subject sits down", each being under 5 seconds). DO NOT output any scene that would require more than 5 seconds of video.
+
 For each scene, provide:
 - imagePrompt: a detailed, descriptive prompt to recreate this scene as a single still image using an AI image generator. Include subject, composition, lighting, style, colors, and mood.
 - videoPrompt: a prompt describing the camera movement, motion, and action in the scene (e.g. "camera slowly pans left", "subject walks toward camera", "zoom in on face").

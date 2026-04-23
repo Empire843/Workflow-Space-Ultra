@@ -1,6 +1,12 @@
 /**
- * Chrome manager for AI Studio Playwright provider.
- * Phase 2 stub — full implementation when Gemini Playwright provider is built.
+ * Chrome manager for the Gemini Playwright video-analysis provider.
+ *
+ * Opens (or reuses) a dedicated Chrome profile logged into the user's
+ * Google / Gemini Advanced account, landing on gemini.google.com/app so
+ * the user can either log in (first run) or watch the automation happen.
+ *
+ * The file/variable names retain the "aistudio" prefix for backwards
+ * compatibility with existing config env vars and cached profile dirs.
  */
 
 import { existsSync, mkdirSync } from "node:fs";
@@ -15,6 +21,6 @@ export async function openAiStudioChrome(): Promise<ChromeHandle> {
     preferredPort: AISTUDIO_CDP_PORT,
     host: AISTUDIO_CDP_HOST,
     startUrl: AISTUDIO_URL,
-    probeMatchUrl: "aistudio.google.com",
+    probeMatchUrl: "gemini.google.com",
   });
 }

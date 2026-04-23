@@ -23,11 +23,8 @@ export async function analyzeVideo(input: AnalyzeVideoInput): Promise<AnalyzeRes
       return analyzeWithGeminiApi(input);
     }
     case "gemini-playwright": {
-      // Phase 2 — not yet implemented
-      throw new Error(
-        "Provider 'gemini-playwright' chưa được implement. " +
-        "Vui lòng chọn 'gemini-api' trong Settings → Clone Video.",
-      );
+      const { analyzeWithGeminiPlaywright } = await import("./geminiPlaywright");
+      return analyzeWithGeminiPlaywright(input);
     }
     case "chatgpt-playwright": {
       // Phase 2 — not yet implemented

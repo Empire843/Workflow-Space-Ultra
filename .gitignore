@@ -27,6 +27,8 @@ electron/*.jsc
 # ==================== runtime data (NHẠY CẢM) ====================
 # Chrome profile chứa toàn bộ cookie, session, login của Google & Grok
 chrome_user_data/
+chrome_user_data_chatgpt/
+chrome_user_data_aistudio/
 chrome_user_data_grok/
 
 # Video/ảnh user đã tạo

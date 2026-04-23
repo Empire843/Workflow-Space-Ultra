@@ -47,7 +47,7 @@ export const AISTUDIO_USER_DATA_DIR = process.env.AISTUDIO_CHROME_USER_DATA_DIR
   : path.join(BASE_DIR, "chrome_user_data_aistudio");
 export const AISTUDIO_CDP_HOST = process.env.AISTUDIO_CDP_HOST || "127.0.0.1";
 export const AISTUDIO_CDP_PORT = Number(process.env.AISTUDIO_CDP_PORT || 9224);
-export const AISTUDIO_URL = process.env.AISTUDIO_URL || "https://aistudio.google.com/prompts/new_chat";
+export const AISTUDIO_URL = process.env.AISTUDIO_URL || "https://gemini.google.com/app";
 
 export const WINDOW_MODE: WindowMode =
   (process.env.CHROME_WINDOW_MODE as WindowMode) || "headful";

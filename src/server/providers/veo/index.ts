@@ -200,6 +200,35 @@ interface RecaptchaCtx {
   collector: VeoTokenCollector;
 }
 
+const VEO_THROTTLE_MS = 20000; // 20 seconds between requests
+
+interface ThrottleState { nextReadyMs: number; }
+function getThrottleState(): ThrottleState {
+  const g = globalThis as any;
+  if (!g.__wsu_veo_throttle__) g.__wsu_veo_throttle__ = { nextReadyMs: 0 };
+  return g.__wsu_veo_throttle__;
+}
+
+async function waitVeoThrottle(onLog?: LogFn, shouldCancel?: ShouldCancel) {
+  const st = getThrottleState();
+  const now = Date.now();
+  
+  let myWait = 0;
+  // Synchronous atomic state update
+  if (st.nextReadyMs > now) {
+    myWait = st.nextReadyMs - now;
+    st.nextReadyMs = st.nextReadyMs + VEO_THROTTLE_MS;
+  } else {
+    st.nextReadyMs = now + VEO_THROTTLE_MS;
+  }
+
+  if (myWait > 0) {
+    const delayS = (myWait / 1000).toFixed(1);
+    onLog?.(`[Rate Limit] Tránh đánh dồn dập: xếp hàng đợi ${delayS}s trước khi gửi VEO…`);
+    await cancelableSleep(myWait, shouldCancel);
+  }
+}
+
 async function withRecaptcha<T>(
   fn: (ctx: RecaptchaCtx) => Promise<T>,
   mode: "video" | "image" = "video",
@@ -214,16 +243,17 @@ async function withRecaptcha<T>(
     ensureNotCancelled(shouldCancel);
 
     // Safety-net cooldown only. Happy path never writes to it; if it's set,
-    // some other lane hit a genuine abuse flag recently and we wait it out
-    // before spending another recaptcha token.
+    // safety-net cooldown kicks in)
     if (cooldownRemainingMs() > 0) {
       await waitForCooldown(onLog, shouldCancel);
     }
 
-    // Human-like delay between retries (not the first attempt). Google
-    // reCAPTCHA v3 Enterprise scores timing patterns: mechanical bursts
-    // get lower scores and trigger UNUSUAL_ACTIVITY more often.
-    if (attempt > 1) {
+    // Rate-limit consecutive requests to prevent spamming Google.
+    // We only wait the main throttle line on attempt 1.
+    if (attempt === 1) {
+      await waitVeoThrottle(onLog, shouldCancel);
+    } else {
+      // Human-like delay between retries
       const delayMs = 3000 + Math.floor(Math.random() * 5000);
       onLog?.(`Đợi ${(delayMs / 1000).toFixed(1)}s trước khi thử lại…`);
       await cancelableSleep(delayMs, shouldCancel);

@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess, execFileSync, execSync } from "node:child_process";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -110,11 +110,75 @@ function runPowerShell(script: string, opts?: { silent?: boolean }): string {
 }
 
 /**
- * Find the CDP port of a Chrome process using the given user-data-dir (Windows only).
+ * Linux: scan `/proc/<pid>/cmdline` for a Chrome process whose --user-data-dir
+ * matches `target`, then return its --remote-debugging-port (if any).
+ * Returns null if not found.
+ */
+function findRunningCdpPortForUserDataLinux(target: string): number | null {
+  try {
+    const entries = readdirSync("/proc");
+    for (const entry of entries) {
+      if (!/^\d+$/.test(entry)) continue;
+      let cmdline: string;
+      try {
+        cmdline = readFileSync(`/proc/${entry}/cmdline`, "utf-8");
+      } catch {
+        continue;
+      }
+      if (!cmdline) continue;
+      // /proc cmdline uses NUL bytes between args
+      const args = cmdline.split("\0").filter(Boolean);
+      if (args.length === 0) continue;
+      const exe = args[0].toLowerCase();
+      if (!exe.includes("chrome") && !exe.includes("chromium")) continue;
+      const uddArg = args.find((a) => a.startsWith("--user-data-dir="));
+      if (!uddArg) continue;
+      const udd = path.resolve(uddArg.slice("--user-data-dir=".length));
+      if (udd !== target) continue;
+      const portArg = args.find((a) => a.startsWith("--remote-debugging-port="));
+      if (!portArg) continue;
+      const portNum = Number(portArg.slice("--remote-debugging-port=".length));
+      if (Number.isFinite(portNum) && portNum > 0) return portNum;
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+/**
+ * macOS: use `ps -ww -eo args` to list process command lines and parse the same way.
+ */
+function findRunningCdpPortForUserDataMac(target: string): number | null {
+  try {
+    const out = execSync("ps -ww -eo args", { stdio: ["ignore", "pipe", "ignore"] }).toString();
+    for (const line of out.split(/\r?\n/)) {
+      const low = line.toLowerCase();
+      if (!low.includes("chrome") && !low.includes("chromium")) continue;
+      const mUdd = /--user-data-dir=("([^"]+)"|(\S+))/.exec(line);
+      const udd = (mUdd?.[2] || mUdd?.[3] || "").trim();
+      if (!udd) continue;
+      if (path.resolve(udd) !== target) continue;
+      const m = /--remote-debugging-port=(\d+)/.exec(line);
+      if (m) return Number(m[1]);
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+/**
+ * Find the CDP port of a Chrome process using the given user-data-dir.
+ * Cross-platform: Windows (WMI), Linux (/proc), macOS (ps).
  * Used to reuse a running Chrome instead of spawning a new one.
  */
 export function findRunningCdpPortForUserData(userDataDir: string): number | null {
-  if (!isWin) return null;
+  if (!isWin) {
+    const target = path.resolve(userDataDir);
+    if (process.platform === "darwin") return findRunningCdpPortForUserDataMac(target);
+    return findRunningCdpPortForUserDataLinux(target);
+  }
   const target = path.resolve(userDataDir).toLowerCase().replace(/\//g, "\\");
   try {
     // Use Where-Object + single quotes to avoid nested double-quote issues.

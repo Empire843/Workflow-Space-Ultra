@@ -68,6 +68,7 @@ export default function QueuePanel({
 }) {
   const [snapshot, setSnapshot] = useState<QueueSnapshot | null>(null);
   const [loading, setLoading] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const nodes = useWorkflowStore((s) => s.nodes);
   const updateNodeData = useWorkflowStore((s) => s.updateNodeData);
@@ -82,8 +83,11 @@ export default function QueuePanel({
     try {
       const r = await fetch("/api/queue", { cache: "no-store" });
       const body = (await r.json()) as QueueSnapshot;
+      if (!body.lanes) throw new Error("Invalid format: missing lanes");
       setSnapshot(body);
-    } catch {
+      setErrorMsg(null);
+    } catch (err) {
+      setErrorMsg(String(err));
       // keep last snapshot; show stale but don't crash the panel
     } finally {
       setLoading(false);
@@ -194,6 +198,11 @@ export default function QueuePanel({
               </span>
             )}
           </h2>
+          {errorMsg && (
+            <span className="text-[10px] text-red-400 font-mono truncate max-w-[150px] mr-2" title={errorMsg}>
+              {errorMsg}
+            </span>
+          )}
           {loading && (
             <Loader2 className="h-3.5 w-3.5 animate-spin text-[color:var(--color-fg-muted)]" />
           )}
