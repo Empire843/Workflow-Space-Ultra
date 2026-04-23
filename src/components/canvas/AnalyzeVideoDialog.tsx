@@ -50,6 +50,7 @@ interface TtsItem {
 
 export default function AnalyzeVideoDialog({ onClose, onResult }: AnalyzeVideoDialogProps) {
   const [file, setFile] = useState<File | null>(null);
+  const [youtubeUrl, setYoutubeUrl] = useState("");
   const [phase, setPhase] = useState<Phase>("idle");
   const [error, setError] = useState<string | null>(null);
   const [rawResponse, setRawResponse] = useState<string | null>(null);
@@ -79,6 +80,7 @@ export default function AnalyzeVideoDialog({ onClose, onResult }: AnalyzeVideoDi
       return;
     }
     setFile(f);
+    setYoutubeUrl(""); // Clear url when file is uploaded
     setError(null);
   }, []);
 
@@ -93,7 +95,7 @@ export default function AnalyzeVideoDialog({ onClose, onResult }: AnalyzeVideoDi
   );
 
   async function handleAnalyze() {
-    if (!file) return;
+    if (!file && !youtubeUrl.trim()) return;
     setPhase("uploading");
     setError(null);
     setRawResponse(null);
@@ -104,7 +106,11 @@ export default function AnalyzeVideoDialog({ onClose, onResult }: AnalyzeVideoDi
 
     try {
       const formData = new FormData();
-      formData.append("video", file);
+      if (file) {
+        formData.append("video", file);
+      } else {
+        formData.append("youtubeUrl", youtubeUrl.trim());
+      }
       if (cloneTts) formData.append("includeNarration", "true");
 
       setPhase("analyzing");
@@ -265,6 +271,34 @@ export default function AnalyzeVideoDialog({ onClose, onResult }: AnalyzeVideoDi
 
         {/* Body */}
         <div className="p-4 space-y-4 overflow-y-auto">
+          {/* URL Input */}
+          {!inPreview && (
+            <div className="space-y-1">
+              <input
+                type="text"
+                placeholder="Nhập link YouTube, TikTok, v.v..."
+                value={youtubeUrl}
+                onChange={(e) => {
+                  setYoutubeUrl(e.target.value);
+                  if (e.target.value) setFile(null); // Clear file when writing URL
+                }}
+                disabled={isProcessing}
+                className="w-full px-3 py-2 rounded-lg bg-[color:var(--color-bg-elev-2)] border border-[color:var(--color-border)] text-sm text-[color:var(--color-fg)] outline-none focus:border-[color:var(--color-accent)] placeholder:text-[color:var(--color-fg-dim)]"
+              />
+            </div>
+          )}
+
+          {/* Separator */}
+          {!inPreview && (
+            <div className="flex items-center gap-2">
+              <div className="flex-1 h-px bg-[color:var(--color-border)]" />
+              <div className="text-[10px] uppercase font-semibold text-[color:var(--color-fg-muted)] tracking-wider">
+                hoặc
+              </div>
+              <div className="flex-1 h-px bg-[color:var(--color-border)]" />
+            </div>
+          )}
+
           {/* Drop zone (hidden in preview to save vertical space) */}
           {!inPreview && (
             <div
@@ -409,7 +443,7 @@ export default function AnalyzeVideoDialog({ onClose, onResult }: AnalyzeVideoDi
           {isProcessing && (
             <div className="flex items-center gap-2 text-xs text-[color:var(--color-fg)]">
               <Loader2 className="h-4 w-4 animate-spin text-[color:var(--color-accent)]" />
-              {phase === "uploading" && "Đang upload video..."}
+              {phase === "uploading" && (youtubeUrl ? "Đang tải video..." : "Đang upload video...")}
               {phase === "analyzing" && (
                 cloneTts
                   ? "AI đang phân tích video + transcribe voice-over... (có thể mất 1-5 phút)"
@@ -464,10 +498,10 @@ export default function AnalyzeVideoDialog({ onClose, onResult }: AnalyzeVideoDi
               <button
                 type="button"
                 onClick={handleAnalyze}
-                disabled={!file || isProcessing}
+                disabled={(!file && !youtubeUrl.trim()) || isProcessing}
                 className={cn(
                   "h-8 px-4 rounded-md text-xs font-semibold transition flex items-center gap-1.5",
-                  file && !isProcessing
+                  (file || youtubeUrl.trim()) && !isProcessing
                     ? "bg-[color:var(--color-accent)] text-white hover:brightness-110"
                     : "bg-[color:var(--color-bg-elev-2)] text-[color:var(--color-fg-dim)] cursor-not-allowed",
                 )}

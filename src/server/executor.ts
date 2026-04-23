@@ -222,6 +222,14 @@ async function _executeNode(
       throw new Error("Transformation node local chưa implement (MVP placeholder)");
     } else if (kind === "xform.extract-frames") {
       throw new Error("Extract Frames chạy client-side (dùng node Upload để nạp lại ảnh).");
+    } else if (kind === "content.clone") {
+      log("Bắt đầu tải video từ link...");
+      const url = nodeData.prompt;
+      if (!url) throw new Error("Chưa nhập URL video");
+      const { runCloneVideo } = await import("./providers/clone");
+      const videoItems = await runCloneVideo(job, nodeData, url, log);
+      assignOutputItems(output, videoItems, "video");
+      setJobProgress(job.id, 100);
     } else {
       throw new Error(`Node kind không support: ${kind}`);
     }
@@ -285,7 +293,7 @@ function assignOutputItems(
 }
 
 function isContent(kind: NodeKind): boolean {
-  return kind.startsWith("content.");
+  return kind.startsWith("content.") && kind !== "content.clone";
 }
 
 async function urlToBase64(url: string): Promise<string> {
@@ -808,9 +816,9 @@ function interpretGrokError(status: number, body?: string | null): string {
       return "Grok từ chối tạo video do content policy (moderation flag) — đổi ảnh/prompt bớt nhạy cảm rồi thử lại";
     }
     if (b.includes("can't create") || b.includes("cannot create") ||
-        b.includes("unable to create") || b.includes("content policy") || b.includes("guidelines") ||
-        b.includes("not allowed") || b.includes("không thể tạo") ||
-        (b.includes("against") && b.includes("policy"))) {
+      b.includes("unable to create") || b.includes("content policy") || b.includes("guidelines") ||
+      b.includes("not allowed") || b.includes("không thể tạo") ||
+      (b.includes("against") && b.includes("policy"))) {
       return "Grok giải thích không thể tạo do content policy — xem nội dung grokSays bên dưới để biết chi tiết";
     }
     if (b.includes("finishreason=")) {

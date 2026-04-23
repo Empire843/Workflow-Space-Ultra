@@ -196,6 +196,8 @@ function InspectorBody({ nodeId, data }: { nodeId: string; data: NodeDataBase })
       return <TextNodeConfig nodeId={nodeId} />;
     case "content.upload":
       return <UploadNodeConfig nodeId={nodeId} data={data} />;
+    case "content.clone":
+      return <CloneNodeConfig nodeId={nodeId} data={data} />;
     case "content.image":
     case "content.video":
     case "content.audio":
@@ -230,6 +232,29 @@ function TextNodeConfig({ nodeId }: { nodeId: string }) {
       <TextPromptEditor nodeId={nodeId} />
       <div className="text-[10px] text-[color:var(--color-fg-dim)]">
         Connect this text node to a generation node to use it as prompt.
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Clone node
+// ---------------------------------------------------------------------------
+
+function CloneNodeConfig({ nodeId, data }: { nodeId: string; data: NodeDataBase }) {
+  const updateNodeData = useWorkflowStore((s) => s.updateNodeData);
+  return (
+    <div className="space-y-2">
+      <Label>Video URL</Label>
+      <input
+        type="text"
+        placeholder="https://youtube.com/..."
+        value={data.prompt || ""}
+        onChange={(e) => updateNodeData(nodeId, { prompt: e.target.value })}
+        className="w-full px-2 py-1.5 rounded-md bg-[color:var(--color-bg-elev-2)] border border-[color:var(--color-border)] text-xs text-[color:var(--color-fg)] outline-none focus:border-[color:var(--color-accent)]"
+      />
+      <div className="text-[10px] text-[color:var(--color-fg-dim)]">
+        Nhập link YouTube, TikTok, v.v. Node sẽ xử lý tải xuống khi chạy.
       </div>
     </div>
   );

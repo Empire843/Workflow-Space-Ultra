@@ -11,6 +11,7 @@ import {
   Film,
   Image as ImageIcon,
   Loader2,
+  Link,
   Music,
   Play,
   Trash2,
@@ -373,6 +374,8 @@ function pickLabelIcon(name: string) {
       return Type;
     case "music":
       return Music;
+    case "link":
+      return Link;
     case "upload":
       return UploadIcon;
     case "video":
@@ -538,6 +541,16 @@ function EmptyPlaceholder({ data }: { data: NodeDataBase }) {
         icon={<UploadIcon className="h-7 w-7" />}
         title="Upload file"
         subtitle="Click node to pick a file"
+      />
+    );
+  }
+
+  if (kind === "content.clone") {
+    return (
+      <MediaPlaceholder
+        icon={<Link className="h-7 w-7" />}
+        title="Download Video"
+        subtitle="Click node to add YouTube link"
       />
     );
   }

@@ -19,6 +19,7 @@ export type NodeKind =
   | "content.text"
   | "content.audio"
   | "content.upload"
+  | "content.clone"
   // Generation (generic — sub-type via `data.genMode`)
   | "gen.image"
   | "gen.video"
@@ -51,6 +52,7 @@ export const NODE_CATALOG: NodeCatalogEntry[] = [
   // instead for local files, or generation nodes for AI output.
   { kind: "content.text", label: "Text", group: "content", icon: "type", description: "Prompt text" },
   { kind: "content.upload", label: "Upload", group: "content", icon: "upload", description: "Upload file từ máy" },
+  { kind: "content.clone", label: "Download Video", group: "content", icon: "link", description: "Tải video từ YouTube / link" },
 
   // Generation
   {
