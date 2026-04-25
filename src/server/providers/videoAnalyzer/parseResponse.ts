@@ -18,6 +18,9 @@ const SceneSchema = z.object({
 
 const AnalyzeResultSchema = z.object({
   aspectRatio: z.enum(["16:9", "9:16", "1:1"]),
+  // Consistent visual style / character description across all scenes.
+  // Optional — older responses or videos without a clear theme may omit it.
+  sharedStyle: z.string().optional(),
   scenes: z.array(SceneSchema).min(1),
   // BCP-47 or empty string. We accept any string (don't enforce format) because
   // the model occasionally returns "und" / language name when it's unsure — the

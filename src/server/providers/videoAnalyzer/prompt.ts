@@ -11,8 +11,11 @@ For each scene, provide:
 - imagePrompt: a detailed, descriptive prompt to recreate this scene as a single still image using an AI image generator. Include subject, composition, lighting, style, colors, and mood.
 - videoPrompt: a prompt describing the camera movement, motion, and action in the scene (e.g. "camera slowly pans left", "subject walks toward camera", "zoom in on face").
 
+Also provide a top-level field:
+- sharedStyle: a concise but detailed description of the consistent visual style, character appearance, art direction, lighting, and color palette shared across ALL scenes. This acts as a "character sheet" — include details like character physical traits, clothing, environment mood, rendering style (e.g. "Pixar 3D", "anime", "photorealistic"), and any other visual elements that remain constant throughout the video. If the video has no consistent style or character, return "".
+
 Return ONLY a valid JSON object with NO other text, NO markdown formatting, NO code fences. The JSON must follow this exact schema:
-{"aspectRatio":"16:9","scenes":[{"imagePrompt":"...","videoPrompt":"..."}]}
+{"aspectRatio":"16:9","sharedStyle":"...","scenes":[{"imagePrompt":"...","videoPrompt":"..."}]}
 
 Where aspectRatio is the detected aspect ratio of the video ("16:9", "9:16", or "1:1").`;
 
@@ -30,7 +33,7 @@ Also add a top-level field:
 - detectedLanguage: the BCP-47 language code of the dominant spoken language (e.g. "vi-vn", "en-us", "ja-jp"). If no speech at all, return "".
 
 The updated JSON schema is:
-{"aspectRatio":"16:9","detectedLanguage":"vi-vn","scenes":[{"imagePrompt":"...","videoPrompt":"...","narration":"..."}]}`;
+{"aspectRatio":"16:9","sharedStyle":"...","detectedLanguage":"vi-vn","scenes":[{"imagePrompt":"...","videoPrompt":"...","narration":"..."}]}`;
 
 export function buildAnalyzePrompt(opts?: {
   sceneCount?: number;

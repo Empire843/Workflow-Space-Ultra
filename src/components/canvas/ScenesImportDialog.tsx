@@ -17,6 +17,7 @@ export interface ScenesImportDialogProps {
     imagePrompts: string;
     videoPrompts: string;
     aspectRatio: "16:9" | "9:16" | "1:1";
+    sharedStyle?: string;
   };
 }
 
@@ -82,8 +83,8 @@ export default function ScenesImportDialog({ flowX, flowY, onClose, initialState
   // Consistency tools (Shared style text + reference images). Collapsed by
   // default: unfamiliar users shouldn't be forced to deal with it, but the
   // section is one click away so returning users find it fast.
-  const [consistencyOpen, setConsistencyOpen] = useState(false);
-  const [stylePrefix, setStylePrefix] = useState("");
+  const [consistencyOpen, setConsistencyOpen] = useState(!!initialState?.sharedStyle);
+  const [stylePrefix, setStylePrefix] = useState(initialState?.sharedStyle ?? "");
   const [refImages, setRefImages] = useState<RefImage[]>([]);
   const [refError, setRefError] = useState<string | null>(null);
   const refFileInputRef = useRef<HTMLInputElement>(null);
@@ -332,7 +333,7 @@ export default function ScenesImportDialog({ flowX, flowY, onClose, initialState
                     Shared style / character sheet
                   </div>
                   <div className="text-[10px] text-[color:var(--color-fg-dim)]">
-                    Tự động prepend vào prompt của mọi scene (cả image và video)
+                    Tạo ảnh reference từ prompt này → nối tới mọi scene image. Cũng prepend text vào prompt.
                   </div>
                 </div>
                 <textarea

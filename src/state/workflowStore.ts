@@ -700,10 +700,12 @@ export const useWorkflowStore = create<WorkflowState>()(
       const baseX = groupInFrame ? FRAME_PAD_X : anchor.x;
       const baseY = groupInFrame ? FRAME_PAD_Y : anchor.y;
 
-      // Header row: shared style text (col 0) + reference upload nodes
-      // (col 1..K). These IDs are collected so every scene's gen.image and
-      // gen.video can reference them via edges further down.
+      // Header row: shared style text (col 0) + style reference image gen
+      // (col 1, when style is present) + reference upload nodes (col 2..K).
+      // These IDs are collected so every scene's gen.image and gen.video can
+      // reference them via edges further down.
       let styleTextId: string | null = null;
+      let styleImageId: string | null = null;
       const refUploadIds: string[] = [];
 
       if (hasHeader) {
@@ -723,16 +725,42 @@ export const useWorkflowStore = create<WorkflowState>()(
               text: stylePrefix!.trim(),
             },
           });
+
+          // gen.image node that will generate a style reference image from
+          // the shared style prompt. Its output is wired to every scene's
+          // gen.image as a reference input (Nano Banana identity anchor).
+          styleImageId = uid("node");
+          newNodes.push({
+            id: styleImageId,
+            type: "wsNode",
+            position: { x: baseX + 1 * COL_W, y: headerY },
+            ...(frameId ? { parentId: frameId } : {}),
+            data: {
+              kind: "gen.image",
+              status: "idle",
+              genMode: imageGenMode,
+              label: "Style Reference Image",
+              aspectRatio,
+            },
+          });
+
+          // Wire style text → style image gen
+          newEdges.push({
+            id: uid("edge"),
+            source: styleTextId,
+            target: styleImageId,
+            animated: true,
+            style: { stroke: "#ff3c8e" },
+          });
         }
 
-        // Reference images: lay out in cols 1..N of the header row; if they
-        // don't all fit (K > 3), wrap by reducing column width slightly —
-        // simplest is to cap at 3 cols in a single row for the happy path.
-        // Users rarely upload more than 2-3 refs in practice.
+        // Reference images: lay out starting from col 2 (col 0 = style text,
+        // col 1 = style gen.image) when style is present, otherwise from col 1.
+        const refStartCol = hasStyle ? 2 : 1;
         refs.forEach((ref, idx) => {
           const uploadId = uid("node");
           refUploadIds.push(uploadId);
-          const col = 1 + idx; // col 0 is the style text
+          const col = refStartCol + idx;
           newNodes.push({
             id: uploadId,
             type: "wsNode",
@@ -845,6 +873,18 @@ export const useWorkflowStore = create<WorkflowState>()(
             id: uid("edge"),
             source: styleTextId,
             target: genVidId,
+            ...edgeStyle,
+          });
+        }
+        // Style reference image → scene gen.image: the generated style image
+        // feeds every scene's gen.image as a reference (Nano Banana identity
+        // anchor). runFrame's topological order ensures the style image is
+        // generated before any scene images that depend on it.
+        if (styleImageId) {
+          newEdges.push({
+            id: uid("edge"),
+            source: styleImageId,
+            target: genImgId,
             ...edgeStyle,
           });
         }

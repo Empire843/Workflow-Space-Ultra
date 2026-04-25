@@ -76,6 +76,7 @@ function Inner() {
   // Initial state for ScenesImportDialog when opened via Clone Video.
   const [scenesInitial, setScenesInitial] = useState<{
     imagePrompts: string; videoPrompts: string; aspectRatio: "16:9" | "9:16" | "1:1";
+    sharedStyle?: string;
   } | null>(null);
   // Analyze Video (Clone) dialog state.
   const [analyzeVideo, setAnalyzeVideo] = useState(false);

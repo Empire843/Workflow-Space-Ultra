@@ -19,6 +19,7 @@ export interface AnalyzeVideoDialogProps {
     imagePrompts: string;
     videoPrompts: string;
     aspectRatio: "16:9" | "9:16" | "1:1";
+    sharedStyle?: string;
   }) => void;
 }
 
@@ -37,6 +38,7 @@ interface SceneResult {
 
 interface AnalyzeApiResult {
   aspectRatio: "16:9" | "9:16" | "1:1";
+  sharedStyle?: string;
   scenes: SceneResult[];
   detectedLanguage?: string;
 }
@@ -157,6 +159,7 @@ export default function AnalyzeVideoDialog({ onClose, onResult }: AnalyzeVideoDi
       imagePrompts,
       videoPrompts,
       aspectRatio: data.aspectRatio || "16:9",
+      sharedStyle: data.sharedStyle || undefined,
     });
   }
 

@@ -44,6 +44,13 @@ export interface SceneResult {
 
 export interface AnalyzeResult {
   aspectRatio: "16:9" | "9:16" | "1:1";
+  /**
+   * Concise description of the consistent visual style, character appearance,
+   * art direction shared across ALL scenes. Acts as a "character sheet" for
+   * downstream gen.image reference nodes. Empty when the video has no
+   * consistent style/character.
+   */
+  sharedStyle?: string;
   scenes: SceneResult[];
   /**
    * BCP-47 language code detected from the original audio (e.g. `vi-vn`, `en-us`).
