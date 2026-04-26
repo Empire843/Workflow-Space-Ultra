@@ -52,7 +52,7 @@ const s = (n: number) => n * 1000;
  *          enough; let a little more time pass.
  *  - 120s / 240s / 300s → account is clearly being watched; stop poking.
  */
-const STRIKE_DELAYS_MS = [s(30), s(60), s(120), s(240), s(300)];
+const STRIKE_DELAYS_MS = [s(30), s(60), s(60), s(60), s(60)];
 
 /**
  * If no new strike happens for this long, reset the escalation counter. We
@@ -122,6 +122,8 @@ export async function waitForCooldown(
 ): Promise<void> {
   const tickMs = 5000;
   const pollMs = 200;
+  let lastRecoverMs = 0;
+
   while (true) {
     ensureNotCancelled(shouldCancel);
     const remaining = cooldownRemainingMs();
@@ -130,7 +132,7 @@ export async function waitForCooldown(
     const st = getState();
     onLog?.(
       `Đang đợi Google cooldown (${secs}s còn lại, strike #${st.strikes}) — giữ tab Chrome VEO, ` +
-        `đừng tắt…`,
+      `đừng tắt…`,
     );
     // Fine-grained sleep so cancel is observed ~5x per second even
     // though log emission only fires every 5s.
@@ -141,6 +143,14 @@ export async function waitForCooldown(
       const step = Math.min(pollMs, sleepDeadline - Date.now());
       if (step <= 0) break;
       await new Promise((r) => setTimeout(r, step));
+
+      const now = Date.now();
+      if (now - lastRecoverMs > 2000) {
+        lastRecoverMs = now;
+        import("../../tokens/veoTokenCollector")
+          .then((m) => m.attemptRecoverLandingPage())
+          .catch(() => { });
+      }
     }
   }
 }

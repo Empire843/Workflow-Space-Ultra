@@ -550,49 +550,29 @@ export async function runSingleNode(
 /* -------------------------------------------------------------------------- */
 
 /**
- * Default cap on concurrent gen nodes dispatched from a single `runFrame`
- * call. Per-provider concurrency is enforced further downstream by
- * `src/server/lanes.ts` (VEO video = 1, VEO image via batcher = 3, Grok = 1),
- * so this is just an upper bound that lets independent images from the
- * same frame enter the batcher together instead of one-at-a-time. Picked
- * slightly above the batcher's `maxBatchSize` (3) so a full batch can
- * form without starving a gen.video that's waiting its turn.
- */
-const FRAME_DEFAULT_MAX_IN_FLIGHT = 6;
-
-/**
  * Run every node whose `parentId === frameId`. The run is **forced**:
  *
  *  - All non-content children are cleared first, regardless of whether they
  *    already carry an output. Even fully-`done` nodes are re-run so the user
  *    can be sure the entire Frame produced fresh artifacts.
- *  - Children execute **in parallel** subject to a `maxInFlight` cap and the
- *    topological order computed from edges that lie inside the Frame. A gen
- *    node never starts before all its internal upstream nodes have finished,
- *    so downstream gen.video still sees the freshly-generated gen.image it
- *    depends on. Independent siblings (e.g. 10 `gen.image` siblings fed by
- *    their own text nodes) DO run concurrently — server-side lanes then
- *    fold them into the VEO image batcher so 3 siblings become 1 HTTP
- *    request + 1 reCAPTCHA token. VEO video and Grok are each capped to
- *    concurrency 1 by their lanes, so parallelism there degrades gracefully
- *    to sequential.
+ *  - Children execute with **per-provider lane scheduling**: each provider
+ *    (VEO, Grok) has exactly 1 slot. Within a lane nodes run sequentially,
+ *    with `gen.image` prioritised before `gen.video` / `gen.start-end`.
+ *    Cross-provider parallelism is maintained — a Grok video can start
+ *    as soon as its upstream VEO image finishes, without waiting for other
+ *    VEO nodes in the lane queue.
+ *  - Topological order is enforced: a gen node never starts before all its
+ *    internal upstream nodes have finished, so downstream gen.video still
+ *    sees the freshly-generated gen.image it depends on.
  *  - Edges crossing the Frame boundary don't change the order — the external
  *    node is assumed to already have its output in the store (or it's the
  *    user's responsibility to run it via the cascade button on a child).
  *
  * Live progress is mirrored onto the Frame's own node data
  * (`frameRunning`, `frameRunIndex`, `frameRunTotal`, `frameRunCurrentLabel`)
- * so `FrameNode` can render a counter. `frameRunIndex` is the **completed**
- * count (updated as each gen finishes) and `frameRunCurrentLabel` shows the
- * most recently started gen — or `"${activeCount} đang chạy · ${label}"`
- * when more than one is in flight.
+ * so `FrameNode` can render a counter.
  */
-export async function runFrame(
-  frameId: string,
-  opts?: { maxInFlight?: number },
-): Promise<void> {
-  const maxInFlight = Math.max(1, opts?.maxInFlight ?? FRAME_DEFAULT_MAX_IN_FLIGHT);
-
+export async function runFrame(frameId: string): Promise<void> {
   const store = useWorkflowStore.getState();
   const children = store.nodes.filter((n) => n.parentId === frameId);
   if (!children.length) return;
@@ -673,6 +653,12 @@ export async function runFrame(
   // by insertion order.
   const activeLabels = new Map<string, string>();
 
+  // Per-provider lane state: each provider runs at most 1 gen node at a time.
+  // Nodes without a provider (null) dispatch immediately with no lane check.
+  const laneOccupied = new Map<string, boolean>();
+  laneOccupied.set("veo", false);
+  laneOccupied.set("grok", false);
+
   const markReadyChildren = (parentId: string) => {
     for (const ch of adj.get(parentId) ?? []) {
       const next = (indegree.get(ch) ?? 0) - 1;
@@ -712,6 +698,13 @@ export async function runFrame(
     });
   };
 
+  // Priority: gen.image < gen.video / gen.start-end so images run first
+  // within the same provider lane.
+  const kindPriority = (kind: string): number => {
+    if (kind === "gen.image") return 0;
+    return 1; // gen.video, gen.start-end, etc.
+  };
+
   try {
     await new Promise<void>((resolveAll) => {
       let inFlight = 0;
@@ -719,7 +712,7 @@ export async function runFrame(
       const tryDispatch = () => {
         // Drain content/frame nodes synchronously in every pass — they never
         // enqueue a job but their "done" status might unblock a gen child.
-        for (let i = 0; i < ready.length; ) {
+        for (let i = 0; i < ready.length;) {
           const id = ready[i];
           const node = nodeById.get(id);
           if (!node) {
@@ -741,50 +734,91 @@ export async function runFrame(
           i++;
         }
 
-        while (inFlight < maxInFlight && ready.length > 0) {
-          // Dispatch the next gen node in the ready queue.
-          let pickedIdx = -1;
-          for (let i = 0; i < ready.length; i++) {
-            const node = nodeById.get(ready[i]);
-            if (!node) continue;
-            if (node.data.kind === "frame" || node.data.kind.startsWith("content.")) {
-              // These should have been drained above; guard anyway.
-              continue;
-            }
-            pickedIdx = i;
-            break;
+        // Sort ready gen nodes: image before video (within same provider).
+        ready.sort((a, b) => {
+          const na = nodeById.get(a);
+          const nb = nodeById.get(b);
+          if (!na || !nb) return 0;
+          return kindPriority(na.data.kind) - kindPriority(nb.data.kind);
+        });
+
+        // Dispatch at most one node per free provider lane.
+        // Track which lanes we've already dispatched to in this pass so we
+        // don't double-dispatch when two ready nodes share a provider.
+        const dispatchedLanes = new Set<string>();
+
+        for (let i = 0; i < ready.length;) {
+          const id = ready[i];
+          const node = nodeById.get(id);
+          if (!node) {
+            ready.splice(i, 1);
+            continue;
           }
-          if (pickedIdx < 0) break;
-          const id = ready.splice(pickedIdx, 1)[0];
-          const node = nodeById.get(id)!;
+
+          const provider = providerForNodeData(node.data); // "veo" | "grok" | null
+
+          // Lane check: if this provider lane is occupied → skip
+          if (provider && (laneOccupied.get(provider) || dispatchedLanes.has(provider))) {
+            i++;
+            continue;
+          }
+
+          // Dispatch this node
+          ready.splice(i, 1);
+          if (provider) {
+            laneOccupied.set(provider, true);
+            dispatchedLanes.add(provider);
+          }
 
           inFlight++;
           const label = node.data.label || node.data.kind;
           activeLabels.set(id, label);
           updateCounter();
 
-          void runGenerationById(id)
-            .catch((err) => {
-              // `runGenerationById` already writes status=error via the
-              // executor; this catch is just a safety net so one failed job
-              // doesn't abort the whole scheduler. Log to console so the
-              // developer notices unexpected throws that bypass the normal
-              // error pipeline.
+          // Post-generation "browse pause" range for VEO nodes (ms). Simulates
+          // a human user reviewing the result before starting the next gen.
+          // Combined with the server-side 30s throttle, this creates ~35-47s
+          // total gap between VEO requests — much closer to natural pacing.
+          const POST_GEN_PAUSE_MIN = 5_000;
+          const POST_GEN_PAUSE_MAX = 12_000;
+
+          const runWithPause = async () => {
+            try {
+              await runGenerationById(id);
+            } catch (err) {
               console.error(`[runFrame] ${id} threw:`, err);
-            })
-            .finally(() => {
-              inFlight--;
-              completedGens++;
-              activeLabels.delete(id);
-              pending.delete(id);
-              markReadyChildren(id);
-              updateCounter();
-              if (pending.size === 0 && inFlight === 0) {
-                resolveAll();
-                return;
-              }
-              tryDispatch();
-            });
+            }
+
+            // Post-gen pause: keep the lane occupied a bit longer so the
+            // next VEO request doesn't fire immediately after this one.
+            // Only for VEO — Grok uses its own Chrome session and doesn't
+            // have reCAPTCHA scoring concerns.
+            if (provider === "veo" && pending.size > 0) {
+              const pause = POST_GEN_PAUSE_MIN +
+                Math.floor(Math.random() * (POST_GEN_PAUSE_MAX - POST_GEN_PAUSE_MIN));
+              const node2 = nodeById.get(id);
+              const lbl = node2?.data.label || node2?.data.kind || id;
+              useWorkflowStore.getState().updateNodeData(frameId, {
+                frameRunCurrentLabel: `Đợi ${(pause / 1000).toFixed(0)}s sau ${lbl}…`,
+              });
+              await new Promise((r) => setTimeout(r, pause));
+            }
+
+            inFlight--;
+            completedGens++;
+            if (provider) laneOccupied.set(provider, false);
+            activeLabels.delete(id);
+            pending.delete(id);
+            markReadyChildren(id);
+            updateCounter();
+            if (pending.size === 0 && inFlight === 0) {
+              resolveAll();
+              return;
+            }
+            tryDispatch();
+          };
+
+          void runWithPause();
         }
 
         // Nothing left to do: scheduler can resolve.

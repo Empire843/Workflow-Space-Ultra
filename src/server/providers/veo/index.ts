@@ -13,7 +13,7 @@ import {
 
 import { getCreateImageBatcher, readBatcherConfig } from "./batcher";
 import { bumpAndMaybeClear, preCaptureJitter } from "./captureCounter";
-import { cooldownRemainingMs, recordRecaptchaStrike, waitForCooldown } from "./cooldown";
+import { recordRecaptchaStrike, waitForCooldown } from "./cooldown";
 import {
   isRecaptchaCaptureTimeout,
   isRecaptchaError,
@@ -204,14 +204,18 @@ interface RecaptchaCtx {
 /**
  * Base inter-request spacing (ms). A timing-jitter is applied on top (±
  * `VEO_THROTTLE_JITTER_MS`) so consecutive submissions don't land on
- * exact 20_000ms boundaries — one of the "too-regular" signals
- * reCAPTCHA Enterprise uses to score traffic as non-human.
+ * exact boundaries — one of the "too-regular" signals reCAPTCHA
+ * Enterprise uses to score traffic as non-human.
  *
- * Overridable via `VEO_THROTTLE_MS` (default 20_000) and
- * `VEO_THROTTLE_JITTER_MS` (default 2_500 → ±2.5s window).
+ * Tuned conservatively: real humans spend 30-60s+ between generations
+ * (reviewing results, tweaking prompts). 30s base + ±5s jitter gives a
+ * 25-35s window that looks more natural than the old 17.5-22.5s range.
+ *
+ * Overridable via `VEO_THROTTLE_MS` (default 30_000) and
+ * `VEO_THROTTLE_JITTER_MS` (default 5_000 → ±5s window).
  */
-const VEO_THROTTLE_BASE_MS_DEFAULT = 20_000;
-const VEO_THROTTLE_JITTER_DEFAULT = 2_500;
+const VEO_THROTTLE_BASE_MS_DEFAULT = 30_000;
+const VEO_THROTTLE_JITTER_DEFAULT = 5_000;
 
 function readThrottleBaseMs(): number {
   const raw = Number(process.env.VEO_THROTTLE_MS);
@@ -282,12 +286,6 @@ async function withRecaptcha<T>(
   while (true) {
     attempt++;
     ensureNotCancelled(shouldCancel);
-
-    // Safety-net cooldown only. Happy path never writes to it; if it's set,
-    // safety-net cooldown kicks in)
-    if (cooldownRemainingMs() > 0) {
-      await waitForCooldown(onLog, shouldCancel);
-    }
 
     // Rate-limit consecutive requests to prevent spamming Google.
     // We only wait the main throttle line on attempt 1.
@@ -390,18 +388,16 @@ async function withRecaptcha<T>(
       if (attempt < MAX_RECAPTCHA_ATTEMPTS && isRecaptchaError(err)) {
         ensureNotCancelled(shouldCancel);
         collector.invalidateRecaptchaCache();
-        // Shared cooldown for the whole VEO lane. Concurrent callers
-        // that also hit a 403 in this burst get debounced to a single
-        // strike, and every in-flight attempt (including this one's
-        // next loop iteration) will block on `waitForCooldown` at the
-        // top of the loop until Google's flag cools. Without this, 4
-        // parallel jobs would each climb the retry ladder separately
-        // and keep the account in the penalty box permanently.
+        // Record the strike and wait for the cooldown inline — with the
+        // sequential lane scheduler only 1 VEO job runs at a time, so
+        // there's no need for a proactive gate at the top of the loop.
+        // The cooldown gives Google time to clear its flag before we retry.
         const cd = recordRecaptchaStrike();
         onLog?.(
-          `Lane VEO cooldown ${(cd.delayMs / 1000).toFixed(0)}s (strike #${cd.strikes}) — ` +
-            `đợi trước khi thử lại…`,
+          `Google 403 UNUSUAL_ACTIVITY — cooldown ${(cd.delayMs / 1000).toFixed(0)}s (strike #${cd.strikes})…`,
         );
+        // Wait for the cooldown to expire before trying again.
+        await waitForCooldown(onLog, shouldCancel);
         // Escalation ladder: retry → clearStorage → restartBrowser.
         // `attempt` is 1-based and already incremented, so the NEXT
         // attempt number is what drives the escalation choice here.
@@ -412,16 +408,10 @@ async function withRecaptcha<T>(
         } else if (nextAttempt === 4) {
           onLog?.("Google flag 403 UNUSUAL_ACTIVITY lần 3 — khởi động lại Chrome…");
           await raceCancel(collector.restartBrowser(), shouldCancel);
-          // restartBrowser cleared auth AND wiped the `_pages` map, so we
-          // don't need a separate `invalidatePageForMode(mode)` here —
-          // the next `getPageForMode` will scan a brand-new context and
-          // open a fresh tab anyway. Reload auth from cache.
           const refreshed = await buildBaseAuth(onLog, shouldCancel);
           collector = refreshed.collector;
           auth = refreshed.auth;
           accountType = refreshed.accountType;
-        } else {
-          onLog?.("Google flag 403 — thử lại với token mới…");
         }
         continue;
       }

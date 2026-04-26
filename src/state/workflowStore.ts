@@ -438,6 +438,9 @@ interface WorkflowState {
      * Imagen silently drops them.
      */
     referenceImages?: Array<{ dataUrl: string; mime: string; name?: string }>;
+    /** When true, only gen.image (+ text prompt) nodes are created — no video
+     *  text or gen.video nodes, and no video-related edges. */
+    imageOnly?: boolean;
   }) => void;
   cloneNode: (sourceId: string, offsetIndex: number, extra?: Partial<NodeDataBase>) => WSNode | null;
   updateNodeData: (id: string, data: Partial<NodeDataBase>) => void;
@@ -632,8 +635,11 @@ export const useWorkflowStore = create<WorkflowState>()(
       groupInFrame,
       stylePrefix,
       referenceImages,
+      imageOnly,
     }) => {
-      const n = Math.min(imagePrompts.length, videoPrompts.length);
+      const n = imageOnly
+        ? imagePrompts.length
+        : Math.min(imagePrompts.length, videoPrompts.length);
       if (n === 0) return;
 
       // Layout: 4 columns per scene, stacked vertically.
@@ -651,7 +657,7 @@ export const useWorkflowStore = create<WorkflowState>()(
         aspectRatio === "9:16" ? 440 : aspectRatio === "1:1" ? 320 : 260;
       const FRAME_PAD_X = 40;
       const FRAME_PAD_Y = 60; // extra top padding so the frame title bar doesn't cover row 0
-      const COLS = 4;
+      const COLS = imageOnly ? 2 : 4;
 
       // Optional header row (stylePrefix text + reference upload nodes) — one
       // extra row above all scenes, so everyone downstream inherits them.
@@ -754,9 +760,33 @@ export const useWorkflowStore = create<WorkflowState>()(
           });
         }
 
-        // Reference images: lay out starting from col 2 (col 0 = style text,
-        // col 1 = style gen.image) when style is present, otherwise from col 1.
-        const refStartCol = hasStyle ? 2 : 1;
+        // When there are reference images but no style text, auto-create
+        // a shared gen.image node so references have a target to connect to.
+        // This shared gen.image will fan-out to every scene's gen.image.
+        if (hasRefs && !styleImageId) {
+          styleImageId = uid("node");
+          const imgCol = hasStyle ? 1 : 0;
+          newNodes.push({
+            id: styleImageId,
+            type: "wsNode",
+            position: { x: baseX + imgCol * COL_W, y: headerY },
+            ...(frameId ? { parentId: frameId } : {}),
+            data: {
+              kind: "gen.image",
+              status: "idle",
+              genMode: imageGenMode,
+              label: "Reference Image",
+              aspectRatio,
+            },
+          });
+        }
+
+        // Reference images: connect to the SHARED gen.image node (not to
+        // each scene's gen.image). The shared gen.image already fans out to
+        // every scene gen.image via the styleImageId → genImgId edges below.
+        // Col layout: hasStyle → col0=text, col1=genImg, col2+=refs
+        //             !hasStyle+refs → col0=auto-genImg, col1+=refs
+        const refStartCol = hasStyle ? 2 : (styleImageId ? 1 : 0);
         refs.forEach((ref, idx) => {
           const uploadId = uid("node");
           refUploadIds.push(uploadId);
@@ -782,6 +812,17 @@ export const useWorkflowStore = create<WorkflowState>()(
               imageUrl: ref.dataUrl,
             },
           });
+
+          // Wire ref upload → shared gen.image (not per-scene).
+          if (styleImageId) {
+            newEdges.push({
+              id: uid("edge"),
+              source: uploadId,
+              target: styleImageId,
+              animated: true,
+              style: { stroke: "#ff3c8e" },
+            });
+          }
         });
       }
 
@@ -792,8 +833,8 @@ export const useWorkflowStore = create<WorkflowState>()(
 
         const textImgId = uid("node");
         const genImgId = uid("node");
-        const textVidId = uid("node");
-        const genVidId = uid("node");
+        const textVidId = imageOnly ? null : uid("node");
+        const genVidId = imageOnly ? null : uid("node");
 
         const parentProps = frameId ? { parentId: frameId } : {};
 
@@ -824,38 +865,42 @@ export const useWorkflowStore = create<WorkflowState>()(
           },
         });
 
-        newNodes.push({
-          id: textVidId,
-          type: "wsNode",
-          position: { x: baseX + 2 * COL_W, y },
-          ...parentProps,
-          data: {
-            kind: "content.text",
-            status: "idle",
-            label: `Scene ${i + 1} · Video prompt`,
-            text: vidPrompt,
-          },
-        });
+        if (textVidId) {
+          newNodes.push({
+            id: textVidId,
+            type: "wsNode",
+            position: { x: baseX + 2 * COL_W, y },
+            ...parentProps,
+            data: {
+              kind: "content.text",
+              status: "idle",
+              label: `Scene ${i + 1} · Video prompt`,
+              text: vidPrompt,
+            },
+          });
+        }
 
         // For VEO video we pin the default to the free "Lower Priority" tier
         // so batch imports don't silently burn Fast credits. Grok has its own
         // label set lazily by the inspector. I2V default is used when an image
         // is upstream; here the upstream is always gen.image, so use I2V.
         const isVeoVideo = videoGenMode === "t2v.veo";
-        newNodes.push({
-          id: genVidId,
-          type: "wsNode",
-          position: { x: baseX + 3 * COL_W, y },
-          ...parentProps,
-          data: {
-            kind: "gen.video",
-            status: "idle",
-            genMode: videoGenMode,
-            label: `Scene ${i + 1} · Video`,
-            aspectRatio,
-            ...(isVeoVideo ? { modelLabel: VEO_I2V_DEFAULT_LABEL } : {}),
-          },
-        });
+        if (genVidId) {
+          newNodes.push({
+            id: genVidId,
+            type: "wsNode",
+            position: { x: baseX + 3 * COL_W, y },
+            ...parentProps,
+            data: {
+              kind: "gen.video",
+              status: "idle",
+              genMode: videoGenMode,
+              label: `Scene ${i + 1} · Video`,
+              aspectRatio,
+              ...(isVeoVideo ? { modelLabel: VEO_I2V_DEFAULT_LABEL } : {}),
+            },
+          });
+        }
 
         const edgeStyle = { animated: true, style: { stroke: "#ff3c8e" } };
         // Header-row fan-out FIRST so the shared style text appears at the
@@ -869,12 +914,14 @@ export const useWorkflowStore = create<WorkflowState>()(
             target: genImgId,
             ...edgeStyle,
           });
-          newEdges.push({
-            id: uid("edge"),
-            source: styleTextId,
-            target: genVidId,
-            ...edgeStyle,
-          });
+          if (genVidId) {
+            newEdges.push({
+              id: uid("edge"),
+              source: styleTextId,
+              target: genVidId,
+              ...edgeStyle,
+            });
+          }
         }
         // Style reference image → scene gen.image: the generated style image
         // feeds every scene's gen.image as a reference (Nano Banana identity
@@ -888,37 +935,32 @@ export const useWorkflowStore = create<WorkflowState>()(
             ...edgeStyle,
           });
         }
-        for (const refId of refUploadIds) {
-          // Refs only wire to gen.image: Nano Banana takes them via
-          // `imageInputs`. Feeding them to gen.video would collide with
-          // the I2V start-frame slot, which is already filled by the
-          // scene's own gen.image output via the genImage → genVideo
-          // edge below.
-          newEdges.push({
-            id: uid("edge"),
-            source: refId,
-            target: genImgId,
-            ...edgeStyle,
-          });
-        }
+        // Reference uploads are now wired to the shared gen.image (header
+        // row) instead of each scene's gen.image. The fan-out from shared
+        // gen.image → scene gen.image is handled by the styleImageId edge
+        // above (line ~895-902).
         newEdges.push({
           id: uid("edge"),
           source: textImgId,
           target: genImgId,
           ...edgeStyle,
         });
-        newEdges.push({
-          id: uid("edge"),
-          source: genImgId,
-          target: genVidId,
-          ...edgeStyle,
-        });
-        newEdges.push({
-          id: uid("edge"),
-          source: textVidId,
-          target: genVidId,
-          ...edgeStyle,
-        });
+        if (genVidId) {
+          newEdges.push({
+            id: uid("edge"),
+            source: genImgId,
+            target: genVidId,
+            ...edgeStyle,
+          });
+        }
+        if (textVidId && genVidId) {
+          newEdges.push({
+            id: uid("edge"),
+            source: textVidId,
+            target: genVidId,
+            ...edgeStyle,
+          });
+        }
       }
 
       set({

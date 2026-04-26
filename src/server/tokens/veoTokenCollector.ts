@@ -125,14 +125,51 @@ async function waitForLock(
     }, maxWaitMs);
     const poll = shouldCancel
       ? setInterval(() => {
-          if (shouldCancel()) done(new JobCancelledError());
-        }, 200)
+        if (shouldCancel()) done(new JobCancelledError());
+      }, 200)
       : null;
     previous.then(
       () => done(),
       () => done(), // ignore previous errors; we only care about timing
     );
   });
+}
+
+/**
+ * Sweeps through all VEO UI tabs looking for the marketing landing page
+ * instead of the project editor. If found, automatically clicks the 
+ * "Create with Flow" button to bounce the Chrome tab back into the editor
+ * during background cooldown wait periods.
+ */
+export async function attemptRecoverLandingPage(): Promise<void> {
+  try {
+    const coll = await getVeoCollector();
+    const mainPage = coll.getPage();
+    if (!mainPage) return;
+    const context = mainPage.context();
+    const pages = context.pages();
+    for (const page of pages) {
+      const url = page.url();
+      if (url.includes("labs.google/fx/vi/tools/flow")) {
+        // Find visible "Create with Flow" elements 
+        // We use a broad locator + filter approach because Google's exact DOM structure
+        // frequently changes (span vs div vs button vs link)
+        const btnLocator = page.locator('*:has-text("Create with Flow")').getByRole('button').first();
+        if (await btnLocator.isVisible().catch(() => false)) {
+          await btnLocator.click({ timeout: 2000 }).catch(() => { });
+          continue; // Successfully dispatched
+        }
+
+        const fallbackLocator = page.locator('*:has-text("Create with Flow")').last(); // last usually hits the tightest bounding box element (span or a)
+        if (await fallbackLocator.isVisible().catch(() => false)) {
+          await fallbackLocator.click({ timeout: 2000 }).catch(() => { });
+        }
+      }
+    }
+  } catch (e) {
+    // Suppress all Playwright errors (disconnected context, target closed, navigation)
+    // This runs repeatedly in the background so failures are non-fatal
+  }
 }
 
 function isRecaptchaReload(url: string): boolean {
@@ -627,13 +664,11 @@ export class VeoTokenCollector {
       sessionTelemetry.record({ target: "veo", kind: "cache_stale" });
     }
 
-    // Only navigate to the Flow homepage if we aren't already on a Flow page.
-    // If the user is inside a project (URL: .../flow/project/<id>), leave them
-    // there — that page has everything we need and kicking them out would
-    // create the "verify → bounce to /flow → user re-clicks project → verify
-    // → bounce again" loop we previously had.
+    // Only navigate to a Flow project page if we aren't already on one.
+    // The marketing landing page (labs.google/fx/ without /project/) has NO
+    // __NEXT_DATA__ with session tokens, so we MUST be on a project page.
     const currentUrl = this.page?.url() || "";
-    if (!currentUrl.includes("labs.google/fx/")) {
+    if (!currentUrl.includes("/project/")) {
       await this.ensureOnFlow();
     }
 
@@ -709,9 +744,9 @@ export class VeoTokenCollector {
     if (!this.captureState.accessToken) missing.push("access_token");
     throw new Error(
       `Không bắt được VEO auth sau ${timeoutMs}ms (thiếu: ${missing.join(", ")}). ` +
-        `Hãy mở cửa sổ Chrome VEO, đảm bảo đã login, ở trong 1 project bất kỳ ` +
-        `(labs.google/fx/vi/tools/flow/project/<id>) và thử di chuột/click quanh ` +
-        `UI để kích hoạt telemetry, rồi bấm Verify Now.`
+      `Hãy mở cửa sổ Chrome VEO, đảm bảo đã login, ở trong 1 project bất kỳ ` +
+      `(labs.google/fx/vi/tools/flow/project/<id>) và thử di chuột/click quanh ` +
+      `UI để kích hoạt telemetry, rồi bấm Verify Now.`
     );
   }
 
@@ -860,8 +895,12 @@ export class VeoTokenCollector {
           return "";
         }
       })();
+      // Demand the tab is on an actual Flow *project* page, not just any
+      // labs.google/fx URL — the marketing landing page also matches the
+      // old `labs.google/fx` check but has NO project editor UI, so
+      // recaptcha captures would fail and cascade into 403 strikes.
       const usable =
-        !cached.isClosed() && cachedUrl.includes("labs.google/fx");
+        !cached.isClosed() && cachedUrl.includes("/project/");
       if (usable) return cached;
       this._pages[mode] = undefined;
     }
@@ -876,7 +915,7 @@ export class VeoTokenCollector {
         if (p === this.page) continue; // leave the auth page alone
         if (Object.values(this._pages).includes(p)) continue;
         const url = (p.url() || "").toLowerCase();
-        if (!url.includes("labs.google/fx")) continue;
+        if (!url.includes("/project/")) continue;
         const detected = await this._detectCurrentMode(p, 800).catch(() => null);
         if (detected === mode) {
           console.log(`[VEO] Reusing existing tab for mode=${mode}: ${p.url()}`);
@@ -896,11 +935,15 @@ export class VeoTokenCollector {
         ? `https://labs.google/fx/vi/tools/flow/project/${projectId}`
         : VEO_FLOW_URL;
       try {
-        // Only navigate if the tab isn't already on a Flow page (reused tab
-        // usually is, so we avoid a needless reload that would drop cached UI).
+        // Navigate if the tab isn't on a Flow *project* page. The old check
+        // (`labs.google/fx`) matched the marketing landing page too — tabs
+        // that got redirected there (after clearSiteStorage wiped cookies)
+        // would be reused forever, failing every recaptcha capture and
+        // accumulating 403 strikes. Now we demand `/project/` in the URL.
         const current = (page.url() || "").toLowerCase();
-        const onFlow = current.includes("labs.google/fx");
-        if (!onFlow) {
+        const onProjectPage = current.includes("/project/");
+        if (!onProjectPage) {
+          console.log(`[VEO] Tab is NOT on a project page (${current.slice(0, 100)}), navigating to ${targetUrl}`);
           await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 20_000 });
           await page.waitForTimeout(3500);
         }
@@ -1048,6 +1091,25 @@ export class VeoTokenCollector {
       }
       console.log(`[VEO] Reload tab after clear storage (mode=${mode})`);
       await page.reload({ waitUntil: "domcontentloaded", timeout: 20_000 });
+
+      // After cookies are wiped, Flow often redirects to the marketing
+      // landing page instead of the project editor. If that happened,
+      // re-navigate to the project URL so recaptcha captures don't fail.
+      const afterUrl = (page.url() || "").toLowerCase();
+      if (!afterUrl.includes("/project/")) {
+        const projectId = this.captureState.projectId;
+        const targetUrl = projectId
+          ? `https://labs.google/fx/vi/tools/flow/project/${projectId}`
+          : VEO_FLOW_URL;
+        console.log(`[VEO] Post-clearStorage landing page detected (${afterUrl.slice(0, 100)}), re-navigating to ${targetUrl}`);
+        try {
+          await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 20_000 });
+          await page.waitForTimeout(3500);
+        } catch {
+          // ignore
+        }
+      }
+
       // After a reload the Flow UI comes up on whatever mode was last
       // selected — drop the per-tab "mode-ready" marker so the next
       // recaptcha capture re-verifies the mode and re-applies route
@@ -1265,11 +1327,11 @@ export class VeoTokenCollector {
     optsOrTimeout?:
       | number
       | {
-          timeoutMs?: number;
-          firstUseTimeoutMs?: number;
-          mode?: "video" | "image";
-          shouldCancel?: ShouldCancel;
-        },
+        timeoutMs?: number;
+        firstUseTimeoutMs?: number;
+        mode?: "video" | "image";
+        shouldCancel?: ShouldCancel;
+      },
     legacyMode: "video" | "image" = "video",
     legacyShouldCancel?: ShouldCancel,
   ): Promise<string> {
@@ -1320,7 +1382,7 @@ export class VeoTokenCollector {
     // wait, and the user sees "RUNNING · cancelling… · 800s · 1%"
     // while the executor is pinned waiting for `previous` to resolve.
     const previous = this._recaptchaLock;
-    let release: () => void = () => {};
+    let release: () => void = () => { };
     this._recaptchaLock = new Promise<void>((resolve) => {
       release = resolve;
     });
@@ -1367,9 +1429,9 @@ export class VeoTokenCollector {
         reject(
           new Error(
             `Không bắt được recaptcha token sau ${timeoutMs}ms (mode=${mode}). ` +
-              `Đảm bảo đang ở project page và UI Flow load xong. ` +
-              `Nếu cửa sổ Chrome VEO bị minimize / tab VEO đang là tab nền, ` +
-              `Chrome sẽ throttle grecaptcha → hãy giữ cửa sổ Chrome VEO foreground khi chạy.`
+            `Đảm bảo đang ở project page và UI Flow load xong. ` +
+            `Nếu cửa sổ Chrome VEO bị minimize / tab VEO đang là tab nền, ` +
+            `Chrome sẽ throttle grecaptcha → hãy giữ cửa sổ Chrome VEO foreground khi chạy.`
           )
         );
       }, timeoutMs);

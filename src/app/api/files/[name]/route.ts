@@ -27,7 +27,9 @@ export async function GET(_req: Request, ctx: { params: Promise<{ name: string }
               : "application/octet-stream";
 
     const stream = createReadStream(abs);
-    return new Response(stream as unknown as ReadableStream, {
+    const { Readable } = await import("node:stream");
+    const webStream = Readable.toWeb(stream as any) as ReadableStream;
+    return new Response(webStream, {
       headers: {
         "Content-Type": mime,
         "Content-Length": String(s.size),

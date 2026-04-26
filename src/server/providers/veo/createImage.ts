@@ -76,6 +76,46 @@ function randomSeed(): number {
   return Math.floor(Math.random() * (SEED_MAX + 1));
 }
 
+// UUID regex: 8-4-4-4-12 hex chars
+const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+
+/**
+ * Convert a media ID to a plain UUID suitable for `imageInputs[].name`.
+ *
+ * - Generated images already have plain UUID format → pass through.
+ * - Uploaded images return CAM-prefixed base64 protobuf strings that embed
+ *   one or more UUIDs. We decode the base64 → extract the first UUID.
+ *
+ * Without this conversion, `batchGenerateImages` returns 500 INTERNAL when
+ * receiving the full CAM-xxx string as `name`.
+ */
+function resolveNameForImageInput(mediaId: string): string {
+  // Already a plain UUID?
+  if (UUID_RE.test(mediaId) && mediaId.length <= 40) return mediaId;
+
+  // CAM-prefixed: decode base64 protobuf → extract UUID
+  // The protobuf contains 2 UUIDs: field 3 = media ID, field 5 = asset name.
+  // imageInputs[].name needs the LAST UUID (project-scoped asset name).
+  if (mediaId.startsWith("CAM")) {
+    try {
+      const decoded = Buffer.from(mediaId, "base64").toString("utf8");
+      const allMatches = [...decoded.matchAll(new RegExp(UUID_RE, "gi"))];
+      if (allMatches.length > 0) {
+        // Use the LAST UUID found (field 5 = asset name)
+        const uuid = allMatches[allMatches.length - 1][0];
+        console.log(`[VEO] Extracted UUID from CAM id: ${uuid} (${allMatches.length} UUIDs found, using last; from ${mediaId.slice(0, 30)}…)`);
+        return uuid;
+      }
+    } catch {
+      // fall through
+    }
+  }
+
+  // Fallback: return as-is (will likely fail but at least the error is visible)
+  console.warn(`[VEO] Could not extract UUID from mediaId: ${mediaId.slice(0, 40)}…`);
+  return mediaId;
+}
+
 export function buildCreateImagePayload(opts: CreateImageOptions) {
   const {
     prompt,
@@ -107,9 +147,9 @@ export function buildCreateImagePayload(opts: CreateImageOptions) {
   //                structuredPrompt.parts[].text, seed, imageInputs[]
   //   imageInputs[i]: { imageInputType: "IMAGE_INPUT_TYPE_REFERENCE", name: <uuid> }
   //
-  // `name` is the plain UUID identifier of a previously-seen Flow media asset
-  // (returned by both `batchGenerateImages` responses — under `name`/`mediaId` —
-  // and `uploadUserImage` responses — nested under `mediaGenerationId`).
+  // `name` is the plain UUID identifier of a previously-seen Flow media asset.
+  // Generated images return plain UUIDs directly. Upload responses return
+  // CAM-prefixed base64 protobuf strings that EMBED a UUID — we extract it.
   //
   // Rejected shapes (do NOT bring these back without re-capturing a new UI payload):
   //   top-of-request:      imageGenerationRequestData | requestData | imageGenerationImageInputs
@@ -119,9 +159,9 @@ export function buildCreateImagePayload(opts: CreateImageOptions) {
   const refs = opts.referenceImages ?? [];
   const referenceItems = supportsRef
     ? refs.map((r) => ({
-        imageInputType: r.imageInputType || "IMAGE_INPUT_TYPE_REFERENCE",
-        name: r.mediaGenerationId,
-      }))
+      imageInputType: r.imageInputType || "IMAGE_INPUT_TYPE_REFERENCE",
+      name: resolveNameForImageInput(r.mediaGenerationId),
+    }))
     : [];
 
   const count = outputCount > 0 ? outputCount : 1;

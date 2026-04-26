@@ -389,7 +389,6 @@ async function runVeoCreateImage(
       if (r.ok) {
         referenceImages.push({
           mediaGenerationId: r.mediaGenerationId,
-          imageInputType: "IMAGE_INPUT_TYPE_REFERENCE",
         });
       }
     }

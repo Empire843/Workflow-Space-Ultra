@@ -69,6 +69,7 @@ export default function ScenesImportDialog({ flowX, flowY, onClose, initialState
   const [imageGenMode, setImageGenMode] = useState<ImageGenModeOpt>("t2i.veo");
   const [videoGenMode, setVideoGenMode] = useState<VideoGenModeOpt>("t2v.veo");
   const [groupInFrame, setGroupInFrame] = useState(true);
+  const [imageOnly, setImageOnly] = useState(false);
   /**
    * One-prompt-video mode: nhập 1 prompt video duy nhất, áp dụng cho tất cả
    * scene. Scene count lúc này = số dòng image prompt. Cover trường hợp phổ
@@ -103,19 +104,24 @@ export default function ScenesImportDialog({ flowX, flowY, onClose, initialState
   const videoSingleText = videoText.trim();
 
   const imgCount = imagePrompts.length;
-  const vidCount = oneVideoPrompt
-    ? videoSingleText
-      ? 1
-      : 0
-    : videoLinePrompts.length;
+  const vidCount = imageOnly
+    ? 0
+    : oneVideoPrompt
+      ? videoSingleText
+        ? 1
+        : 0
+      : videoLinePrompts.length;
   // Mismatch only matters in per-line mode; single mode maps 1 prompt → N.
-  const mismatch = oneVideoPrompt ? false : imgCount !== vidCount;
-  const empty = imgCount === 0 && vidCount === 0;
-  const n = oneVideoPrompt
-    ? videoSingleText
-      ? imgCount
-      : 0
-    : Math.min(imgCount, videoLinePrompts.length);
+  // imageOnly skips video entirely so mismatch is irrelevant.
+  const mismatch = imageOnly ? false : oneVideoPrompt ? false : imgCount !== vidCount;
+  const empty = imageOnly ? imgCount === 0 : imgCount === 0 && vidCount === 0;
+  const n = imageOnly
+    ? imgCount
+    : oneVideoPrompt
+      ? videoSingleText
+        ? imgCount
+        : 0
+      : Math.min(imgCount, videoLinePrompts.length);
   const canConfirm = !empty && !mismatch && n > 0;
   const tooMany = n > 50;
 
@@ -175,12 +181,13 @@ export default function ScenesImportDialog({ flowX, flowY, onClose, initialState
     if (!canConfirm) return;
     importScenes({
       imagePrompts,
-      videoPrompts: effectiveVideoPrompts,
+      videoPrompts: imageOnly ? [] : effectiveVideoPrompts,
       imageGenMode: imageGenMode as GenMode,
       videoGenMode: videoGenMode as GenMode,
       aspectRatio,
       anchor: { x: flowX, y: flowY },
       groupInFrame,
+      imageOnly,
       stylePrefix: stylePrefix.trim() || undefined,
       referenceImages: refImages.length
         ? refImages.map((r) => ({ dataUrl: r.dataUrl, mime: r.mime, name: r.name }))
@@ -215,6 +222,7 @@ export default function ScenesImportDialog({ flowX, flowY, onClose, initialState
     stylePrefix,
     refImages,
     oneVideoPrompt,
+    imageOnly,
     aspectRatio,
   ]);
 
@@ -246,9 +254,11 @@ export default function ScenesImportDialog({ flowX, flowY, onClose, initialState
             Import scenes from prompts
           </div>
           <div className="ml-2 text-[11px] text-[color:var(--color-fg-dim)]">
-            {oneVideoPrompt
-              ? "Image: 1 dòng = 1 scene · Video: 1 prompt chung"
-              : "Mỗi dòng = 1 scene · Số dòng 2 ô phải bằng nhau"}
+            {imageOnly
+              ? "Image only · Mỗi dòng = 1 scene · Không tạo video"
+              : oneVideoPrompt
+                ? "Image: 1 dòng = 1 scene · Video: 1 prompt chung"
+                : "Mỗi dòng = 1 scene · Số dòng 2 ô phải bằng nhau"}
           </div>
           <button
             type="button"
@@ -260,7 +270,7 @@ export default function ScenesImportDialog({ flowX, flowY, onClose, initialState
           </button>
         </div>
 
-        <div className="flex-1 min-h-0 p-4 grid grid-cols-2 gap-4">
+        <div className={cn("flex-1 min-h-0 p-4 grid gap-4", imageOnly ? "grid-cols-1" : "grid-cols-2")}>
           <PromptColumn
             label="Image prompts"
             hint="Prompt tạo ảnh (1 dòng / scene)"
@@ -270,24 +280,26 @@ export default function ScenesImportDialog({ flowX, flowY, onClose, initialState
             countMismatch={mismatch}
             textareaRef={imageFirstTextareaRef}
           />
-          <PromptColumn
-            label={oneVideoPrompt ? "Video prompt (1 chung)" : "Video prompts"}
-            hint={
-              oneVideoPrompt
-                ? `Áp dụng cho cả ${Math.max(imgCount, 1)} scene`
-                : "Prompt chuyển động video (1 dòng / scene)"
-            }
-            value={videoText}
-            onChange={setVideoText}
-            count={vidCount}
-            countLabel={oneVideoPrompt ? (videoSingleText ? "✓" : "—") : undefined}
-            countMismatch={mismatch}
-            placeholderOverride={
-              oneVideoPrompt
-                ? "VD: Camera slowly dollies in, subtle breathing motion, cinematic 24 fps."
-                : undefined
-            }
-          />
+          {!imageOnly && (
+            <PromptColumn
+              label={oneVideoPrompt ? "Video prompt (1 chung)" : "Video prompts"}
+              hint={
+                oneVideoPrompt
+                  ? `Áp dụng cho cả ${Math.max(imgCount, 1)} scene`
+                  : "Prompt chuyển động video (1 dòng / scene)"
+              }
+              value={videoText}
+              onChange={setVideoText}
+              count={vidCount}
+              countLabel={oneVideoPrompt ? (videoSingleText ? "✓" : "—") : undefined}
+              countMismatch={mismatch}
+              placeholderOverride={
+                oneVideoPrompt
+                  ? "VD: Camera slowly dollies in, subtle breathing motion, cinematic 24 fps."
+                  : undefined
+              }
+            />
+          )}
         </div>
 
         {/* Consistency tools — shared style text + reference images.
@@ -437,17 +449,19 @@ export default function ScenesImportDialog({ flowX, flowY, onClose, initialState
             </select>
           </label>
 
-          <label className="flex items-center gap-1.5 text-xs text-[color:var(--color-fg)]">
-            <span className="text-[color:var(--color-fg-muted)]">Video:</span>
-            <select
-              value={videoGenMode}
-              onChange={(e) => setVideoGenMode(e.target.value as VideoGenModeOpt)}
-              className="h-7 px-2 rounded-md bg-[color:var(--color-bg-elev-2)] border border-[color:var(--color-border)] text-xs outline-none focus:border-[color:var(--color-accent)]"
-            >
-              <option value="t2v.veo">VEO · Text/Image → Video</option>
-              <option value="t2v.grok">Grok · Text/Image → Video</option>
-            </select>
-          </label>
+          {!imageOnly && (
+            <label className="flex items-center gap-1.5 text-xs text-[color:var(--color-fg)]">
+              <span className="text-[color:var(--color-fg-muted)]">Video:</span>
+              <select
+                value={videoGenMode}
+                onChange={(e) => setVideoGenMode(e.target.value as VideoGenModeOpt)}
+                className="h-7 px-2 rounded-md bg-[color:var(--color-bg-elev-2)] border border-[color:var(--color-border)] text-xs outline-none focus:border-[color:var(--color-accent)]"
+              >
+                <option value="t2v.veo">VEO · Text/Image → Video</option>
+                <option value="t2v.grok">Grok · Text/Image → Video</option>
+              </select>
+            </label>
+          )}
 
           <label
             className="flex items-center gap-1.5 text-xs text-[color:var(--color-fg)]"
@@ -479,16 +493,31 @@ export default function ScenesImportDialog({ flowX, flowY, onClose, initialState
 
           <label
             className="flex items-center gap-1.5 text-xs text-[color:var(--color-fg)] select-none cursor-pointer"
-            title="Dùng chung 1 prompt video cho tất cả scene thay vì 1 prompt / scene"
+            title="Chỉ tạo node Image, bỏ qua Video"
           >
             <input
               type="checkbox"
-              checked={oneVideoPrompt}
-              onChange={(e) => setOneVideoPrompt(e.target.checked)}
+              checked={imageOnly}
+              onChange={(e) => setImageOnly(e.target.checked)}
               className="accent-[color:var(--color-accent)]"
             />
-            One prompt video
+            Image only
           </label>
+
+          {!imageOnly && (
+            <label
+              className="flex items-center gap-1.5 text-xs text-[color:var(--color-fg)] select-none cursor-pointer"
+              title="Dùng chung 1 prompt video cho tất cả scene thay vì 1 prompt / scene"
+            >
+              <input
+                type="checkbox"
+                checked={oneVideoPrompt}
+                onChange={(e) => setOneVideoPrompt(e.target.checked)}
+                className="accent-[color:var(--color-accent)]"
+              />
+              One prompt video
+            </label>
+          )}
 
           {mismatch && !empty && (
             <div className="flex items-center gap-1.5 text-[11px] text-red-400">
@@ -502,7 +531,7 @@ export default function ScenesImportDialog({ flowX, flowY, onClose, initialState
               Sắp tạo {n * 4} node — chắc chứ?
             </div>
           )}
-          {veoSquareFallback && (
+          {veoSquareFallback && !imageOnly && (
             <div
               className="flex items-center gap-1.5 text-[11px] text-amber-400"
               title="Đổi Video sang Grok nếu muốn video 1:1 thật sự."

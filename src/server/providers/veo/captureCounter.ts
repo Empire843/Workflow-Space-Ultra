@@ -41,7 +41,7 @@ function getCaptureCounter(): CaptureCounterState {
   return g[KEY]!;
 }
 
-const VEO_CLEAR_EVERY_DEFAULT = 6;
+const VEO_CLEAR_EVERY_DEFAULT = 4;
 export function readClearEvery(): number {
   const raw = Number(process.env.VEO_CLEAR_STORAGE_EVERY);
   if (!Number.isFinite(raw)) return VEO_CLEAR_EVERY_DEFAULT;
@@ -101,8 +101,7 @@ export async function bumpAndMaybeClear(
     await raceCancel(collector.clearSiteStorage(mode), shouldCancel);
   } catch (err) {
     onLog?.(
-      `Proactive clear failed (non-fatal): ${
-        err instanceof Error ? err.message.slice(0, 120) : String(err).slice(0, 120)
+      `Proactive clear failed (non-fatal): ${err instanceof Error ? err.message.slice(0, 120) : String(err).slice(0, 120)
       }`,
     );
   }
