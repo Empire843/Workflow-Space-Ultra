@@ -18,6 +18,7 @@ export interface AnalyzeVideoDialogProps {
   onResult: (result: {
     imagePrompts: string;
     videoPrompts: string;
+    scriptPrompts?: string;
     aspectRatio: "16:9" | "9:16" | "1:1";
     sharedStyle?: string;
   }) => void;
@@ -154,10 +155,14 @@ export default function AnalyzeVideoDialog({ onClose, onResult }: AnalyzeVideoDi
     const videoPrompts = (data.scenes || [])
       .map((s) => s.videoPrompt)
       .join("\n");
+    const scriptPrompts = (data.scenes || [])
+      .map((s) => s.narration || "")
+      .join("\n");
 
     onResult({
       imagePrompts,
       videoPrompts,
+      scriptPrompts,
       aspectRatio: data.aspectRatio || "16:9",
       sharedStyle: data.sharedStyle || undefined,
     });

@@ -52,7 +52,7 @@ const s = (n: number) => n * 1000;
  *          enough; let a little more time pass.
  *  - 120s / 240s / 300s → account is clearly being watched; stop poking.
  */
-const STRIKE_DELAYS_MS = [s(30), s(60), s(60), s(60), s(60)];
+const STRIKE_DELAYS_MS = [s(30), s(30), s(30), s(30), s(60)];
 
 /**
  * If no new strike happens for this long, reset the escalation counter. We

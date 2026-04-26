@@ -441,6 +441,10 @@ interface WorkflowState {
     /** When true, only gen.image (+ text prompt) nodes are created — no video
      *  text or gen.video nodes, and no video-related edges. */
     imageOnly?: boolean;
+    /** Per-scene script/narration text. When present, each scene gets an
+     *  additional standalone `content.text` node at the end of the row.
+     *  NOT connected to any gen nodes — purely informational reference. */
+    scriptPrompts?: string[];
   }) => void;
   cloneNode: (sourceId: string, offsetIndex: number, extra?: Partial<NodeDataBase>) => WSNode | null;
   updateNodeData: (id: string, data: Partial<NodeDataBase>) => void;
@@ -636,6 +640,7 @@ export const useWorkflowStore = create<WorkflowState>()(
       stylePrefix,
       referenceImages,
       imageOnly,
+      scriptPrompts,
     }) => {
       const n = imageOnly
         ? imagePrompts.length
@@ -657,7 +662,8 @@ export const useWorkflowStore = create<WorkflowState>()(
         aspectRatio === "9:16" ? 440 : aspectRatio === "1:1" ? 320 : 260;
       const FRAME_PAD_X = 40;
       const FRAME_PAD_Y = 60; // extra top padding so the frame title bar doesn't cover row 0
-      const COLS = imageOnly ? 2 : 4;
+      const hasScript = (scriptPrompts ?? []).length > 0;
+      const COLS = (imageOnly ? 2 : 4) + (hasScript ? 1 : 0);
 
       // Optional header row (stylePrefix text + reference upload nodes) — one
       // extra row above all scenes, so everyone downstream inherits them.
@@ -959,6 +965,26 @@ export const useWorkflowStore = create<WorkflowState>()(
             source: textVidId,
             target: genVidId,
             ...edgeStyle,
+          });
+        }
+
+        // Script node: standalone content.text at the end of the row.
+        // Not wired to any gen node — purely informational reference
+        // (for voiceover / narration / screenplay context).
+        const scriptText = scriptPrompts?.[i];
+        if (hasScript && scriptText != null) {
+          const scriptCol = imageOnly ? 2 : 4;
+          newNodes.push({
+            id: uid("node"),
+            type: "wsNode",
+            position: { x: baseX + scriptCol * COL_W, y },
+            ...parentProps,
+            data: {
+              kind: "content.text",
+              status: "idle",
+              label: `Scene ${i + 1} · Script`,
+              text: scriptText,
+            },
           });
         }
       }

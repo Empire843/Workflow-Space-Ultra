@@ -1,11 +1,13 @@
 "use client";
 
-import { AlertTriangle, ChevronRight, ListPlus, Paperclip, Sparkles, X } from "lucide-react";
+import { AlertTriangle, ChevronRight, FileText, ListPlus, Paperclip, Sparkles, X, History, Mic, Loader2, Package, Download } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import type { GenMode } from "@/lib/nodes";
 import { cn } from "@/lib/utils";
 import { useWorkflowStore } from "@/state/workflowStore";
+import { useImportHistory } from "@/hooks/useImportHistory";
+import { DEFAULT_TTS_LANGUAGE, DEFAULT_TTS_VOICE, GEMINI_TTS_LANGUAGES, GEMINI_TTS_VOICES, type GeminiTtsVoice } from "@/lib/tts";
 
 export interface ScenesImportDialogProps {
   /** React Flow world coordinates — anchor for the top-left of the spawned batch (or Frame). */
@@ -16,6 +18,7 @@ export interface ScenesImportDialogProps {
   initialState?: {
     imagePrompts: string;
     videoPrompts: string;
+    scriptPrompts?: string;
     aspectRatio: "16:9" | "9:16" | "1:1";
     sharedStyle?: string;
   };
@@ -66,10 +69,12 @@ export default function ScenesImportDialog({ flowX, flowY, onClose, initialState
 
   const [imageText, setImageText] = useState(initialState?.imagePrompts ?? "");
   const [videoText, setVideoText] = useState(initialState?.videoPrompts ?? "");
+  const [scriptText, setScriptText] = useState(initialState?.scriptPrompts ?? "");
   const [imageGenMode, setImageGenMode] = useState<ImageGenModeOpt>("t2i.veo");
   const [videoGenMode, setVideoGenMode] = useState<VideoGenModeOpt>("t2v.veo");
   const [groupInFrame, setGroupInFrame] = useState(true);
   const [imageOnly, setImageOnly] = useState(false);
+  const [includeScript, setIncludeScript] = useState(!!initialState?.scriptPrompts);
   /**
    * One-prompt-video mode: nhập 1 prompt video duy nhất, áp dụng cho tất cả
    * scene. Scene count lúc này = số dòng image prompt. Cover trường hợp phổ
@@ -92,6 +97,16 @@ export default function ScenesImportDialog({ flowX, flowY, onClose, initialState
 
   const imageFirstTextareaRef = useRef<HTMLTextAreaElement>(null);
 
+  const { history, saveHistory, deleteHistory, loaded: historyLoaded } = useImportHistory();
+  const [showHistory, setShowHistory] = useState(false);
+
+  // TTS States
+  const [voice, setVoice] = useState<GeminiTtsVoice>(DEFAULT_TTS_VOICE);
+  const [language, setLanguage] = useState<string>(DEFAULT_TTS_LANGUAGE);
+  const [ttsItems, setTtsItems] = useState<{ index: number; audioDataUrl: string; mimeType: string; bytes: number }[] | null>(null);
+  const [ttsError, setTtsError] = useState<string | null>(null);
+  const [ttsPhase, setTtsPhase] = useState<"idle" | "generating" | "done">("idle");
+
   useEffect(() => {
     imageFirstTextareaRef.current?.focus();
   }, []);
@@ -102,6 +117,8 @@ export default function ScenesImportDialog({ flowX, flowY, onClose, initialState
   // once `n` is known.
   const videoLinePrompts = useMemo(() => splitPrompts(videoText), [videoText]);
   const videoSingleText = videoText.trim();
+  const scriptPrompts = useMemo(() => splitPrompts(scriptText), [scriptText]);
+  const scriptCount = includeScript ? scriptPrompts.length : 0;
 
   const imgCount = imagePrompts.length;
   const vidCount = imageOnly
@@ -113,7 +130,9 @@ export default function ScenesImportDialog({ flowX, flowY, onClose, initialState
       : videoLinePrompts.length;
   // Mismatch only matters in per-line mode; single mode maps 1 prompt → N.
   // imageOnly skips video entirely so mismatch is irrelevant.
-  const mismatch = imageOnly ? false : oneVideoPrompt ? false : imgCount !== vidCount;
+  const videoMismatch = imageOnly ? false : oneVideoPrompt ? false : imgCount !== vidCount;
+  const scriptMismatch = includeScript && scriptCount > 0 && scriptCount !== imgCount;
+  const mismatch = videoMismatch || scriptMismatch;
   const empty = imageOnly ? imgCount === 0 : imgCount === 0 && vidCount === 0;
   const n = imageOnly
     ? imgCount
@@ -177,8 +196,80 @@ export default function ScenesImportDialog({ flowX, flowY, onClose, initialState
     ? "Sẽ được gắn làm reference cho MỌI node Image. Chỉ Nano Banana 2 / pro dùng; Imagen 4 sẽ bỏ qua."
     : "Upload 1–3 ảnh character / style / setting. Mỗi gen.image sẽ nhận tất cả ảnh này làm reference.";
 
+  async function handleGenerateTts() {
+    if (!scriptPrompts || scriptPrompts.length === 0) return;
+    setTtsPhase("generating");
+    setTtsError(null);
+    setTtsItems(null);
+
+    try {
+      const scenes = scriptPrompts
+        .map((narration, i) => ({ index: i, narration: narration.trim() }))
+        .filter((s) => s.narration !== "");
+
+      if (scenes.length === 0) {
+        setTtsError("Không có kịch bản nào để sinh TTS.");
+        setTtsPhase("idle");
+        return;
+      }
+
+      const res = await fetch("/api/tts/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ scenes, voice, language }),
+      });
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+        setTtsError(err.error || `Lỗi ${res.status}`);
+        setTtsPhase("idle");
+        return;
+      }
+
+      const data = (await res.json()) as { items: { index: number; audioDataUrl: string; mimeType: string; bytes: number }[] };
+      setTtsItems(data.items);
+      setTtsPhase("done");
+    } catch (err) {
+      setTtsError(err instanceof Error ? err.message : String(err));
+      setTtsPhase("idle");
+    }
+  }
+
+  async function handleDownloadZip() {
+    if (!scriptPrompts || scriptPrompts.length === 0) return;
+    const scenes = scriptPrompts
+      .map((narration, i) => ({ index: i, narration: narration.trim() }))
+      .filter((s) => s.narration !== "");
+    if (scenes.length === 0) return;
+
+    const res = await fetch("/api/tts/generate?format=zip", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ scenes, voice, language }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+      setTtsError(err.error || `Lỗi ${res.status}`);
+      return;
+    }
+    const blob = await res.blob();
+    triggerBlobDownload(blob, "tts-scenes.zip");
+  }
+
   function handleConfirm() {
     if (!canConfirm) return;
+
+    saveHistory({
+      imagePrompts: imageText,
+      videoPrompts: imageOnly ? "" : videoText,
+      scriptPrompts: includeScript ? scriptText : undefined,
+      imageGenMode: imageGenMode as GenMode,
+      videoGenMode: videoGenMode as GenMode,
+      aspectRatio,
+      groupInFrame,
+      imageOnly,
+      stylePrefix: stylePrefix.trim() || undefined,
+    });
     importScenes({
       imagePrompts,
       videoPrompts: imageOnly ? [] : effectiveVideoPrompts,
@@ -192,6 +283,7 @@ export default function ScenesImportDialog({ flowX, flowY, onClose, initialState
       referenceImages: refImages.length
         ? refImages.map((r) => ({ dataUrl: r.dataUrl, mime: r.mime, name: r.name }))
         : undefined,
+      scriptPrompts: includeScript && scriptPrompts.length > 0 ? scriptPrompts : undefined,
     });
     onClose();
   }
@@ -253,7 +345,70 @@ export default function ScenesImportDialog({ flowX, flowY, onClose, initialState
           <div className="text-sm font-semibold text-[color:var(--color-fg)]">
             Import scenes from prompts
           </div>
-          <div className="ml-2 text-[11px] text-[color:var(--color-fg-dim)]">
+          {historyLoaded && (
+            <div className="relative ml-2">
+              <button
+                type="button"
+                onClick={() => setShowHistory(!showHistory)}
+                className="flex items-center gap-1.5 px-2 py-1 text-[11px] font-medium text-[color:var(--color-fg-muted)] bg-[color:var(--color-bg-elev-2)] hover:text-[color:var(--color-fg)] border border-[color:var(--color-border)] rounded-md transition-colors"
+                title="Sử dụng lại các thông số import đã từng chạy"
+              >
+                <History className="h-3 w-3" />
+                History
+              </button>
+              {showHistory && (
+                <div className="absolute top-full left-0 mt-1 z-[100] w-72 max-h-64 overflow-y-auto bg-[color:var(--color-bg-elev-2)] border border-[color:var(--color-border)] shadow-xl rounded-md py-1 custom-scrollbar">
+                  {history.length === 0 ? (
+                    <div className="px-3 py-4 text-xs text-center text-[color:var(--color-fg-dim)]">
+                      Chưa có lịch sử import nào.
+                    </div>
+                  ) : (
+                    history.map((h) => (
+                      <div key={h.id} className="relative group">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const conf = h.data;
+                            setImageText(conf.imagePrompts);
+                            setVideoText(conf.videoPrompts);
+                            setScriptText(conf.scriptPrompts || "");
+                            setIncludeScript(!!conf.scriptPrompts);
+                            setImageGenMode(conf.imageGenMode as ImageGenModeOpt);
+                            setVideoGenMode(conf.videoGenMode as VideoGenModeOpt);
+                            setAspectRatio(conf.aspectRatio);
+                            setGroupInFrame(conf.groupInFrame);
+                            setImageOnly(conf.imageOnly);
+                            if (conf.stylePrefix) {
+                              setStylePrefix(conf.stylePrefix);
+                              setConsistencyOpen(true);
+                            }
+                            setShowHistory(false);
+                          }}
+                          className="w-full text-left px-3 py-2 pr-8 text-xs text-[color:var(--color-fg-dim)] hover:bg-[color:var(--color-bg-base)] hover:text-[color:var(--color-fg)] border-b border-[color:var(--color-border)] last:border-0"
+                        >
+                          <div className="font-medium text-[color:var(--color-fg)] truncate" title={h.label}>{h.label}</div>
+                          <div className="flex gap-2 text-[10px] mt-1 text-[color:var(--color-fg-muted)]">
+                            <span>{h.data.imagePrompts.split(/\r?\n/).filter(x => x.trim()).length} scene(s)</span>
+                            <span>•</span>
+                            <span>{h.data.aspectRatio}</span>
+                            {h.data.scriptPrompts && <span className="text-purple-400 font-medium">• TTS</span>}
+                          </div>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={(e) => { e.stopPropagation(); deleteHistory(h.id); }}
+                          className="absolute right-2 top-2 p-1 rounded hover:bg-[color:var(--color-bg-elev-3)] text-[color:var(--color-fg-muted)] hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity"
+                          title="Xóa lịch sử này"
+                        >
+                          <X className="h-3 w-3" />
+                        </button>
+                      </div>
+                    )))}
+                </div>
+              )}
+            </div>
+          )}
+          <div className="ml-auto flex items-center text-[11px] text-[color:var(--color-fg-dim)]">
             {imageOnly
               ? "Image only · Mỗi dòng = 1 scene · Không tạo video"
               : oneVideoPrompt
@@ -270,14 +425,19 @@ export default function ScenesImportDialog({ flowX, flowY, onClose, initialState
           </button>
         </div>
 
-        <div className={cn("flex-1 min-h-0 p-4 grid gap-4", imageOnly ? "grid-cols-1" : "grid-cols-2")}>
+        <div className={cn(
+          "flex-1 min-h-0 p-4 grid gap-4",
+          includeScript
+            ? imageOnly ? "grid-cols-2" : "grid-cols-3"
+            : imageOnly ? "grid-cols-1" : "grid-cols-2",
+        )}>
           <PromptColumn
             label="Image prompts"
             hint="Prompt tạo ảnh (1 dòng / scene)"
             value={imageText}
             onChange={setImageText}
             count={imgCount}
-            countMismatch={mismatch}
+            countMismatch={videoMismatch}
             textareaRef={imageFirstTextareaRef}
           />
           {!imageOnly && (
@@ -292,7 +452,7 @@ export default function ScenesImportDialog({ flowX, flowY, onClose, initialState
               onChange={setVideoText}
               count={vidCount}
               countLabel={oneVideoPrompt ? (videoSingleText ? "✓" : "—") : undefined}
-              countMismatch={mismatch}
+              countMismatch={videoMismatch}
               placeholderOverride={
                 oneVideoPrompt
                   ? "VD: Camera slowly dollies in, subtle breathing motion, cinematic 24 fps."
@@ -300,7 +460,96 @@ export default function ScenesImportDialog({ flowX, flowY, onClose, initialState
               }
             />
           )}
+          {includeScript && (
+            <PromptColumn
+              label="Script / Kịch bản"
+              hint="Lời thoại / voiceover (1 dòng / scene)"
+              value={scriptText}
+              onChange={setScriptText}
+              count={scriptCount}
+              countMismatch={scriptMismatch}
+              placeholderOverride={"Scene 1 narration…\nScene 2 narration…\nScene 3 narration…"}
+            />
+          )}
         </div>
+
+        {includeScript && (
+          <div className="border-t border-[color:var(--color-border)] bg-[color:var(--color-bg-elev-2)] px-4 py-3 flex flex-col gap-3">
+            <div className="flex items-center flex-wrap gap-x-4 gap-y-2">
+              <div className="flex items-center gap-2">
+                <Mic className="h-4 w-4 text-purple-400" />
+                <span className="text-xs font-semibold text-[color:var(--color-fg)]">TTS Generation</span>
+              </div>
+
+              <div className="h-4 w-px bg-[color:var(--color-border)] hidden sm:block" />
+
+              <select
+                value={voice}
+                onChange={(e) => setVoice(e.target.value as GeminiTtsVoice)}
+                className="h-7 rounded-sm border border-[color:var(--color-border)] bg-[color:var(--color-bg-base)] px-2 text-xs text-[color:var(--color-fg)] outline-none focus:border-[color:var(--color-accent)] focus:ring-1 focus:ring-[color:var(--color-accent)]"
+              >
+                {GEMINI_TTS_VOICES.map((v) => (
+                  <option key={v} value={v}>
+                    {v}
+                  </option>
+                ))}
+              </select>
+
+              <select
+                value={language}
+                onChange={(e) => setLanguage(e.target.value)}
+                className="h-7 rounded-sm border border-[color:var(--color-border)] bg-[color:var(--color-bg-base)] px-2 text-xs text-[color:var(--color-fg)] outline-none focus:border-[color:var(--color-accent)] focus:ring-1 focus:ring-[color:var(--color-accent)]"
+              >
+                {GEMINI_TTS_LANGUAGES.map((l) => (
+                  <option key={l.value} value={l.value}>{l.label}</option>
+                ))}
+              </select>
+
+              <button
+                type="button"
+                onClick={handleGenerateTts}
+                disabled={ttsPhase === "generating" || scriptCount === 0}
+                className="sm:ml-auto inline-flex items-center gap-1.5 rounded-md bg-purple-500/10 px-3 py-1.5 text-xs font-medium text-purple-400 hover:bg-purple-500/20 disabled:opacity-50 transition-colors"
+                title="Sinh file âm thanh TTS cho từng scene (bỏ qua dòng trống). Sau đó có thể tải về dạng ZIP."
+              >
+                {ttsPhase === "generating" ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Package className="h-3.5 w-3.5" />
+                )}
+                {ttsPhase === "generating" ? "Generating..." : "Generate TTS"}
+              </button>
+
+              {ttsItems && ttsPhase === "done" && (
+                <button
+                  type="button"
+                  onClick={handleDownloadZip}
+                  className="inline-flex items-center gap-1.5 rounded-md bg-[color:var(--color-bg-elev-3)] px-3 py-1.5 text-xs font-medium text-[color:var(--color-fg)] hover:text-white transition-colors border border-[color:var(--color-border)]"
+                >
+                  <Download className="h-3.5 w-3.5" />
+                  Download ZIP
+                </button>
+              )}
+            </div>
+
+            {ttsError && (
+              <div className="rounded-md bg-red-500/10 p-2 text-[11px] text-red-400">
+                Lỗi TTS: {ttsError}
+              </div>
+            )}
+
+            {ttsItems && ttsPhase === "done" && (
+              <div className="flex items-center gap-3 overflow-x-auto pb-1 custom-scrollbar">
+                {ttsItems.map((item, i) => (
+                  <div key={i} className="shrink-0 flex items-center gap-2 bg-[color:var(--color-bg-base)] rounded px-2 py-1 border border-[color:var(--color-border)]">
+                    <span className="text-[10px] text-[color:var(--color-fg-muted)]">#{item.index + 1}</span>
+                    <audio src={item.audioDataUrl} controls className="h-6 w-38 outline-none [&::-webkit-media-controls-panel]:bg-[color:var(--color-bg-base)] [&::-webkit-media-controls-current-time-display]:text-[color:var(--color-fg)] [&::-webkit-media-controls-time-remaining-display]:text-[color:var(--color-fg)]" />
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Consistency tools — shared style text + reference images.
              Cả hai đi vào header row của Frame và được fan-out tới mọi scene
@@ -519,10 +768,24 @@ export default function ScenesImportDialog({ flowX, flowY, onClose, initialState
             </label>
           )}
 
+          <label
+            className="flex items-center gap-1.5 text-xs text-[color:var(--color-fg)] select-none cursor-pointer"
+            title="Thêm cột kịch bản / lời thoại cho mỗi scene"
+          >
+            <input
+              type="checkbox"
+              checked={includeScript}
+              onChange={(e) => setIncludeScript(e.target.checked)}
+              className="accent-[color:var(--color-accent)]"
+            />
+            <FileText className="h-3 w-3" />
+            Script
+          </label>
+
           {mismatch && !empty && (
             <div className="flex items-center gap-1.5 text-[11px] text-red-400">
               <AlertTriangle className="h-3.5 w-3.5" />
-              Số dòng không khớp: {imgCount} vs {vidCount}
+              Số dòng không khớp:{videoMismatch ? ` Image ${imgCount} vs Video ${vidCount}` : ""}{scriptMismatch ? ` Image ${imgCount} vs Script ${scriptCount}` : ""}
             </div>
           )}
           {tooMany && canConfirm && (
@@ -631,4 +894,15 @@ function PromptColumn({
       />
     </div>
   );
+}
+
+function triggerBlobDownload(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }

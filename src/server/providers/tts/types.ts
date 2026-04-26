@@ -18,7 +18,8 @@ export {
   DEFAULT_TTS_VOICE,
   DEFAULT_TTS_LANGUAGE,
 } from "@/lib/tts";
-export type { GeminiTtsModel, GeminiTtsVoice, GeminiTtsLanguage } from "@/lib/tts";
+import type { GeminiTtsModel, GeminiTtsVoice, GeminiTtsLanguage } from "@/lib/tts";
+export type { GeminiTtsModel, GeminiTtsVoice, GeminiTtsLanguage };
 
 export interface TtsSceneInput {
   /** Stable scene index — echoed back on output so the UI can zip by index. */
